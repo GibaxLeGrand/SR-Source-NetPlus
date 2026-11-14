@@ -119,6 +119,7 @@ SR-Source uses a modified fork of ModernGekko: [KnivesDevilish/ModernGekko](http
 - The Netplay lobby with invite codes (see [Netplay](#-netplay)).
 - GameCube controller profiles written for SR-Source, with a controller tester.
 - The in-game menu, visual effects and high-resolution screenshots (see [In-game menu](#in-game-menu)).
+- Mods that replace or add the games' files, texture packs and data patches, without touching your copy, turned on from the launcher (see [Mods](#-mods)).
 - Small runtime adjustments, such as hiding the runtime's on-screen messages and skipping redundant checks of the game files at startup.
 
 Like the original, the fork is licensed under the GNU GPL v3.
@@ -183,7 +184,7 @@ SR-Source/
 ├── external/
 │   └── ModernGekko/           # SR-Source fork of the Dolphin-derived runtime (submodule)
 ├── game_assets/               # User-provided game files (not distributed)
-├── mods/                      # Reserved for future project mod support
+├── mods/                      # Reserved for the project's own mods (players' mods go in the user directory)
 ├── src/
 │   ├── recompiled/            # DolRecomp-generated game code
 │   ├── core/                  # Optional project-specific hooks and replacements (disabled by default).
@@ -499,12 +500,12 @@ Build scripts, dependencies, and runtime behavior may change as the project evol
 
 The launcher, **Riders Terminal**, is the program players open to play SR-Source. It is part of the ModernGekko fork and is built as `build/chassis/SR-Source`. Its window is 1280x720, or as big as fits a smaller screen (larger on a screen with a display scale above 100%), and most pages show their panels in two columns so they fit without scrolling.
 
-- **PLAY:** shows whether each game is ready (**GAME READY** or **NOT INSTALLED**) and starts it, alone or through Netplay. **LAUNCH** opens the [game selection screen](#game-selection-screen). The banner at the top moves: the checkered flag waves, Sonic floats, the layers lean with the mouse, and the Sonic Riders and Zero Gravity logos take turns every 10 seconds (its layers and their `layout.txt` are in `docs/banner/`). Summary cards show the time played, the controller (with a drawing of an Xbox, PlayStation or Nintendo controller, any other gamepad, or the keyboard), the display settings and the installed mods, and the **PATCH NOTES** panel shows what changed in this version.
+- **PLAY:** shows whether each game is ready (**GAME READY** or **NOT INSTALLED**) and starts it, alone or through Netplay. **LAUNCH** opens the [game selection screen](#game-selection-screen). The banner at the top moves: the checkered flag waves, Sonic floats, the layers lean with the mouse, and the Sonic Riders and Zero Gravity logos take turns every 10 seconds (its layers and their `layout.txt` are in `docs/banner/`). Summary cards show the time played, the controller (with a drawing of an Xbox, PlayStation or Nintendo controller, any other gamepad, or the keyboard), the display settings and how many mods are on, and the **PATCH NOTES** panel shows what changed in this version.
 - **Settings:** CPU core, graphics backend (Vulkan or OpenGL; on Windows also Direct3D 11 and 12, and the launcher suggests another one if the chosen backend can't start), internal resolution, screenshot resolution, visual effect, game volume, aspect ratio (see [Aspect ratio](#aspect-ratio)), window size, fullscreen and FPS in the window title. Changes are saved right away and apply the next time you press **PLAY**; the visual effect, the internal resolution and the game volume can also be changed while playing, in the [in-game menu](#in-game-menu).
 - **Window size** (Settings → Display) is the game window's size when it isn't fullscreen. **Automatic**, the default, fits it to your screen: a 16:9 window about 85% of the primary monitor, in its middle. 960x540 to 2560x1440 are fixed sizes; one that doesn't fit your screen becomes the automatic one. How sharp the game looks is the internal resolution, not the window size: a small window with a high internal resolution looks very sharp.
 - **Controls:** chooses the controller, writes its GameCube profile (see [Controls](#controls)) and shows a tester that lights up whatever is pressed.
 - **Game Files:** extracts your own copy of each game and installs the complete saves (see [Extracting with the Launcher](#extracting-with-the-launcher)).
-- **Mods & expansions:** lists the mod packages installed, shows the folder they go in (`Mods` in the SR-Source user directory) with a button to open it, and presents the planned custom expansions (see [Future Ecosystem & Expansion Plans](#-future-ecosystem--expansion-plans)). SR-Source has no mods of its own yet.
+- **Mods & expansions:** lists each game's mods (texture packs and data patches included), with a box to turn each one on or off, the code mod packages (`.mgm`), and any folder that can't be used, with the reason. It shows the folder mods go in (`Mods` in the SR-Source user directory), with buttons to open it and to refresh the list, and presents the planned custom expansions (see [Future Ecosystem & Expansion Plans](#-future-ecosystem--expansion-plans)). See [Mods](#-mods) for how to install and make mods. SR-Source doesn't come with any mods.
 - **Credits:** the people and projects SR-Source is built on, their licenses, and the version check.
 
 **With a gamepad.** The launcher works with a gamepad as well as with the mouse and keyboard: the D-pad or the left stick moves, **A** chooses and **B** goes back to the sidebar; **LB** and **RB** change the page, the right stick scrolls, and **right** goes from the sidebar into the page. While a gamepad is in use, the bottom right corner shows its buttons as the controller prints them (Xbox, PlayStation or Nintendo). With the keyboard, the arrow keys move, **Enter** (or Space) chooses, **Escape** goes back, **Q** and **E** change the page, and the corner shows those keys instead. The bottom left corner draws what the game reads: the controller, or the keyboard when no gamepad is connected. Choosing **Controls** in the sidebar starts testing the controller, so its buttons only light up the drawing: hold **B** (or press Escape) to stop testing and move through the page. **LB** and **RB** pass through **Controls** without testing; press the top face button there (**Y**, the triangle on PlayStation) or **Test buttons** to start the test. The Netplay lobby works with a gamepad too.
@@ -589,7 +590,7 @@ Netplay lets up to four players race together. On the launcher's **PLAY** page, 
 > [!WARNING]
 > Anyone who sees an invite code can join the room, and an IP address identifies your connection. Don't show either one on stream or post them publicly.
 
-Every player needs the same SR-Source release and the same game files. Everyone plays with the host's CPU core and the host's 16:9 or 4:3 choice; JIT64 is recommended, especially when players are on different systems.
+Every player needs the same SR-Source release, the same game files and the same [mods](#mods-and-netplay) on. Everyone plays with the host's CPU core and the host's 16:9 or 4:3 choice; JIT64 is recommended, especially when players are on different systems.
 
 The first time a player opens the Netplay lobby with a game, SR-Source reads all of that game's files to make sure everyone has the same ones: several GB, which can take a few minutes, longer on a hard disk. The loading screen shows how far it has got, what has been read is kept even if the loading is stopped, and later lobbies only read the files that changed. **Esc** or **B** (after a few seconds), or closing the launcher's window, stops the loading. If the launcher is closed from the Task Manager or crashes, the game it started ends with it instead of staying in the background.
 
@@ -598,6 +599,7 @@ Netplay is part of the experimental build and has had limited testing so far.
 ### If your friends can't connect
 
 - **Same release:** everyone needs the same SR-Source version (the launcher's **Credits** page and the patch notes show it). Linux and Windows players can play together.
+- **Same mods:** everyone needs the same mods on, in the same order; texture packs don't count (see [Mods and Netplay](#mods-and-netplay)).
 - **In the same house:** use **Direct IP** with the address the host's lobby shows under **At home** (the first one, when there are several). Invite codes go out to the internet and back, which many routers don't allow between two computers behind them.
 - **The host's firewall** has to let the game in:
   - **Windows:** the first time someone hosts, Windows asks whether to allow `moderngekko-run`: tick **Private** and **Public** networks and choose **Allow**. If the question was closed or missed, press **Allow the game in the Windows firewall** in **Host Netplay**; Windows asks for permission once. By hand: **Windows Security → Firewall & network protection → Allow an app through firewall → Change settings**, tick **Private** and **Public** for `moderngekko-run` (or add `moderngekko-run.exe` from the SR-Source folder with **Allow another app...**).
@@ -619,6 +621,137 @@ Netplay is part of the experimental build and has had limited testing so far.
 
 ---
 
+## 🔧 Mods
+
+A mod changes the game's files when the game starts: each file in the mod takes the place of the game's file with the same name and folder, or is added if the game doesn't have one. This happens in memory, so your extracted game is never changed: turn the mod off and the game is as it was. A mod can also be a [texture pack](#texture-packs), which changes how the game looks, or carry [data patches](#data-patches), which change values inside the game's files, such as an Extreme Gear's stats.
+
+### Installing a mod
+
+1. Copy the mod's folder into `Mods` in the SR-Source user directory: `~/.local/share/sr-source/Mods` on Linux, `%LOCALAPPDATA%\sr-source\Mods` on Windows. **Mods & expansions → Open folder** opens it.
+2. Open **Mods & expansions** in the launcher (press **Refresh** if the page was already open). The mod is listed under its game, with a box.
+3. Tick the box. It is saved right away and applies the next time you press **PLAY**; the **MODS** card on the **PLAY** page says how many are on.
+
+Only the mods made for the game being started are used. If two mods change the same file, the one turned on last wins.
+
+The launcher keeps the mods that are on in the `[Mods]` section of `config.ini`, in the user directory: one `mod=<folder name>` line each, in the order they apply. A `Mods` folder next to the launcher works too; a mod in the user directory takes the place of one with the same folder name there.
+
+### Making a mod
+
+A mod is a folder with a `mod.ini` file and a `files` folder, a `textures` folder (a [texture pack](#texture-packs)), a `patches.ini` file ([data patches](#data-patches)), or several of them:
+
+```text
+Mods/
+└── my-first-mod/
+    ├── mod.ini
+    └── files/              # laid out as the game's own files folder
+        └── 10SONIC.DAT
+```
+
+`mod.ini` says what the mod is:
+
+```ini
+name=My first mod
+game=GXEE8P
+version=1.0
+author=Your name
+description=One line saying what it changes.
+```
+
+- `game` is required: the 6-character ID of the game the mod is for, `GXEE8P` for Sonic Riders or `RS9E8P` for Sonic Riders: Zero Gravity (the names of the folders in `games/` in the user directory).
+- `name` is what the launcher shows; without it, the launcher shows the folder's name. `version`, `author` and `description` are optional and are shown with it.
+- Lines that start with `#` or `;` are comments.
+
+The folder's name is how `config.ini` refers to the mod, so keep it short and don't rename it once the mod is shared: players would have to turn it on again.
+
+`files` mirrors the game's own `files` folder, which the launcher extracted to `games/<Game ID>/files` in the user directory. To replace `games/GXEE8P/files/10SONIC.DAT`, the mod has `files/10SONIC.DAT`; a file inside one of the game's folders goes in a folder with the same name in the mod. Capital letters in the names don't matter. Put in only the files you change, never a copy of the game: a mod that is shared must contain only your own work.
+
+To check that it works, play once and look for these lines in `Logs/ModernGekko.log`, in the user directory:
+
+```text
+mods: My first mod 1.0 (my-first-mod) is on
+mods: my-first-mod: 1 file(s)
+```
+
+A folder that has a `mod.ini` but can't be used (it has no `game=` line, or no `files` folder, `textures` folder or `patches.ini`) is shown in orange on the **Mods & expansions** page, with the reason, and the log says the same.
+
+### What each game lets you change
+
+- **Sonic Riders (`GXEE8P`)** keeps its files loose (`00.DAT`, `10SONIC.DAT` and many more, some of them in numbered folders), so a mod can replace them one by one.
+- **Sonic Riders: Zero Gravity (`RS9E8P`)** keeps almost everything inside three archives, `Image1.cvm`, `Image2.cvm` and `Image3.cvm` (its music is in `Image2.cvm`, for example `B11_OPTION.ADX`). A mod changes a file inside one by putting it in a folder named after the archive: `files/Image2.cvm/B11_OPTION.ADX`. See [Files inside a .cvm](#files-inside-a-cvm).
+
+Code files (`.rel` and `.dol`) in a mod are used with the JIT64 CPU core, the default. With StaticRecomp they are left out, because the recompiled module is the game's own code; the log says how many.
+
+### Files inside a .cvm
+
+```text
+Mods/
+└── option-music/
+    ├── mod.ini             # game=RS9E8P
+    └── files/
+        └── Image2.cvm/     # a folder, named after the archive
+            └── B11_OPTION.ADX
+```
+
+- Each file in the folder takes the place of the file with the same name inside the archive (capitals don't matter). Only files the archive already has can be changed; new ones can't be added yet.
+- The archive isn't copied (they are over a gigabyte): as the game starts, in memory, a file that fits in the room its original had is written there, and a bigger one goes at the end of the archive. The archive's index then points to it, and the sizes its header keeps are updated.
+- If two mods change the same file, the one turned on last wins. A mod that replaces a whole `.cvm` (a file `files/Image2.cvm`) wins over the files other mods put inside it, which are left out.
+- The log says how many went in: `mods: Image2.cvm: 2 file(s) inside it (1 in place, 1 at the end)`, and names any that couldn't, with the reason.
+- In Netplay, they count like any mod's files.
+
+### Texture packs
+
+A texture pack changes how the game looks without touching its files: its custom textures take the place of the game's own as they are drawn. So it works the same in both games, whatever archive the original texture is in.
+
+```text
+Mods/
+└── lime-menus/
+    ├── mod.ini             # game=RS9E8P, as in any mod
+    └── textures/
+        └── tex1_256x256_12bdbb7524dd2461_9.png
+```
+
+- The textures are PNG or DDS files named as Dolphin dumps them (`tex1_<width>x<height>_..._<format>.png`), in any subfolders. A pack made for Dolphin works as it is: copy the files in its game folder (`Load/Textures/RS9E8P`, for example) into the mod's `textures` folder.
+- It is turned on in **Mods & expansions** like any mod, where it is marked **Textures**. If two packs have the same texture, the one turned on last wins.
+- When the game starts, the textures of the packs that are on are gathered in `Cache/textures`, in the user directory, as links to the packs' files, so they don't take space twice. The log says how many: `mods: textures: 49 from 1 mod(s)`.
+- In Netplay, texture packs don't need to match: they only change what each player sees.
+- With a large pack, the game can stutter a little the first time each texture appears, while it loads.
+
+### Data patches
+
+A `patches.ini` changes values inside the game's files as the game starts, such as an Extreme Gear's stats, without the mod carrying any of the game's files: only the values its author chose. As with every mod, nothing is written to your extracted game.
+
+```ini
+# Sonic Riders: the Default Gear's boost, 300 km/h at every level
+gear.Default.level1.boostSpeed = 300 km/h
+gear.Default.level2.boostSpeed = 300 km/h
+gear.Default.level3.boostSpeed = 300 km/h
+```
+
+- One change per line, `key = value`. Lines that start with `#` or `;` are comments.
+- `+=` adds to the value the game has, and `*=` multiplies it: `gear.Default.topSpeed += 80 km/h`, `gear.Default.level1.maxAir *= 1.5`. They work on the value as the mods before have left it, so they can be combined.
+- **Sonic Riders' Extreme Gear (`GXEE8P`):** `gear.<gear>.<value>`, or `gear.<gear>.level<1-3>.<value>` for what changes with the gear's level, and `gear.*.` for every gear at once (`gear.*.topSpeed += 80 km/h`). Capitals don't matter.
+  - A gear's `topSpeed` is added to what each character reaches on it (and to the speeds at which acceleration changes), so `+= 80 km/h` makes every character 80 km/h faster on it. The game keeps a character's top speed between 120 and 447 km/h.
+  - The gears: `Default`, `HighBooster`, `AutoSlider`, `PowerfulGear`, `Fastest`, `TurboStar`, `SpeedBalancer`, `BlueStar2`, `Access`, `Beginner`, `Accelerator`, `TrapGear`, `LightBoard`, `SlideBooster`, `Legend`, `MagicCarpet`, `AirBroom`, `Hovercraft`, `ChaosEmerald`, `Faster`, `Gambler`, `PowerGear`, `OpaOpa`, `TheCrazy`, `Berserker`, `ERider`, `AirTank`, `HeavyBike`, `Destroyer`, `Omnipotence`, `CoverS`, `CoverF`, `CoverP`, `HangOn`, `SuperHangOn`, `Darkness`, `Grinder`, `AdvantageS`, `AdvantageF`, `AdvantageP`, `Cannonball`.
+  - Each gear's values: `acceleration`, `topSpeed`, `offRoadSpeed`, `speedHandlingMultiplier`, `weight`, `turningSpeedLoss`, `handling`, `backAxelHandling`, `frontAxelHandling`, `driftRadius`, `driftRotation`, `backAxelDriftRotation`, `frontAxelDriftRotation`, `driftDashFrames`, `trickAirGainMultiplier`, `shortcutAirGainMultiplier`, `QTEAirGainMultiplier`, `jumpChargeCostMultiplier`, `costInGearShop`, `useFlags`, `type`, `model`, `extraTypeAttributes`, `specialFlags`, and the stats the shop shows: `tempoStat`, `efficiencyStat`, `combatStat`, `weightStat`.
+  - Each level's values: `maxAir`, `passiveAirDrain`, `driftingAirCost`, `boostCost`, `tornadoCost`, `driftDashSpeed`, `boostSpeed`.
+  - Speeds can be written in km/h (`300 km/h`): the game keeps them as km/h divided by 216. Air is a whole number (a level 1 tank holds 100000 on most gears).
+  - Where the gear table is and what each value means come from the source of [Sonic Riders Tournament Edition](https://github.com/RidersBoulevard/sonicriderste) (GPL v3). These keys only apply to the `_Main.rel` of the USA release: with another one they are left out, and the log says so.
+- **Any value in any file under `files`** (up to 64 MB: not a whole `.cvm`): `<file>@<place>:<type> = <value>`, for example `_Main.rel@0x1EA2C0:f32 = 1.2`. The types are `u8`, `u16`, `u32`, `s8`, `s16`, `s32` and `f32` (big-endian, as the consoles store them), and `bytes` (in hex: `3F 80 00 00`).
+- If two mods change the same value, the one turned on last wins. If a mod also replaces that file, the changes are made on the mod's copy.
+- With StaticRecomp, changes to a module's code (the code sections of a `.rel` file) are left out, since the recompiled module is the game's own code. Data, such as the gear values, is changed as with JIT64.
+- When the game starts, the changed copies are made in `Cache/patched`, in the user directory, and the log says how many changes each mod made (`mods: turbo-default: 3 data patch(es)`), and names any line that can't be used, with the reason.
+- In Netplay, data patches count: everyone needs the same ones. The launcher marks these mods **Data patches**.
+
+### Mods and Netplay
+
+Every player needs the same mods on, in the same order, with the same files and data patches: Netplay checks them along with the game files. Texture packs are the exception: each player can have their own. When they differ, joining fails and the launcher says that the game, the mods or the recomp module don't match the host's. A mod's files are read the first time it is used in Netplay, and again when they change, so a large mod makes that lobby take a little longer to open.
+
+### Code mods (`.mgm`)
+
+ModernGekko can also load experimental code mod packages (`.mgm`) for the recompiled code, from the same `Mods` folders. They are always loaded (they have no box) and are listed apart on the **Mods & expansions** page. The `mod-template` folder of the ModernGekko fork shows how to build one.
+
+---
+
 ## 🧩 Future Ecosystem & Expansion Plans
 
 ### 💽 Custom Story Expansions & Modding Support
@@ -626,6 +759,8 @@ Netplay is part of the experimental build and has had limited testing so far.
 One of the long-term ambitions of **Sonic Riders: Source** is to establish a modular ecosystem for custom content and community-created expansions.
 
 The project aims to eventually support original story campaigns, additional characters, custom tracks, cutscenes and other fan-created content without requiring modifications to the original game assets.
+
+The first step is in place: mods that replace or add the games' files when they start, without touching your copy (see [Mods](#-mods)). Story campaigns, characters and tracks need more than that, and are still planned.
 
 Potential projects and concepts include:
 
@@ -661,7 +796,7 @@ Whether you're interested in contributing code, testing the project or sharing t
 Constructive feedback is always welcome. <3
 
 ### Does SR-Source currently support mods?
-Not yet. Native project-specific mod loading is a future development goal. The `mods/` directory is reserved for future use and does not currently represent a fully implemented SR-Source mod loader. ModernGekko itself can load experimental code mod packages (`.mgm`) from the `Mods` folder of the SR-Source user directory; the launcher's **Mods & expansions** page lists them and opens that folder.
+Yes: mods that replace or add the games' files, texture packs that change how they look, and data patches that change values such as an Extreme Gear's stats, without touching your copy. Put them in the `Mods` folder of the SR-Source user directory and turn them on in the launcher's **Mods & expansions** page (see [Mods](#-mods), which also says how to make one). In Zero Gravity, almost every file is inside one of three `.cvm` archives, and a mod can change files inside them too. ModernGekko can also load experimental code mod packages (`.mgm`). Bigger content, such as story campaigns, is still a future goal.
 
 ### Does SR-Source require Dolphin?
 SR-Source currently uses a modified fork of **ModernGekko**, a Dolphin-derived runtime, to provide graphics, audio, input and Wii system services. You don't need to install Dolphin separately: the runtime is built from the `external/ModernGekko/` submodule. A more independent runtime is a long-term development goal.
@@ -720,6 +855,7 @@ SR-Source is focused on Sonic Riders and Sonic Riders: Zero Gravity. The project
 - **Dolphin** — The Dolphin Team and its contributors: the foundation for much of the runtime technology.
 - **Invite codes** — The Dolphin project's public server (`stun.dolphin-emu.org`).
 - **pl_mpeg** — Dominic Szablewski: the MPEG-1 decoder that plays the games' intros on the game selection screen.
+- **Sonic Riders Tournament Edition** — The Tournament Edition team ([RidersBoulevard](https://github.com/RidersBoulevard/sonicriderste)): the layout of Sonic Riders' Extreme Gear table that data patches use, from their source.
 
 **Licenses:**
 
@@ -729,6 +865,7 @@ SR-Source is focused on Sonic Riders and Sonic Riders: Zero Gravity. The project
 | Dolphin | GNU GPL v2 or later |
 | SDL 3 | zlib License |
 | Dear ImGui, pl_mpeg | MIT License |
+| Sonic Riders Tournament Edition | GNU GPL v3 |
 | Noto Sans CJK, Teko | SIL Open Font License 1.1 |
 
 ---
