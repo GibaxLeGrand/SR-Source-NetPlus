@@ -64,6 +64,14 @@ mkdir -p "$STAGE"
 echo "Packing $NAME from $BIN"
 cp "$LAUNCHER" "$BIN/moderngekko-run$EXE" "$STAGE/"
 cp -R "$BIN/Sys" "$BIN/Resources" "$STAGE/"
+# Dolphin's lists of game names (Sys/wiitdb-*.txt, from GameTDB) also name
+# other Sonic Riders projects, which SR-Source has nothing to do with (it
+# only plays the two original games): their lines are left out.
+for list in "$STAGE"/Sys/wiitdb-*.txt; do
+  if [[ -f "$list" ]]; then
+    sed -i -E '/^(GXSRTE|GXTE8P|SRZE8P)[[:space:]]*=/d' "$list"
+  fi
+done
 
 # Shared libraries the build put beside the programs, but never a
 # StaticRecomp module (made from the game's code) or a test library.

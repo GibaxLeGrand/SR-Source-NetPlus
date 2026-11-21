@@ -1,4 +1,13 @@
 [en]
+# 0.2.3
+Mods arrive, and Windows folders with accents work.
+
+- New Mods & expansions page: copy a mod's folder into the Mods folder (Open folder opens it), tick its box, and it applies the next time you play. Your extracted game is never changed: untick it and the game is as it was
+- Mods can replace or add the games' files (in Zero Gravity, also the files inside its .cvm archives), be texture packs, change values inside the game (data patches), and bring their own sounds and an on-screen charge meter. The README's Mods section says how to make one
+- Each mod takes one line, its box and its name: hover over it, or select it with the controller, to see its version, author and description
+- Netplay: everyone needs the same mods on, except texture packs; the lobby checks them along with the game files
+- Windows: SR-Source now works when your user folder, or the folder you put SR-Source in, has accents or letters from other languages. Before, extracting a game made a folder with the wrong name and the game couldn't start
+
 # 0.2.2
 A launcher that opens smoothly, a new Netplay lobby, and Netplay that tells you what's going on.
 
@@ -94,6 +103,15 @@ First public build of SR-ZGS: Sonic Riders: Zero Gravity as a static recompilati
 - Builds for Linux and, still experimental, for Windows
 
 [es]
+# 0.2.3
+Llegan los mods, y en Windows funcionan las carpetas con acentos.
+
+- Nueva página Mods y expansiones: copia la carpeta de un mod en la carpeta Mods (Abrir carpeta la abre), marca su casilla y se aplica la próxima vez que juegues. Tu juego extraído nunca cambia: desmárcala y el juego queda como estaba
+- Los mods pueden reemplazar o añadir archivos de los juegos (en Zero Gravity, también los que están dentro de sus archivos .cvm), ser paquetes de texturas, cambiar valores dentro del juego (parches de datos) y traer sus propios sonidos y un medidor de carga en pantalla. La sección Mods del README explica cómo hacer uno
+- Cada mod ocupa una línea, con su casilla y su nombre: pasa el ratón por encima, o selecciónalo con el mando, para ver su versión, su autor y su descripción
+- Netplay: todos necesitan los mismos mods activados, salvo los paquetes de texturas; el lobby los comprueba junto con los archivos del juego
+- Windows: SR-Source ya funciona cuando tu carpeta de usuario, o la carpeta donde pusiste SR-Source, tiene acentos o letras de otros idiomas. Antes, al extraer un juego se creaba una carpeta con el nombre equivocado y el juego no podía arrancar
+
 # 0.2.2
 Un launcher que abre con suavidad, un lobby de Netplay nuevo y un Netplay que te dice qué pasa.
 
@@ -189,6 +207,15 @@ Primera versión pública de SR-ZGS: Sonic Riders: Zero Gravity como recompilaci
 - Builds para Linux y, todavía experimental, para Windows
 
 [ja]
+# 0.2.3
+MODが使えるようになり、Windowsでアクセントなどを含むフォルダー名でも動くようになりました。
+
+- 新しい「MODと拡張」ページ：MODのフォルダーをModsフォルダーにコピーし（「フォルダーを開く」で開けます）、チェックを入れると、次にプレイするときから使われます。展開したゲームは変更されません。チェックをはずせば元どおりです
+- MODでは、ゲームのファイルの置き換えや追加（Zero Gravityでは.cvmアーカイブの中のファイルも）、テクスチャパック、ゲーム内の値の変更（データパッチ）、MOD自身のサウンドや画面上のチャージメーターが使えます。作り方はREADMEの「Mods」にあります
+- MODはそれぞれチェックボックスと名前の1行で表示されます。マウスをのせるか、コントローラーで選ぶと、バージョン、作者、内容が表示されます
+- ネットプレイ：テクスチャパックをのぞき、全員が同じMODを有効にする必要があります。ロビーがゲームのファイルと共に確認します
+- Windows：ユーザーフォルダーやSR-Sourceを置いたフォルダーの名前にアクセントや他の言語の文字が含まれていても動くようになりました。以前は、ゲームを展開すると名前の違うフォルダーが作られ、ゲームを起動できませんでした
+
 # 0.2.2
 ランチャーがなめらかに開くようになり、ネットプレイのロビーが新しくなり、ネットプレイで何が起きているか分かるようになりました。
 

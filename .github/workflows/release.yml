@@ -100,6 +100,14 @@ jobs:
           CHASSIS_CMAKE_ARGS: -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
         run: bash tools/build_tools.sh --chassis
 
+      # GitHub issue #5: on Windows, a user folder with an accent broke the
+      # extraction and the game's start. Checked in a folder named with
+      # letters from several languages, with the real runner started as the
+      # launcher starts it; a change that brings the bug back stops here.
+      - name: Check folders with accents
+        shell: bash
+        run: bash tools/check_unicode_paths.sh
+
       - name: Pack the release
         shell: bash
         run: bash tools/package_release.sh

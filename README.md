@@ -72,6 +72,7 @@ Requires your own legally obtained copy of each game you want to play.
 - [x] 0.2.0: **Sonic Riders: Source.** Sonic Riders (GameCube) joins Zero Gravity in one launcher, Riders Terminal: a game selection screen with each game's intro, a loading screen from the launcher to the game, complete saves for both games, three visual effects (Remaster, Anime outline and CRT), 16:9 and 4:3 filling any screen, and a moving PLAY banner.
 - [x] 0.2.1: Netplay's first check of the game files shows its progress on the loading screen and goes on where it stopped, a loading can be stopped (Esc, B or closing the window), and a game no longer stays in the background when the launcher is closed from the Task Manager or crashes.
 - [x] 0.2.2: the launcher opens with SR-Source's icon instead of all at once, a new Netplay lobby with the banner's art, the Netplay host's router opens its port by itself (UPnP) and the lobby says whether friends can reach it, and Netplay errors say why, in a small window of the launcher.
+- [x] 0.2.3: mods, on the launcher's **Mods & expansions** page: files that replace or add the games' own (also inside Zero Gravity's `.cvm` archives), texture packs, data patches, and mods' own sounds and on-screen charge meters. And on Windows, user folders with accents or letters from other languages work.
 - [x] Recompiled code for Sonic Riders (GameCube), as Zero Gravity has. Most of its game code lives in `_Main.rel`, which StaticRecomp doesn't recompile yet: that part runs on the dynamic recompiler.
 - [ ] Improve and optimize StaticRecomp execution performance.
 - [ ] Independent runtime implementation.
@@ -476,7 +477,7 @@ On Linux the keyboard is read through X11, which the launcher uses by default. T
 
 ### Making a Release
 
-`.github/workflows/release.yml` builds the Linux and Windows packages on GitHub's machines with `tools/build_tools.sh --chassis` (without DolRecomp: `SRZGS_SKIP_DOLRECOMP=1`) and `tools/package_release.sh`. Run it from the repository's **Actions** tab (**Release → Run workflow**) to get both packages as the run's artifacts, or push a tag that matches `project(SR_SOURCE VERSION ...)` in `CMakeLists.txt` to also get a draft release with them and the patch notes:
+`.github/workflows/release.yml` builds the Linux and Windows packages on GitHub's machines with `tools/build_tools.sh --chassis` (without DolRecomp: `SRZGS_SKIP_DOLRECOMP=1`) and `tools/package_release.sh`. Before packing, `tools/check_unicode_paths.sh` checks that SR-Source works in a folder named with letters from several languages (on Windows, a user folder with an accent once broke the extraction and the game's start). Run it from the repository's **Actions** tab (**Release → Run workflow**) to get both packages as the run's artifacts, or push a tag that matches `project(SR_SOURCE VERSION ...)` in `CMakeLists.txt` to also get a draft release with them and the patch notes:
 
 ```bash
 git tag v0.2.0
@@ -628,7 +629,7 @@ A mod changes the game's files when the game starts: each file in the mod takes 
 ### Installing a mod
 
 1. Copy the mod's folder into `Mods` in the SR-Source user directory: `~/.local/share/sr-source/Mods` on Linux, `%LOCALAPPDATA%\sr-source\Mods` on Windows. **Mods & expansions → Open folder** opens it.
-2. Open **Mods & expansions** in the launcher (press **Refresh** if the page was already open). The mod is listed under its game, with a box.
+2. Open **Mods & expansions** in the launcher (press **Refresh** if the page was already open). The mod is listed under its game, with a box. Hover over it, or select it with the controller, to see its version, author, description and folder.
 3. Tick the box. It is saved right away and applies the next time you press **PLAY**; the **MODS** card on the **PLAY** page says how many are on.
 
 Only the mods made for the game being started are used. If two mods change the same file, the one turned on last wins.
@@ -721,27 +722,66 @@ Mods/
 A `patches.ini` changes values inside the game's files as the game starts, such as an Extreme Gear's stats, without the mod carrying any of the game's files: only the values its author chose. As with every mod, nothing is written to your extracted game.
 
 ```ini
-# Sonic Riders: the Default Gear's boost, 300 km/h at every level
-gear.Default.level1.boostSpeed = 300 km/h
-gear.Default.level2.boostSpeed = 300 km/h
-gear.Default.level3.boostSpeed = 300 km/h
+# A value in Sonic Riders' _Main.rel, and one in Zero Gravity's _MAIN.REL
+# (inside the Image2.cvm archive)
+_Main.rel@0x1000:f32 = 1.2
+Image2.cvm/_MAIN.REL@0x2F940C:f32 += 80 km/h
 ```
 
 - One change per line, `key = value`. Lines that start with `#` or `;` are comments.
-- `+=` adds to the value the game has, and `*=` multiplies it: `gear.Default.topSpeed += 80 km/h`, `gear.Default.level1.maxAir *= 1.5`. They work on the value as the mods before have left it, so they can be combined.
-- **Sonic Riders' Extreme Gear (`GXEE8P`):** `gear.<gear>.<value>`, or `gear.<gear>.level<1-3>.<value>` for what changes with the gear's level, and `gear.*.` for every gear at once (`gear.*.topSpeed += 80 km/h`). Capitals don't matter.
-  - A gear's `topSpeed` is added to what each character reaches on it (and to the speeds at which acceleration changes), so `+= 80 km/h` makes every character 80 km/h faster on it. The game keeps a character's top speed between 120 and 447 km/h.
-  - The gears: `Default`, `HighBooster`, `AutoSlider`, `PowerfulGear`, `Fastest`, `TurboStar`, `SpeedBalancer`, `BlueStar2`, `Access`, `Beginner`, `Accelerator`, `TrapGear`, `LightBoard`, `SlideBooster`, `Legend`, `MagicCarpet`, `AirBroom`, `Hovercraft`, `ChaosEmerald`, `Faster`, `Gambler`, `PowerGear`, `OpaOpa`, `TheCrazy`, `Berserker`, `ERider`, `AirTank`, `HeavyBike`, `Destroyer`, `Omnipotence`, `CoverS`, `CoverF`, `CoverP`, `HangOn`, `SuperHangOn`, `Darkness`, `Grinder`, `AdvantageS`, `AdvantageF`, `AdvantageP`, `Cannonball`.
-  - Each gear's values: `acceleration`, `topSpeed`, `offRoadSpeed`, `speedHandlingMultiplier`, `weight`, `turningSpeedLoss`, `handling`, `backAxelHandling`, `frontAxelHandling`, `driftRadius`, `driftRotation`, `backAxelDriftRotation`, `frontAxelDriftRotation`, `driftDashFrames`, `trickAirGainMultiplier`, `shortcutAirGainMultiplier`, `QTEAirGainMultiplier`, `jumpChargeCostMultiplier`, `costInGearShop`, `useFlags`, `type`, `model`, `extraTypeAttributes`, `specialFlags`, and the stats the shop shows: `tempoStat`, `efficiencyStat`, `combatStat`, `weightStat`.
-  - Each level's values: `maxAir`, `passiveAirDrain`, `driftingAirCost`, `boostCost`, `tornadoCost`, `driftDashSpeed`, `boostSpeed`.
-  - Speeds can be written in km/h (`300 km/h`): the game keeps them as km/h divided by 216. Air is a whole number (a level 1 tank holds 100000 on most gears).
-  - Where the gear table is and what each value means come from the source of [Sonic Riders Tournament Edition](https://github.com/RidersBoulevard/sonicriderste) (GPL v3). These keys only apply to the `_Main.rel` of the USA release: with another one they are left out, and the log says so.
-- **Any value in any file under `files`** (up to 64 MB: not a whole `.cvm`): `<file>@<place>:<type> = <value>`, for example `_Main.rel@0x1EA2C0:f32 = 1.2`. The types are `u8`, `u16`, `u32`, `s8`, `s16`, `s32` and `f32` (big-endian, as the consoles store them), and `bytes` (in hex: `3F 80 00 00`).
+- `+=` adds to the value the game has, and `*=` multiplies it: `_Main.rel@0x1000:f32 += 80 km/h`, `_Main.rel@0x1004:s32 *= 1.5`. They work on the value as the mods before have left it, so they can be combined.
+- Speeds can be written in km/h (`300 km/h`): the games keep them as km/h divided by 216.
+- **Any value in any file under `files`** (up to 64 MB: not a whole `.cvm`): `<file>@<place>:<type> = <value>`, for example `_Main.rel@0x1000:f32 = 1.2`. The types are `u8`, `u16`, `u32`, `s8`, `s16`, `s32` and `f32` (big-endian, as the consoles store them), and `bytes` (in hex: `3F 80 00 00`).
 - **Any value in a file inside a `.cvm`** (Zero Gravity): the archive, then the file inside it, `<archive>.cvm/<file>@<place>:<type> = <value>`, for example `Image2.cvm/_MAIN.REL@0x2F940C:f32 += 80 km/h`. The changed copy of that file goes into the archive as a mod's file would (see [Files inside a .cvm](#files-inside-a-cvm)), so the log counts it there too. If a mod also puts that file in its `files/Image2.cvm/` folder, the changes are made on the mod's copy.
 - If two mods change the same value, the one turned on last wins. If a mod also replaces that file, the changes are made on the mod's copy.
-- With StaticRecomp, changes to a module's code (the code sections of a `.rel` file) are left out, since the recompiled module is the game's own code. Data, such as the gear values, is changed as with JIT64.
-- When the game starts, the changed copies are made in `Cache/patched`, in the user directory, and the log says how many changes each mod made (`mods: turbo-default: 3 data patch(es)`), and names any line that can't be used, with the reason.
+- With StaticRecomp, changes to a module's code (the code sections of a `.rel` file) are left out, since the recompiled module is the game's own code. Data is changed as with JIT64.
+- When the game starts, the changed copies are made in `Cache/patched`, in the user directory, and the log says how many changes each mod made (`mods: my-mod: 3 data patch(es)`), and names any line that can't be used, with the reason.
 - In Netplay, data patches count: everyone needs the same ones. The launcher marks these mods **Data patches**.
+
+### Sounds
+
+A mod whose code does something new (a drift, say) can bring its own sounds with a `sounds.ini` in its folder: a loop that plays while something lasts, faster at each level, and sounds that play once on numbered events. They are WAV files in the mod's folder (PCM, 16 bits, mono or stereo, any sample rate), mixed into the game's sound.
+
+```ini
+# Rows of four 32-bit words, one per controller port, that the mod's code writes
+heartbeat = 0x80B7FB00     # goes up each frame the mod's code runs
+loop_state = 0x80B7FB10    # 0 = the loop is off; N >= 1 = on, at level N - 1
+event_count = 0x80B7FB20   # goes up by one for each event
+event_id = 0x80B7FB30      # the last event's number
+# A word that only holds this value while the mod's code is in memory
+magic_address = 0x80B7FB40
+magic_value = 0x534F4E44
+loop = sounds/loop.wav
+loop_volume = 0.6
+loop_pitch_per_level = 0.06
+event.1 = sounds/level1.wav
+event_volume = 0.9
+```
+
+The mod's code (its data patches) writes those words; SR-Source reads them and plays the sounds. Nothing plays while the game is paused, when the heartbeat stops, or when the magic word doesn't hold its value. The full format is in ModernGekko's `src/runtime/mod_sounds_core.hpp`.
+
+### Charge meter
+
+The same way, a `hud.ini` draws a meter over the game: an arc that fills while the mod's code charges something, with a colour and a number for each level; it flashes at each new level and bursts when the charge is let go.
+
+```ini
+heartbeat = 0x80B7FB00   # as in sounds.ini
+value = 0x80B7FB50       # how much is charged; 0 = not charging
+step = 0x80B7F010        # the words with the value each level starts at
+step = 0x80B7F014
+step = 0x80B7F018
+magic_address = 0x80B7FB40
+magic_value = 0x534F4E44
+port = 0                 # which controller's meter
+x = 0.48                 # its centre, as fractions of the picture
+y = 0.60
+size = 0.10              # its radius, as a fraction of the picture's height
+color = #19E6FF          # one per level
+color = #FF2BD6
+color = #FFE23B
+```
+
+The full format, with the events that make it burst, is in ModernGekko's `src/runtime/mod_hud_core.hpp`.
 
 ### Mods and Netplay
 
@@ -826,6 +866,9 @@ The NTSC-U releases of Sonic Riders for GameCube (`GXEE8P`) and of Sonic Riders:
 ### Do both games run the same way?
 Yes. Sonic Riders and Zero Gravity play through the same runtime, launcher and settings, and the downloads run both with ModernGekko's JIT64 CPU core. The experimental StaticRecomp mode, for those who build from source, has recompiled code for both; in Sonic Riders, most of the game's code still runs on the dynamic recompiler (see [Performance Notes](#performance-notes)).
 
+### Is SR-Source made with AI?
+Yes, together with its author, and openly: [How SR-Source is made](#-how-sr-source-is-made) says who does what.
+
 ### What happened to SR-ZGS?
 It is the same project: SR-ZGS (Sonic Riders: Zero Gravity Source) became Sonic Riders: Source in 0.2.0, when the original Sonic Riders joined. See [Updating from SR-ZGS](#updating-from-sr-zgs-01x).
 
@@ -843,6 +886,19 @@ SR-Source is focused on Sonic Riders and Sonic Riders: Zero Gravity. The project
 
 ---
 
+## 🤖 How SR-Source is made
+
+SR-Source is made by one person, KnivesDevilish, working with an AI model (Claude, by Anthropic). This is how, so everyone can decide knowing it:
+
+- **What I do:** decide what SR-Source is and what goes into each version, design each feature and how it should feel (the launcher, Netplay, the mods, the drift for Zero Gravity), make the music and the artwork, play-test every change on my own PC before it goes in, bring the logs, memory snapshots and players' reports that each fix starts from, and publish the releases.
+- **What the AI does:** writes most of the code with me, step by step, in the ModernGekko fork and in SR-Source; helps read the games' memory and code to find where they keep things (a gear's turn, a replay's inputs); and writes the tests that check each change.
+- **How a change gets in:** in small steps. Each one is built, checked by automated tests, and played in the game; only then is it committed. Before a release, GitHub's machines build it for Linux and Windows and run the tests again.
+- **What comes from others:** the recompiler (DolRecomp), the runtime (ModernGekko, with Dolphin's code) and the libraries, made by the people in the credits below.
+
+The source code is all here to read. If a project made this way isn't for you, that is a fair choice too.
+
+---
+
 ## ❤️‍🔥 Credits & Acknowledgments
 
 **Created by** 奈依茲・悪魔的 (JP: Naizu Akumateki · EN: KnivesDevilish), with the SR-Source contributors and testers: research, development and testing. The launcher and Netplay lobby music are original tracks by KnivesDevilish, and the game selection screen's sounds were made for SR-Source.
@@ -856,7 +912,6 @@ SR-Source is focused on Sonic Riders and Sonic Riders: Zero Gravity. The project
 - **Dolphin** — The Dolphin Team and its contributors: the foundation for much of the runtime technology.
 - **Invite codes** — The Dolphin project's public server (`stun.dolphin-emu.org`).
 - **pl_mpeg** — Dominic Szablewski: the MPEG-1 decoder that plays the games' intros on the game selection screen.
-- **Sonic Riders Tournament Edition** — The Tournament Edition team ([RidersBoulevard](https://github.com/RidersBoulevard/sonicriderste)): the layout of Sonic Riders' Extreme Gear table that data patches use, from their source.
 
 **Licenses:**
 
@@ -866,7 +921,6 @@ SR-Source is focused on Sonic Riders and Sonic Riders: Zero Gravity. The project
 | Dolphin | GNU GPL v2 or later |
 | SDL 3 | zlib License |
 | Dear ImGui, pl_mpeg | MIT License |
-| Sonic Riders Tournament Edition | GNU GPL v3 |
 | Noto Sans CJK, Teko | SIL Open Font License 1.1 |
 
 ---
