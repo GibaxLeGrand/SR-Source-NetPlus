@@ -1,13 +1,9 @@
 [en]
 # 0.2.5
-Mods' textures show from the first frame.
+Mods' textures from the first frame, a launcher that stays out of the way while a game loads, and the lightest settings for new players.
 
 - Texture packs from mods now load before the game starts, so their textures show from the first frame. Before, the game's own texture could show for a moment the first time something appeared on screen. A big pack takes a little longer to start
 - Mods now have their own page, with KnivesDevilish's first pack, SR: ZGS Overdrive: https://knivesdevilish.github.io/SR-Source-Mods/
-
-# 0.2.4
-Small fixes for a better first start.
-
 - While a game loads, the launcher no longer stays over every other window: you can switch to another program meanwhile. It only goes over the game's window in the moment that opens, as before
 - The first time you open SR-Source, it starts with its lightest settings, so it runs well on any PC: the games' own internal resolution and no visual effect. A higher resolution or an effect looks better and asks more of your graphics card: raise them in Settings while the game keeps 60 FPS. If you already played, your settings stay as they are
 - New players' screenshots are taken at 1920x1080 (it was 3840x2160): sharp, and light for any graphics card
@@ -117,14 +113,10 @@ First public build of SR-ZGS: Sonic Riders: Zero Gravity as a static recompilati
 
 [es]
 # 0.2.5
-Las texturas de los mods se ven desde el primer momento.
+Las texturas de los mods desde el primer momento, un launcher que no estorba mientras carga un juego y los ajustes más ligeros para quien empieza.
 
 - Los packs de texturas de los mods ahora se cargan antes de empezar el juego, así que sus texturas se ven desde el primer fotograma. Antes, la primera vez que algo aparecía en pantalla se podía ver un momento la textura del propio juego. Un pack grande tarda un poco más en empezar
 - Los mods ya tienen su propia página, con el primer pack de KnivesDevilish, SR: ZGS Overdrive: https://knivesdevilish.github.io/SR-Source-Mods/
-
-# 0.2.4
-Pequeños arreglos para un mejor primer arranque.
-
 - Mientras carga un juego, el launcher ya no se queda encima de todas las demás ventanas: mientras tanto puedes pasar a otro programa. Solo se pone encima de la ventana del juego en el momento en que esta se abre, como antes
 - La primera vez que abres SR-Source, empieza con sus ajustes más ligeros, para que vaya bien en cualquier PC: la resolución interna propia de los juegos y sin efecto visual. Una resolución más alta o un efecto se ven mejor y le piden más a tu tarjeta gráfica: súbelos en Ajustes mientras el juego se mantenga a 60 FPS. Si ya habías jugado, tus ajustes se quedan como estaban
 - Las capturas de quien empieza se toman a 1920x1080 (antes, 3840x2160): nítidas y ligeras para cualquier tarjeta gráfica
@@ -234,14 +226,10 @@ Primera versión pública de SR-ZGS: Sonic Riders: Zero Gravity como recompilaci
 
 [ja]
 # 0.2.5
-MODのテクスチャが最初から表示されます。
+MODのテクスチャが最初から表示され、初めての起動もより使いやすくなりました。
 
 - MODのテクスチャパックは、ゲームの開始前に読み込まれるようになりました。画面に新しいものが出たとき、ゲームのもともとのテクスチャがわずかな間だけ表示されることはなくなりました。大きなパックは、開始までの時間が長くなります
 - MODのページができました。KnivesDevilishの最初のパック、SR: ZGS Overdriveがあります：https://knivesdevilish.github.io/SR-Source-Mods/
-
-# 0.2.4
-初めての起動を、より使いやすくするための修正です。
-
 - ゲームの読み込み中、ランチャーが他のすべてのウィンドウの上に表示され続けることはなくなりました。その間に別のプログラムに切り替えられます。これまでどおり、ゲームのウィンドウが開くときだけその上に表示されます
 - SR-Sourceを初めて開くと、どのPCでも動くよう、最も軽い設定で始まります：ゲームのもともとの内部解像度で、映像エフェクトなし。解像度を上げたりエフェクトを使ったりすると、きれいになりますが、グラフィックスへの要求も大きくなります。ゲームが60 FPSを保てる範囲で、設定から上げてください。すでにプレイしていた場合、設定はそのままです
 - 初めての人のスクリーンショットは1920x1080で撮影されます（以前は3840x2160）：十分きれいで、どのグラフィックスでも軽い大きさです
