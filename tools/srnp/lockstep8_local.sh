@@ -16,7 +16,10 @@ SIEGES="${SIEGES:-8}"; K=$((SIEGES / N))
 # REPARTITION="0,1 2 3 4 5 6 7" : les sièges de chaque runner (N = nombre de groupes).
 GROUPES=(${REPARTITION:-}); (( ${#GROUPES[@]} )) && N=${#GROUPES[@]}
 W=/d/_SonicRidersSource/work
-CHASSIS=/d/_SonicRidersSource/SR-Source-NetPlus/build/chassis
+# CHASSIS=<dossier> : où lancer les runners (exécutable, Sys/, Resources/, module). Par défaut
+# build/chassis, où RUNNER est d'abord posé ; un autre dossier est pris tel quel (rien n'est posé).
+CHASSIS_DEFAUT=/d/_SonicRidersSource/SR-Source-NetPlus/build/chassis
+CHASSIS="${CHASSIS:-$CHASSIS_DEFAUT}"
 PY="/c/Program Files/Python313/python.exe"
 RELAIS=/d/_SonicRidersSource/SR-Source-NetPlus/tools/srnp/relais.py
 STATE="${ETAT:-$W/states/gxee8p_course8cpu_metal_1tour_jit.sav}"
@@ -24,7 +27,9 @@ RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-lockstepn-$N-$MODE${ETIQUETTE:+-$ETIQUETTE}"
 mkdir -p "$RUN"
 w() { cygpath -w "$1"; }
 bash "$W/scripts/run/attendre_poste.sh" "${ATTENTE_MAX:-1800}" > "$RUN/poste.txt" || { echo "!! poste occupé"; exit 3; }
-bash "$W/scripts/run/poser.sh" runner "${RUNNER:-$W/phase2/moderngekko-run_p2.exe}" || exit 1
+if [[ "$CHASSIS" == "$CHASSIS_DEFAUT" ]]; then
+  bash "$W/scripts/run/poser.sh" runner "${RUNNER:-$W/phase2/moderngekko-run_p2.exe}" || exit 1
+fi
 
 "$PY" -I "$RELAIS" --sieges "$SIEGES" --delai-ms "${DELAI_MS:-100}" --journal "$(w "$RUN/relais.log")" > "$RUN/relais.out" 2>&1 &
 RPID=$!

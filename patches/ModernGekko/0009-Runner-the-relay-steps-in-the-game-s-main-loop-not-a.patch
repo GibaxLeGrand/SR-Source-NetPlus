@@ -1,0 +1,199 @@
+From 4c7d4a6c55af75e6bf45bda5a480051a5fec2cdd Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:22:17 +0100
+Subject: [PATCH] Runner: the relay steps in the game's main loop, not at the
+ present
+
+Phase 2 (SRNP_RACERS=1, native core): inputs are applied, and checksums
+taken, at the head of Sonic Riders' main loop (0x805B8290, just before
+the game reads its pads), through a StaticRecomp host hook
+(ModManager::AddHostHook). The present's timing depends on what each
+machine's camera draws, so a present could fall in the middle of the
+racers' update: a snapshot taken there differed between machines, and
+an input applied there could reach some racers a frame late.
+
+The main loop's function (0x805B80CC-0x805B82D8) is added to the forced
+fallback ranges, so that StaticRecomp sees the hook every time round
+the loop: its native code loops inside a function without going back
+to the dispatcher. Frames are now counted from the first hook.
+SRNP_CROCHET=0 keeps the old stepping at each present.
+
+Measured: the same race with the camera on racer 0 then 5, racers
+dumped every game frame (3671 frames): positions identical everywhere;
+the one-frame snapshot differences are gone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/moderngekko/mod_loader.hpp |  3 +++
+ src/runtime/dolphin_runtime.cpp    | 25 ++++++++++++++++++--
+ src/runtime/mod_loader.cpp         |  8 +++++++
+ src/runtime/srnp_relay.cpp         | 37 ++++++++++++++++++++++++++++++
+ src/runtime/srnp_relay.hpp         | 17 +++++++++++++-
+ 5 files changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/include/moderngekko/mod_loader.hpp b/include/moderngekko/mod_loader.hpp
+index a33dd1d..47a1446 100644
+--- a/include/moderngekko/mod_loader.hpp
++++ b/include/moderngekko/mod_loader.hpp
+@@ -73,6 +73,9 @@ public:
+   bool HasGuestInterception() const;
+   std::uint64_t InterceptionGeneration() const;
+   bool Empty() const;
++  // SR-Source Net Plus: an entry hook of the runtime itself, run like a mod's
++  // (StaticRecomp calls it when the game reaches `address`).
++  void AddHostHook(std::uint32_t address, ModernGekkoModFunction function);
+ 
+   static bool HostCall(CPUState *state, std::uint32_t address, void *user_data);
+   static bool HostCallContains(std::uint32_t address, void *user_data);
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 689095e..4fce691 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -10,6 +10,7 @@
+ #include "Core/Boot/BootManager.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/StaticRecompSettings.h"
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/CPU.h"
+@@ -1248,10 +1249,30 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+     recomp_source = StaticRecompModuleSource::Attached(
+         reinterpret_cast<const StaticRecompModuleDesc *>(
+             impl->config.module.descriptor));
++  // SR-Source Net Plus: the relay steps once per frame of the game, at a fixed
++  // point of its main loop (srnp_relay.hpp), rather than at each present.
++  if (const std::uint32_t at = srnp::GameFrameHookAddress()) {
++    impl->mods->AddHostHook(at, &srnp::GameFrameHook);
++    // The loop's function runs in the interpreter (forced fallback range), or
++    // StaticRecomp would only see the hook now and then: its native code loops
++    // inside the function without going back to the dispatcher. The core takes
++    // the ranges from this variable first, else from the config.
++    const char *env = std::getenv("STATICRECOMP_FALLBACK_RANGES");
++    std::string ranges =
++        env ? env : Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES);
++    ranges += std::string(ranges.empty() ? "" : ",") +
++              srnp::kGameFrameHookFallbackRange;
++#ifdef _WIN32
++    _putenv_s("STATICRECOMP_FALLBACK_RANGES", ranges.c_str());
++#else
++    setenv("STATICRECOMP_FALLBACK_RANGES", ranges.c_str(), 1);
++#endif
++  }
+   // The mods' hooks into the game's code. StaticRecomp asks them about every
+   // address it runs (a few percent of the CPU thread), so they are only
+-  // installed when a mod is loaded: without one, nothing can hook.
+-  if (!impl->mods->Empty()) {
++  // installed when a mod is loaded (or the runtime hooks): without one,
++  // nothing can hook.
++  if (!impl->mods->Empty() || impl->mods->HasGuestInterception()) {
+     recomp_source.host_call = &ModManager::HostCall;
+     recomp_source.host_call_contains = &ModManager::HostCallContains;
+     recomp_source.host_call_range_contains =
+diff --git a/src/runtime/mod_loader.cpp b/src/runtime/mod_loader.cpp
+index 2acf980..4da23bc 100644
+--- a/src/runtime/mod_loader.cpp
++++ b/src/runtime/mod_loader.cpp
+@@ -665,6 +665,14 @@ std::uint64_t ModManager::InterceptionGeneration() const {
+ 
+ bool ModManager::Empty() const { return m_impl->mods.empty(); }
+ 
++void ModManager::AddHostHook(std::uint32_t address,
++                             ModernGekkoModFunction function) {
++  if ((address & 3u) != 0u || !function)
++    return;
++  m_impl->hooks[address].entry.push_back(function);
++  ++m_impl->interception_generation;
++}
++
+ bool ModManager::HostCall(CPUState *state, std::uint32_t address,
+                           void *user_data) {
+   return user_data &&
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 5d50a9d..5ec10e1 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -349,9 +349,45 @@ bool Connect()
+ }
+ }  // namespace
+ 
++namespace
++{
++std::uint64_t s_game_frames = 0;
++void RelayStep(std::uint64_t frame);
++}  // namespace
++
++std::uint32_t GameFrameHookAddress()
++{
++  static const std::uint32_t address = [] {
++    const auto set = [](const char* name) {
++      const char* v = std::getenv(name);
++      return v && *v && *v != '0';
++    };
++    const char* hook = std::getenv("SRNP_CROCHET");
++    const bool off = hook && *hook == '0';
++    return set("SRNP_RELAY") && set("SRNP_RACERS") && set("MODERNGEKKO_STATICRECOMP") && !off
++               ? 0x805B8290u
++               : 0u;
++  }();
++  return address;
++}
++
++void GameFrameHook(CPUState*)
++{
++  RelayStep(++s_game_frames);
++}
++
+ void RelayOnFrame(std::uint64_t frame)
+ {
+   PadCheckOnFrame(frame);
++  if (GameFrameHookAddress() != 0)
++    return;  // the relay steps in the game's main loop
++  RelayStep(frame);
++}
++
++namespace
++{
++void RelayStep(std::uint64_t frame)
++{
+   if (!s_relay.tried)
+   {
+     s_relay.tried = true;
+@@ -477,4 +513,5 @@ void RelayOnFrame(std::uint64_t frame)
+     s_relay.wait_max_ms = 0.0;
+   }
+ }
++}  // namespace
+ }  // namespace srnp
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index eb63c77..5eab2bc 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -12,8 +12,23 @@
+ 
+ #include <cstdint>
+ 
++#include "moderngekko/cpu_state.h"
++
+ namespace srnp
+ {
+-// Called after each present on the emulation thread; does nothing without SRNP_RELAY.
++// Called after each present on the emulation thread; does nothing without SRNP_RELAY, nor when the
++// relay steps in the game's main loop (below).
+ void RelayOnFrame(std::uint64_t frame);
++
++// Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
++// Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
++// drawn), through a StaticRecomp host hook. Inputs are then applied, and checksums taken, at the same
++// point of the game's frame on every machine, whatever the present's timing (which depends on what
++// each machine's camera draws). Frames are counted from the first hook. Returns 0 when the relay
++// steps at each present instead (no relay or no racers mode, the JIT64, or SRNP_CROCHET=0).
++std::uint32_t GameFrameHookAddress();
++void GameFrameHook(CPUState* state);
++// The main loop's whole function, to run in the interpreter while the hook is in place: StaticRecomp's
++// native code loops inside a function without going back to its dispatcher, where hooks are seen.
++inline constexpr const char* kGameFrameHookFallbackRange = "805B80CC-805B82D8";
+ }  // namespace srnp
+-- 
+2.34.1.windows.1
+

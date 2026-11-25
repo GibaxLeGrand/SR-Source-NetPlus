@@ -13,6 +13,13 @@ import sys
 T = 0x1080
 CAMERA = [(0x370, 0x394), (0x8B4, 0x8B8), (0x8C0, 0x8C4), (0xDC4, 0xE74), (0xFD8, 0xFDC), (0x1000, 0x1004),
           (0x1036, 0x1037), (0x105C, 0x1060)]
+# Bits de l'affichage seul (comme RacersHash) : {octet : bits laissés de côté}.
+BITS = {0xBAD: 0x01, 0xBB9: 0x01}
+MASQUE = bytearray(b"\xff" * T)
+for lo_, hi_ in CAMERA:
+    MASQUE[lo_:hi_] = bytes(hi_ - lo_)
+for o_, bits_ in BITS.items():
+    MASQUE[o_] &= ~bits_ & 0xFF
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 tout = "--tout" in sys.argv
@@ -36,7 +43,7 @@ for f in communes:
         for o in range(0, T, 4):
             i = k * T + o
             if x[i:i + 4] != y[i:i + 4]:
-                if not tout and any(lo <= o < hi for lo, hi in CAMERA):
+                if not tout and not any((x[i + j] ^ y[i + j]) & MASQUE[o + j] for j in range(4)):
                     continue
                 compte[(k, o)] += 1
                 premier.setdefault((k, o), (f, struct.unpack_from(">I", x, i)[0], struct.unpack_from(">I", y, i)[0]))

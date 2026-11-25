@@ -40,9 +40,19 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   `SRNP_INPUT=course:1` (forward, random steering, then the AI takes the racer), each runner's camera
   on its seat; screenshots at the capture frame and at the end, MEM1 compared (measurement PC's
   paths). `REPARTITION="0,1 2,3 4 5 6 7"` gives each runner its seats (two seats: split screen, from
-  a 2-player save state, with `PORTS=2`).
+  a 2-player save state, with `PORTS=2`). `CHECK=<n>`: a checksum and a dump of the racers every n
+  frames (60 by default). `CHASSIS=<folder>`: runs the runners from another folder (executable,
+  `Sys`, `Resources`, module), taken as it is.
+- With the native core, the runner steps the relay at the head of the game's main loop (patch 0009):
+  inputs are applied, and checksums taken, at the same point of the game's frame on every machine,
+  and frame numbers count the game's frames from the save state. `SRNP_CROCHET=0` steps at each
+  present instead, as before.
+- During a race, racers out of the camera's sight keep their animations (patch 0010: the game's 1P
+  drawing picks the next animation only for the racers it sees); `SRNP_ANIM=0` keeps the game's code.
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
+- `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same
+  race with another camera, say): the fields that differ and where they first do.
 - `depart_8cpu.sh`: makes the save state of a race whose 8 racers are CPUs when it is set up (from the
   "Are you ready?" menu, with `pilote.sh`).
 - `pilote.sh`: keeps one runner open and sends it automation commands one by one (how the menus were

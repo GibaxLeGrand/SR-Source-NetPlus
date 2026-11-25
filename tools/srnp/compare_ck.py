@@ -13,6 +13,15 @@ import sys
 T = 0x1080
 CAMERA = [(0x370, 0x394), (0x8B4, 0x8B8), (0x8C0, 0x8C4), (0xDC4, 0xE74), (0xFD8, 0xFDC), (0x1000, 0x1004), (0x1036, 0x1037), (0x105C, 0x1060)]
 
+# Bits de l'affichage seul (comme RacersHash) : {octet : bits laissés de côté}.
+BITS = {0xBAD: 0x01, 0xBB9: 0x01}
+MASQUE = bytearray(b"\xff" * T)
+for a, b in CAMERA:
+    MASQUE[a:b] = bytes(b - a)
+for o, bits in BITS.items():
+    MASQUE[o] &= ~bits & 0xFF
+MASQUE = int.from_bytes(bytes(MASQUE) * 8, "big")
+
 run, n = sys.argv[1], int(sys.argv[2])
 frames = None
 for r in range(n):
@@ -24,10 +33,12 @@ premieres = {}
 for f in sorted(frames or []):
     dumps = [open(os.path.join(run, f"runner{r}", "ck", f"racers_{f}.bin"), "rb").read() for r in range(n)]
     diffs = set()
+    ref = int.from_bytes(dumps[0], "big")
     for r in range(1, n):
-        for i in range(8 * T):
-            if dumps[r][i] != dumps[0][i] and not any(a <= i % T < b for a, b in CAMERA):
-                diffs.add(i)
+        x = (int.from_bytes(dumps[r], "big") ^ ref) & MASQUE
+        if x:
+            o = x.to_bytes(8 * T, "big")
+            diffs.update(i for i in range(8 * T) if o[i])
     if not diffs:
         continue
     mots = sorted({(i // T, (i % T) & ~3) for i in diffs})

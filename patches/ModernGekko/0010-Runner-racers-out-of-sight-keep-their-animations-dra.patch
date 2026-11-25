@@ -1,0 +1,121 @@
+From ed7bd693caf6bb963d13ab5a286cd28d7a6f2a14 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:36:58 +0100
+Subject: [PATCH] Runner: racers out of sight keep their animations;
+ drawing-only bits out of the checksum
+
+The 1P race's drawing of the racers (0x8040B438) also picks each racer's
+next animation (0x8048FEC0: +0xB7C, +0x760, +0x8D4...), but only for the
+racers its camera sees (visibility test 0x80445AA8, result in +0x1000):
+a racer one machine sees close up and another does not ended up with
+another animation, and the checksum diverged (8 runners, one camera
+each: 507 divergences, all from the machine whose camera followed that
+racer; positions unchanged). During a race the branch that skips a racer
+out of sight now goes to the animation call (0x8040B6D8: bne 0x8040BBEC
+becomes bne 0x8040BBD8): only the drawing is skipped. SRNP_ANIM=0 keeps
+the game's code. The split screen's drawing (0x8040AA78) loops once per
+view and is not changed yet.
+
+Bit 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is
+set by the characters' drawing functions (table 0x805E3FF0) for a racer
+the camera sees and only tested by the two drawing functions: it is
+left out of the checksum.
+
+Measured on one PC, 8 runners, each camera on its own racer, inputs
+applied in the game's main loop: the same race 3671 checksums equal,
+0 divergences; a full race (8 finishers) 142 equal, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 47 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 61a92f7..1a30c93 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -331,6 +331,41 @@ long long RaceFrame()
+   return s_race ? static_cast<long long>(s_frames - s_race_start) : -1;
+ }
+ 
++// The 1P race's drawing of the racers (0x8040B438) also moves their animations on (0x8048FEC0: the
++// next animation when one ends, +0xB7C, +0x760, +0x8D4, a bit of +0xBAC...), but only for the racers
++// its camera sees (0x80445AA8, the result in +0x1000; racer 0 is never left out): a racer one machine
++// sees and another does not ends up with another animation, which the checksum catches (measured
++// 2026-11-25: racer 5 seen close up, 0x4C instead of 0x4B for 20 frames and +0x8D4 for good; the
++// positions stay the same). So a racer out of sight skips the drawing only, not its animation: the
++// branch past both goes to the animation call. SRNP_ANIM=0 leaves the game's code. (The split screen's
++// drawing, 0x8040AA78, does it once per view: not changed yet.)
++constexpr CodeWord kAnimSkip = {0x8040B6D8, 0x40820514};  // bne 0x8040BBEC (past the animation)
++constexpr std::uint32_t kAnimKeep = 0x40820500;            // bne 0x8040BBD8 (to the animation)
++bool s_anim_patched = false;
++
++void PatchAnimation(bool on)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_ANIM");
++    return v && *v == '0';
++  }();
++  if (off || on == s_anim_patched)
++    return;
++  std::uint8_t* p = Guest(kAnimSkip.address, 4);
++  const std::uint32_t expected = on ? kAnimSkip.original : kAnimKeep;
++  if (!p || Get32(p) != expected)
++  {
++    std::fprintf(stderr, "[srnp racers] animation: 0x%08X holds %08X, not %08X: left alone\n",
++                 kAnimSkip.address, Read32(kAnimSkip.address), expected);
++    return;
++  }
++  Put32(p, on ? kAnimKeep : kAnimSkip.original);
++  Core::System::GetInstance().GetJitInterface().InvalidateICache(kAnimSkip.address, 4, true);
++  s_anim_patched = on;
++  std::fprintf(stderr, "[srnp racers] animations of racers out of sight: %s\n",
++               on ? "moved on (every machine alike)" : "the game's");
++}
++
+ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2)
+ {
+   ++s_frames;
+@@ -358,6 +393,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+                  std::min<std::size_t>(pads.size(), count),
+                  std::min<std::size_t>(pads.size(), count) - 1);
+     PatchHud(camera_seat);
++    PatchAnimation(true);
+   }
+   if (!s_race)
+     return false;
+@@ -370,6 +406,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+         racers[k * kRacerSize + kControl] = racers[k * kRacerSize + kCpuFlag] = 1;
+     s_race = false;
+     PatchHud(0);
++    PatchAnimation(false);
+     std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
+     return false;
+   }
+@@ -436,6 +473,11 @@ std::uint64_t RacersHash()
+   static constexpr std::pair<std::uint32_t, std::uint32_t> kCameraFields[] = {
+       {0x370, 0x394},   {0x8B4, 0x8B8},   {0x8C0, 0x8C4},  {0xDC4, 0xE74},  {0xFD8, 0xFDC},
+       {0x1000, 0x1004}, {0x1036, 0x1037}, {0x105C, 0x1060}};  // not +0x102C: the rank
++  // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
++  // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
++  // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
++  static constexpr std::pair<std::uint32_t, std::uint8_t> kCameraBits[] = {{0xBAD, 0x01},
++                                                                           {0xBB9, 0x01}};
+   std::uint64_t hash = 0xCBF29CE484222325ull;
+   for (std::uint32_t k = 0; k < 8; ++k)
+   {
+@@ -444,7 +486,10 @@ std::uint64_t RacersHash()
+       bool skip = false;
+       for (const auto& [a, b] : kCameraFields)
+         skip = skip || (i >= a && i < b);
+-      hash ^= skip ? 0 : racers[k * kRacerSize + i];
++      std::uint8_t byte = racers[k * kRacerSize + i];
++      for (const auto& [at, bits] : kCameraBits)
++        byte = i == at ? static_cast<std::uint8_t>(byte & ~bits) : byte;
++      hash ^= skip ? 0 : byte;
+       hash *= 0x100000001B3ull;
+     }
+   }
+-- 
+2.34.1.windows.1
+
