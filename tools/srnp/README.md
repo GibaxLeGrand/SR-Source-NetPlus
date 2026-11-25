@@ -101,6 +101,9 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   see racer 5 as a CPU, through code in free low memory) by halving the game's 128 reads, after MEM1
   and ARAM dumps (`SRNP_ARAMDUMP=<frames>:<folder>`). 8-player demo, 8 simulated players: the 8 views
   whole, 0 divergences, the race unchanged.
+- Patch 0027 (the labels session's, merged): the waiting screen's counts on one line, each seat's tag
+  (`SRNP_TAGS`) under its card and "YOU" in yellow, in the font of the game's names (GoalResult_01_E,
+  read from the player's GTSE; the ImGui text without it).
 - `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (leftovers of an earlier demo
   are stopped, other sessions' runners waited for; `N=<seats>`, `TOUS_CPU`): the waiting screen fills up, then the race, photos of the 8 windows at
   three frames of the game, and contact sheets.

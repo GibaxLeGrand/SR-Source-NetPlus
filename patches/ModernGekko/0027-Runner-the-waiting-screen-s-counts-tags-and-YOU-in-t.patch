@@ -1,0 +1,356 @@
+From 5d3679ac177dc4cf29d1a43b92d7a879c1d84b3a Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:02:00 +0100
+Subject: [PATCH] Runner: the waiting screen's counts, tags and "YOU" in the
+ names' font
+
+Gibax: "pour cet ecran met la police qu'on a fait", and "pouvoir aussi
+ajouter le tag d'un joueur". The waiting screen's "8 PLAYERS", "8 RACERS",
+"2/8 READY" and "YOU", and each seat's tag (SRNP_TAGS, under its card),
+are written in the font of the results' names.
+
+- srnp_labels: NameFontText() lays any text out in that font (the
+  names' letters, the others from Saira, now with '/'), and PlayerTag()
+  gives a seat's tag.
+- srnp_game_textures: NameText() reads "GoalResult_01_E" from the
+  player's GTSE file (the 7th GVR texture; the game has loaded nothing
+  yet while it waits), lays the text out and makes it an ImGui texture,
+  cached per text.
+- srnp_waiting_screen: the counts as one line with a gap between them,
+  made smaller together when needed; every tag the size at which 8 wide
+  letters fit a column; "YOU" in the menus' yellow under the tag. Without
+  the GTSE, the ImGui text as before.
+
+Seen on two runners waiting for 8 seats (2/8), tags GIBAX, TAILSMKR,
+K-NUX, AMY_R, -, WAVE!, BOB-PIP, ZAP-2024.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_game_textures.cpp  | 68 +++++++++++++++++++++++++++++
+ src/runtime/srnp_game_textures.hpp  |  5 +++
+ src/runtime/srnp_labels.cpp         | 57 ++++++++++++++++++++++--
+ src/runtime/srnp_labels.hpp         | 14 ++++++
+ src/runtime/srnp_waiting_screen.cpp | 68 +++++++++++++++++++++++++++--
+ 5 files changed, 205 insertions(+), 7 deletions(-)
+
+diff --git a/src/runtime/srnp_game_textures.cpp b/src/runtime/srnp_game_textures.cpp
+index b08ed2a..1262f75 100644
+--- a/src/runtime/srnp_game_textures.cpp
++++ b/src/runtime/srnp_game_textures.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include "srnp_game_textures.hpp"
++#include "srnp_labels.hpp"
+ 
+ #include "VideoCommon/AbstractGfx.h"
+ #include "VideoCommon/AbstractTexture.h"
+@@ -240,8 +241,75 @@ Decoded DecodeC8(const std::vector<std::uint8_t>& d, std::size_t palette, std::s
+                 Rgb5a3(Be16(d, palette + 2u * d[n]));
+   return out;
+ }
++// GTSE's 7th GVR texture, "GoalResult_01_E" (the results' names, 256x256 CI4): its palette indices,
++// row by row, and its 16 colours.
++bool NamesTexture(std::vector<std::uint8_t>* indices, std::vector<std::uint32_t>* colours)
++{
++  const std::vector<std::uint8_t>& d = File(s_root / "files" / "GTSE");
++  std::size_t at = 0;
++  int k = -1;
++  for (;;)
++  {
++    std::size_t found = std::string::npos;
++    for (std::size_t i = at; i + 4 <= d.size(); ++i)
++      if (d[i] == 'G' && d[i + 1] == 'C' && d[i + 2] == 'I' && d[i + 3] == 'X')
++      {
++        found = i;
++        break;
++      }
++    if (found == std::string::npos)
++      return false;
++    if (++k == 6)
++    {
++      at = found;
++      break;
++    }
++    at = found + 4;
++  }
++  const std::size_t g = at + 0x10;
++  if (Be32(d, g) != 0x47565254u || d[g + 0xB] != 8 || Be16(d, g + 0xC) != 256 || Be16(d, g + 0xE) != 256)
++    return false;
++  const std::size_t palette = g + 0x10, texels = palette + 0x20;
++  if (texels + 256 * 256 / 2 > d.size())
++    return false;
++  colours->resize(16);
++  for (std::size_t c = 0; c < 16; ++c)
++    (*colours)[c] = Rgb5a3(Be16(d, palette + 2 * c));
++  indices->assign(256 * 256, 0);
++  std::size_t n = 0;
++  for (int ty = 0; ty < 256; ty += 8)
++    for (int tx = 0; tx < 256; tx += 8)
++      for (int y = 0; y < 8; ++y)
++        for (int x = 0; x < 8; ++x, ++n)
++        {
++          const std::uint8_t b = d[texels + n / 2];
++          (*indices)[static_cast<std::size_t>(ty + y) * 256 + static_cast<std::size_t>(tx + x)] =
++              static_cast<std::uint8_t>(n % 2 == 0 ? b >> 4 : b & 15);
++        }
++  return true;
++}
+ }  // namespace
+ 
++GamePicture NameText(const std::string& text)
++{
++  return Cached("srnp name font: " + text, 0, [&] {
++    Decoded out;
++    std::vector<std::uint8_t> names;
++    std::vector<std::uint32_t> colours;
++    if (!NamesTexture(&names, &colours))
++      return out;
++    int w = 0;
++    const std::vector<std::uint8_t> laid = NameFontText(names, text, &w);
++    if (laid.empty() || w <= 0)
++      return out;
++    out.width = w, out.height = 16;
++    out.rgba.resize(laid.size());
++    for (std::size_t i = 0; i < laid.size(); ++i)
++      out.rgba[i] = colours[laid[i]];  // index 0 is clear in the names' palette
++    return out;
++  });
++}
++
+ void SetGameRoot(const std::filesystem::path& root)
+ {
+   s_root = root;
+diff --git a/src/runtime/srnp_game_textures.hpp b/src/runtime/srnp_game_textures.hpp
+index 5ef4518..d33b525 100644
+--- a/src/runtime/srnp_game_textures.hpp
++++ b/src/runtime/srnp_game_textures.hpp
+@@ -34,4 +34,9 @@ void SetModDirectories(const std::vector<std::filesystem::path>& directories);
+ // "SRNPLBL1": u16 width, u16 height, u32 GX format 9, u32 palette offset, u32 texels offset; 256
+ // RGB5A3 colours, then C8 texels). Not ok without the mod.
+ GamePicture LabelsTexture();
++
++// `text` in the font of the game's results names (srnp_labels.hpp: the names' letters read from GTSE's
++// "GoalResult_01_E", the others from Saira), white with the names' black outline, for ImGui (a tint
++// colours the white); cached per text. Not ok without the game's GTSE.
++GamePicture NameText(const std::string& text);
+ }  // namespace srnp
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index bb72d14..c6de212 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -623,6 +623,7 @@ const DrawnGlyph kDrawn[] = {
+     {'!', 0, {"  CCC", "  FFD", "  FFC", " CFF", " 8FE", " DF8", " EF", " ED", "", "EF8", "FFC", "CC", nullptr}},
+     {'?', 0, {" C888C", "8FFFFFF", "C8C8DFFC", "    CFF", "   CEFF", " CFFFE", " EF8", " EE", "", "DFD", "FF8", "CC", nullptr}},
+     {'_', 12, {"C88888", "EFFFFF", nullptr}},
++    {'/', 0, {"       8FD", "       FF", "      EFC", "     8FD", "     FF", "    EFC", "   8FD", "   FF", "  DFC", " 8FD", " FF", "DFC", nullptr}},
+ };
+ 
+ // The font: the game's letters, then the drawn ones (kDrawn, generated outline).
+@@ -643,9 +644,9 @@ std::map<char, Pixels> ResultsFont(const std::vector<std::uint8_t>& idx)
+   return font;
+ }
+ 
+-// One tag, laid out and centred like the game's names (fill centre at x 66 of 128), rows relative to the
+-// top of the capitals.
+-Pixels LayOut(const std::map<char, Pixels>& font, const std::string& tag)
++// A text laid out like the game's names (fills one texel apart, the strongest index wins where two
++// letters touch), from x 4, rows relative to the top of the capitals.
++Pixels Compose(const std::map<char, Pixels>& font, const std::string& tag)
+ {
+   Pixels out;
+   int x = 4;
+@@ -673,6 +674,13 @@ Pixels LayOut(const std::map<char, Pixels>& font, const std::string& tag)
+     }
+     x += right + 2;
+   }
++  return out;
++}
++
++// One tag, laid out and centred like the game's names (fill centre at x 66 of 128).
++Pixels LayOut(const std::map<char, Pixels>& font, const std::string& tag)
++{
++  const Pixels out = Compose(font, tag);
+   int x0 = 1 << 20, x1 = -(1 << 20);
+   for (const auto& [p, v] : out)
+     if (IsFill(v))
+@@ -810,6 +818,49 @@ void WriteAll(bool ours)
+ }
+ }  // namespace
+ 
++std::vector<std::uint8_t> NameFontText(const std::vector<std::uint8_t>& names, const std::string& text,
++                                       int* width)
++{
++  // the font is made once: the names' texture is the same file each time
++  static std::map<char, Pixels> font;
++  static bool made = false;
++  if (!made)
++  {
++    if (names.size() != 256 * 256)
++      return {};
++    font = ResultsFont(names);
++    made = true;
++  }
++  std::string upper(text);
++  for (char& c : upper)
++    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++  const Pixels laid = Compose(font, upper);
++  int x0 = 1 << 20, x1 = -(1 << 20);
++  for (const auto& [p, v] : laid)
++  {
++    x0 = std::min(x0, p.first);
++    x1 = std::max(x1, p.first);
++  }
++  if (x1 < x0)
++    return {};
++  const int w = x1 - x0 + 1;
++  std::vector<std::uint8_t> out(static_cast<std::size_t>(w) * 16, 0);
++  for (const auto& [p, v] : laid)
++  {
++    const int y = p.second + 2;  // the capitals' top on row 2, as in the game's names
++    if (y >= 0 && y < 16)
++      out[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.first - x0)] = v;
++  }
++  *width = w;
++  return out;
++}
++
++const std::string& PlayerTag(int seat)
++{
++  static const std::string none;
++  return seat >= 0 && seat < 8 ? Tags()[static_cast<std::size_t>(seat)] : none;
++}
++
+ void LabelsOnFrame()
+ {
+   static const bool off = [] {
+diff --git a/src/runtime/srnp_labels.hpp b/src/runtime/srnp_labels.hpp
+index a9106e8..fb755ab 100644
+--- a/src/runtime/srnp_labels.hpp
++++ b/src/runtime/srnp_labels.hpp
+@@ -33,8 +33,22 @@
+ // (racer 0, or the viewport's), or the phase 2 runner's "spotter" (the seat's racer).
+ #pragma once
+ 
++#include <cstdint>
++#include <string>
++#include <vector>
++
+ namespace srnp
+ {
+ // On the emulation thread, after each present.
+ void LabelsOnFrame();
++
++// The font of the results' names, for the runner's own screens (srnp_game_textures.hpp): `text` in upper
++// case, laid out like the names, from the names' texture `names` ("GoalResult_01_E": 256x256 palette
++// indices, row by row; the letters it lacks from Saira), as its palette indices, `*width` x 16 (the
++// outline included, the capitals' top on row 2). Empty if it can't be had.
++std::vector<std::uint8_t> NameFontText(const std::vector<std::uint8_t>& names, const std::string& text,
++                                       int* width);
++
++// A seat's tag (SRNP_TAGS), "" without one.
++const std::string& PlayerTag(int seat);
+ }  // namespace srnp
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 51170bf..4a10b21 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "srnp_relay.hpp"
+ #include "srnp_game_textures.hpp"
++#include "srnp_labels.hpp"
+ 
+ #include <imgui.h>
+ 
+@@ -84,6 +85,23 @@ void Picture(ImDrawList* list, const GamePicture& p, ImVec2 a, ImVec2 b, ImVec2
+     list->AddImage(p.texture, a, b, uv0, uv1, tint);
+ }
+ 
++// Text in the font of the game's results names (Gibax, 2026-11-25: the counts, "YOU" and the players'
++// tags as the results screen writes the names), `height` tall with its outline (16 texels), centred,
++// narrowed to `max_width`; the tint colours its white. False without the game's GTSE.
++bool NameTextCentred(ImDrawList* list, const std::string& text, ImVec2 centre, float height, ImU32 tint,
++                     float max_width = 1e9f)
++{
++  const GamePicture p = NameText(text);
++  if (!p.ok || p.height <= 0.0f)
++    return false;
++  float h = height, w = p.width * height / p.height;
++  if (w > max_width)
++    h *= max_width / w, w = max_width;
++  Picture(list, p, ImVec2(centre.x - w * 0.5f, centre.y - h * 0.5f), ImVec2(centre.x + w * 0.5f, centre.y + h * 0.5f),
++          ImVec2(0, 0), ImVec2(1, 1), tint);
++  return true;
++}
++
+ // The game's label ("1P".."4P", "COM": the HUD atlas, 36x30 at (76 + 36 k, 60), as the game's table at
+ // 0x805D3DB4 has them); "5P".."8P" from the labels mod (srnp_etiquettes: 36x30 side by side), or drawn
+ // in the game's colours without it.
+@@ -147,8 +165,41 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+             ImVec2(display.x * 0.5f + w * 0.5f, display.y * 0.04f + h), ImVec2(0, 0), ImVec2(1, 40.0f / 256.0f));
+   }
+   char line[64];
+-  std::snprintf(line, sizeof(line), "%d Players    %d Racers    %d/%d Ready", players, seats, ready, players);
+-  TextCentred(list, font, unit * 0.95f, ImVec2(display.x * 0.5f, display.y * 0.19f), Rgba(255, 255, 255), line);
++  const bool name_font = NameText("YOU").ok;
++  if (name_font)
++  {
++    // the three counts in the names' font, as one line with a gap between them, made smaller together if
++    // the line would not fit
++    char texts[3][32];
++    std::snprintf(texts[0], sizeof(texts[0]), "%d PLAYERS", players);
++    std::snprintf(texts[1], sizeof(texts[1]), "%d RACERS", seats);
++    std::snprintf(texts[2], sizeof(texts[2]), "%d/%d READY", ready, players);
++    float h = unit * 0.95f, gap = unit * 1.6f;
++    GamePicture pictures[3];
++    float total = 2.0f * gap;
++    for (int i = 0; i < 3; ++i)
++    {
++      pictures[i] = NameText(texts[i]);
++      total += pictures[i].ok && pictures[i].height > 0.0f ? pictures[i].width * h / pictures[i].height : 0.0f;
++    }
++    const float fit = std::min(1.0f, display.x * 0.9f / total);
++    h *= fit, gap *= fit, total *= fit;
++    float x0 = display.x * 0.5f - total * 0.5f;
++    const float cy = display.y * 0.19f;
++    for (int i = 0; i < 3; ++i)
++    {
++      if (!pictures[i].ok || pictures[i].height <= 0.0f)
++        continue;
++      const float w = pictures[i].width * h / pictures[i].height;
++      Picture(list, pictures[i], ImVec2(x0, cy - h * 0.5f), ImVec2(x0 + w, cy + h * 0.5f));
++      x0 += w + gap;
++    }
++  }
++  else
++  {
++    std::snprintf(line, sizeof(line), "%d Players    %d Racers    %d/%d Ready", players, seats, ready, players);
++    TextCentred(list, font, unit * 0.95f, ImVec2(display.x * 0.5f, display.y * 0.19f), Rgba(255, 255, 255), line);
++  }
+ 
+   const GamePicture panel = GameTexture(kMenus, 116);
+   const float column = display.x / static_cast<float>(seats + 1);
+@@ -205,8 +256,17 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+       const float pulse = 0.6f + 0.4f * static_cast<float>(std::sin(now * 4.0));
+       list->AddCircle(mark, r, Rgba(40, 170, 255, pulse), 0, unit * 0.2f);
+     }
+-    if (mine)
+-      TextCentred(list, font, unit * 0.5f, ImVec2(x, b.y + unit * 0.5f), Rgba(255, 214, 64), "YOU");
++    // the player's tag under the card (SRNP_TAGS for now, the lobby later), every tag the same size: the
++    // size at which 8 wide letters (about 110 texels of the 16-texel-high font) fit the column; then
++    // "YOU" for this machine's seat
++    const float tag_h = std::min(unit * 0.9f, column * 0.96f * 16.0f / 110.0f);
++    float below = b.y + unit * 0.5f;
++    const std::string& tag = PlayerTag(k);
++    if (name_font && !tag.empty() &&
++        NameTextCentred(list, tag, ImVec2(x, b.y + tag_h * 0.6f), tag_h, IM_COL32_WHITE, column * 0.96f))
++      below = b.y + tag_h * 1.2f + unit * 0.45f;
++    if (mine && !(name_font && NameTextCentred(list, "YOU", ImVec2(x, below), unit * 0.7f, Rgba(255, 214, 64))))
++      TextCentred(list, font, unit * 0.5f, ImVec2(x, below), Rgba(255, 214, 64), "YOU");
+   }
+ }
+ 
+-- 
+2.34.1.windows.1
+
