@@ -10,6 +10,12 @@ seat has sent its input for f, or --delai-ms after the first input for f arrived
 gets its last official input repeated, so a slow machine does not hold the others back, and its own
 input for that frame, arriving later, is dropped. Frames are closed in order. Checksums of the same
 frame are compared as soon as every seat has sent one: the journal says "identique" or "DIVERGENCE".
+
+Start together: the relay answers each HELLO with WAIT <present> <seats> to every connection, and again
+every 2 s while a seat is missing (the runners wait at their first frame, and the line keeps their
+connection alive); once every seat is there it sends GO. Until every seat has sent its first input, no
+frame is closed without it (a runner that has just loaded is slow for a while): no input of the start
+is replaced.
 """
 import argparse
 import asyncio
@@ -32,6 +38,9 @@ class Relais:
         self.dernier = [NEUTRE] * sieges
         self.prochaine = None         # prochaine frame à fermer
         self.demarre = False          # tous les sièges ont dit HELLO
+        self.go = False               # GO envoyé
+        self.vus = set()              # sièges qui ont envoyé au moins une entrée
+        self.dernier_wait = 0.0
         self.delai_entree = 0         # délai d'entrée annoncé par les sièges (HELLO)
         self.f_saisie = 0             # première frame qui a des entrées
         self.retard_siege = [0] * sieges
@@ -86,7 +95,8 @@ class Relais:
                 echeance = self.t0 + (f - self.f0) / self.cadence + self.delai
                 if not complete and time.monotonic() < echeance:
                     return
-            elif not complete and time.monotonic() - self.premiere[f] < self.delai:
+            elif not complete and (len(self.vus) < self.sieges or time.monotonic() - self.premiere[f] < self.delai):
+                # Au départ, pas de délai tant qu'un siège n'a rien envoyé : il vient de charger.
                 return
             pads = []
             for s in range(self.sieges):
@@ -108,9 +118,22 @@ class Relais:
                 self.log(f"frame {f} fermée ; {self.fermees} frames, {self.en_retard} entrées en retard "
                          f"remplacées ; sommes de contrôle : {self.ck_ok} identiques, {self.ck_ko} divergences")
 
+    async def annoncer(self):
+        """WAIT <présents> <sièges> à tous, ou GO quand tout le monde est là."""
+        presents = len(self.clients)
+        if presents >= self.sieges and not self.go:
+            self.go = True
+            self.log(f"tous les sièges sont là : GO")
+            await self.diffuser("GO")
+        elif not self.go:
+            self.dernier_wait = time.monotonic()
+            await self.diffuser(f"WAIT {presents} {self.sieges}")
+
     async def minuteur(self):
         while True:
             await asyncio.sleep(0.005)
+            if not self.go and self.clients and time.monotonic() - self.dernier_wait > 2.0:
+                await self.annoncer()
             await self.fermer_pretes()
 
     def controle(self, frame, siege, valeur):
@@ -142,9 +165,14 @@ class Relais:
                         self.delai_entree = max(self.delai_entree, int(mots[3]))
                     self.clients[siege] = writer
                     self.log(f"siège {siege} connecté ({len(self.clients)}/{self.sieges})")
+                    await self.annoncer()
                 elif mots[0] == "IN":
                     f, s, pad = int(mots[1]), int(mots[2]), mots[3]
                     self.derniere_recue[s] = f
+                    if s not in self.vus:
+                        self.vus.add(s)
+                        if len(self.vus) == self.sieges:
+                            self.log(f"tous les sièges ont envoyé une entrée : délai de {self.delai * 1000:.0f} ms")
                     self.nb_recues[s] = self.nb_recues.get(s, 0) + 1
                     if self.nb_recues[s] <= 5:
                         self.log(f"entrée du siège {s} pour la frame {f} (prochaine à fermer : {self.prochaine})")

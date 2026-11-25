@@ -63,6 +63,10 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   in the GTSE of the srnp_etiquettes file mod; nothing changes without it). `ETIQ="0 3"` (or all) in the
   lockstep script mounts the mod on those runners (and srnp_etiquettes_hd with `HD`); start from a save
   state taken before the race loads (pret1p...).
+- Start together (patch 0015): the relay answers each HELLO with `WAIT <present> <seats>` (again every
+  2 s while a seat is missing) and sends `GO` once every seat is there; the runners wait at their first
+  frame. Until every seat has sent an input, no frame is closed without it. `ECART=<s>` in the lockstep
+  script launches the runners that many seconds apart.
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same

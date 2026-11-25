@@ -1,0 +1,137 @@
+From 91b3da6760d0186a347d795a50e6339ea667b0df Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:04:56 +0100
+Subject: [PATCH] Runner: start together: wait at the first frame for the
+ relay's GO
+
+After HELLO the runner waits at its first frame until every seat is
+there: the relay says WAIT <present> <seats> at each arrival and every
+2 s (which also keeps the connection alive past the receive time
+limit), then GO. Before, a seat arriving more than 60 s after the first
+made the others give up the relay. srnp::RelayWaiting() gives the
+waiting state (present, seats) to a waiting screen.
+
+Measured: 8 runners on one PC launched 3 s apart: each waits ("1/8" to
+"8/8" for the first), GO when the 8th arrives, then 44 checksums equal,
+0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp | 55 ++++++++++++++++++++++++++++++++++++++
+ src/runtime/srnp_relay.hpp |  4 +++
+ 2 files changed, 59 insertions(+)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 2380a93..b127b76 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -6,6 +6,8 @@
+ //   IN <frame> <seat> <pad>          pad: 16 hex digits (below)
+ //   CK <frame> <seat> <hash>         hash: 16 hex digits (FNV-1a 64 of the game's state)
+ // relay -> client
++//   WAIT <present> <seats>           at each arrival and every 2 s until every seat is there
++//   GO                               every seat is there: the runners leave their first frame
+ //   OF <frame> <pad seat 0> <pad seat 1> ...
+ // A pad is 8 bytes: buttons (16 bits: A B X Y Z Start Up Down Left Right L R), main stick X, Y,
+ // C-stick X, Y (signed, -127..127), L, R (0..255).
+@@ -25,6 +27,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <thread>
+ #include <cstdio>
+@@ -74,6 +77,11 @@ struct Relay
+ 
+ Relay s_relay;
+ 
++// The start: seats present and expected, while waiting for GO (read by the waiting screen).
++std::atomic<bool> s_waiting{false};
++std::atomic<int> s_wait_present{0};
++std::atomic<int> s_wait_seats{0};
++
+ void Off(const char* why)
+ {
+   std::fprintf(stderr, "[srnp relay] off: %s\n", why);
+@@ -347,8 +355,54 @@ bool Connect()
+       return false;
+   return true;
+ }
++
++// The start together: after HELLO, the runner waits at its first frame until every seat is there. The
++// relay says WAIT <present> <seats> at each arrival and every 2 s (which keeps the connection alive past
++// the receive time limit), then GO.
++void WaitForGo()
++{
++  s_wait_seats = s_relay.seats;
++  s_waiting = true;
++  const auto t0 = std::chrono::steady_clock::now();
++  int shown = -1;
++  for (;;)
++  {
++    std::string line;
++    if (!ReadLine(&line))
++    {
++      s_waiting = false;
++      return Off("relay lost while waiting for the other seats");
++    }
++    if (line == "GO")
++      break;
++    int present = 0, seats = 0;
++    if (std::sscanf(line.c_str(), "WAIT %d %d", &present, &seats) == 2)
++    {
++      s_wait_present = present;
++      s_wait_seats = seats;
++      if (present != shown)
++      {
++        shown = present;
++        std::fprintf(stderr, "[srnp relay] waiting for the other seats: %d/%d\n", present, seats);
++      }
++    }
++  }
++  s_waiting = false;
++  const double waited =
++      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++  std::fprintf(stderr, "[srnp relay] every seat is there: go (waited %.1f s)\n", waited);
++}
+ }  // namespace
+ 
++bool RelayWaiting(int* present, int* seats)
++{
++  if (present)
++    *present = s_wait_present;
++  if (seats)
++    *seats = s_wait_seats;
++  return s_waiting;
++}
++
+ namespace
+ {
+ std::uint64_t s_game_frames = 0;
+@@ -413,6 +467,7 @@ void RelayStep(std::uint64_t frame)
+                    "frames%s\n",
+                    seats.c_str(), s_relay.seats, s_relay.input_mode.c_str(), s_relay.delay,
+                    s_relay.check_every, racers.c_str());
++      WaitForGo();
+     }
+     else if (std::getenv("SRNP_RELAY"))
+       Off("cannot reach the relay");
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index e4cf587..46ed01e 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -24,6 +24,10 @@ void RelayOnFrame(std::uint64_t frame);
+ // opens as in Netplay, the match going on behind it).
+ bool RelayConfigured();
+ 
++// The start together: true while this runner waits at its first frame for the other seats (the relay's
++// WAIT <present> <seats>, until GO), with how many are there. For a waiting screen (any thread).
++bool RelayWaiting(int* present, int* seats);
++
+ // Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
+ // Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
+ // drawn), through a StaticRecomp host hook. Inputs are then applied, and checksums taken, at the same
+-- 
+2.34.1.windows.1
+

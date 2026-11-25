@@ -93,6 +93,9 @@ for r in $(seq 0 $((N - 1))); do
     ./moderngekko-run.exe "${ARGS[@]}" > "$D/runner.log" 2>&1 &
   PIDS+=($!)
   echo "runner $r : sièges $SEATS"
+  # ECART=<s> : délai entre deux lancements (des joueurs qui arrivent l'un après l'autre : les runners
+  # attendent à leur première frame le GO du relais).
+  sleep "${ECART:-0}"
 done
 attend() {  # attend <commande> <limite s>
   local T0=$SECONDS
