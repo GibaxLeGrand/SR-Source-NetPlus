@@ -1,0 +1,81 @@
+From 1c333505b36515b42f9f02baeabceb2fe0251ab4 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:35:07 +0100
+Subject: [PATCH 2/7] StaticRecomp: cache lines with no code skip the icache
+ invalidation
+
+From Piconet's RecompCore (piconet-live/recompcore, OnICacheInvalidate's
+fast reject): with the data cache not emulated, every dcbst/dcbf of a
+guest DCStoreRange/DCFlushRange over data reaches OnICacheInvalidate,
+which searched the module's chunks and invalidated the fallback JIT's
+cache for nothing. A line of main RAM with no module code (the lookup
+table's eight entries) and no fallback JIT block (its valid-block bit)
+now returns at once.
+
+Sonic Riders, demo race, 1800 frames, uncapped: ~15 % of the CPU-GPU
+thread was in this path (sampled profile); 151.6-156.1 -> 174.8-176.5
+frames/s. _Main.rel's BSS at the pause: identical (0 words).
+SRNP_ICACHE_FAST=0 keeps the old path, for comparisons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../StaticRecomp/StaticRecompCore_SMC.cpp     | 36 +++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 491c57ef3a..815aba5388 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -8,6 +8,7 @@
+ #include "Common/Logging/Log.h"
+ #include <algorithm>
+ #include <cstdio>
++#include <cstdlib>
+ 
+ namespace
+ {
+@@ -332,6 +333,41 @@ void StaticRecompCore::VerifyChunk(u32 index)
+ 
+ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+ {
++  // From Piconet's RecompCore (piconet-live/recompcore, StaticRecompCore_SMC.cpp, GPL-2.0-or-later):
++  // one cache line of main RAM that holds no code of the module and no block of the fallback JIT
++  // has nothing to invalidate. That is every line of a guest DCFlushRange/DCStoreRange over data
++  // (thousands a frame in Sonic Riders too: ~15 % of a race's host time went to this function and
++  // the fallback JIT's InvalidateICache, profile of 2026-11-25), and what Jit64's own dcbx fast
++  // path tests (the block bit of the line). SRNP_ICACHE_FAST=0 keeps the old path, for comparisons.
++  static const bool fast_reject = [] {
++    const char* off = std::getenv("SRNP_ICACHE_FAST");
++    return !(off && off[0] == '0');
++  }();
++  if (fast_reject && m_module_active && !m_has_rel_modules && length != 0 && length <= 32u &&
++      ((address ^ (address + (length - 1u))) & ~31u) == 0 && address >= 0x80000000u &&
++      (address | 31u) - 0x80000000u < m_lookup_ram_size && !m_chunk_lookup_table.empty())
++  {
++    // The line's eight entries of the lookup table. The line number is taken first and then
++    // scaled (Piconet: MSVC 19.44 miscompiles `((address & ~31u) - 0x80000000u) >> 2`).
++    const std::size_t first_word = static_cast<std::size_t>((address - 0x80000000u) >> 5) << 3;
++    bool code = true;
++    if (first_word + 8 <= m_chunk_lookup_table.size())
++    {
++      const int* const entries = m_chunk_lookup_table.data() + first_word;
++      code = false;
++      for (std::size_t i = 0; i < 8; ++i)
++        code |= entries[i] >= 0;
++    }
++    bool jit_block = false;
++    if (m_fallback_jit)
++    {
++      const u32 line = (address & 0x3FFFFFFFu) >> 5;
++      jit_block = (m_fallback_jit->GetBlockCache()->GetBlockBitSet()[line / 32u] &
++                   (1u << (line % 32u))) != 0;
++    }
++    if (!code && !jit_block)
++      return;
++  }
+   if (m_fallback_jit)
+   {
+     m_fallback_jit->GetBlockCache()->InvalidateICache(address, length, false);
+-- 
+2.34.1.windows.1
+

@@ -1,0 +1,138 @@
+From 6571ba679cab8f6a550d570c143cb5796a972d88 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:37:37 +0100
+Subject: [PATCH] llvm: DOLRECOMP_EE_EXIT=pending leaves at MSR[EE] 0->1 only
+ with an interrupt pending
+
+SR-Source Net Plus (Sonic Riders), on top of Piconet's fork.
+An ordinary body side-exits to guest_pc+4 whenever a write sets MSR[EE],
+so that the run loop can deliver a pending external interrupt. The run
+loop does that only when one is pending; otherwise it dispatches the
+next instruction at once, and the exit has unwound the native call stack
+for nothing: every guest return above it then goes through the
+dispatcher too. In Sonic Riders' races OSRestoreInterrupts and
+OSEnableInterrupts made most of the dispatches left after Piconet's
+switches.
+
+With the switch, the body reads the host's exception word through
+dolrecomp_exceptions (thread-local pointer, set by the host through
+staticrecomp_set_exceptions, which fastlookup.py now writes into
+native_tables.c) and leaves only when EXCEPTION_EXTERNAL_INT (0x4) is
+set in it. A host that hands over no word gets the old exit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/backend/codegen_switches.h            |  1 +
+ src/backend/llvm/emitter.cpp              |  2 ++
+ src/backend/llvm/emitter.h                |  4 ++++
+ src/backend/llvm/special_instructions.cpp | 28 ++++++++++++++++++++++-
+ tools/fastlookup.py                       |  7 ++++++
+ 5 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/codegen_switches.h b/src/backend/codegen_switches.h
+index 03746fc..46b64dc 100644
+--- a/src/backend/codegen_switches.h
++++ b/src/backend/codegen_switches.h
+@@ -38,6 +38,7 @@ static const char* const dolrecomp_codegen_switches[] = {
+     "DOLRECOMP_ENTRY_QUERY",
+     "DOLRECOMP_COUNT",
+     "DOLRECOMP_HOST_FEATURES",
++    "DOLRECOMP_EE_EXIT",
+     "DOLRECOMP_HOST_TUNE",
+     "DOLRECOMP_UNMAPPED_READS",
+     "DOLRECOMP_INDIRECT_GUARDS",
+diff --git a/src/backend/llvm/emitter.cpp b/src/backend/llvm/emitter.cpp
+index 896a8a7..9bc7711 100644
+--- a/src/backend/llvm/emitter.cpp
++++ b/src/backend/llvm/emitter.cpp
+@@ -66,6 +66,8 @@ FunctionEmitter::FunctionEmitter(LLVMContext &context, Module &module,
+   inline_gather_pipe_ =
+       !modern_runtime_ && !native_abi_ && !write_journal_ &&
+       dolrecomp_codegen_switch_is("DOLRECOMP_GATHER_PIPE", "inline");
++  ee_exit_pending_ =
++      !modern_runtime_ && dolrecomp_codegen_switch_is("DOLRECOMP_EE_EXIT", "pending");
+   entry_check_ = !modern_runtime_ && !native_abi_ &&
+                  !dolrecomp_codegen_switch_is("DOLRECOMP_ENTRY_CHECK", "off");
+   register_counters_ =
+diff --git a/src/backend/llvm/emitter.h b/src/backend/llvm/emitter.h
+index 3e7147a..a9d0327 100644
+--- a/src/backend/llvm/emitter.h
++++ b/src/backend/llvm/emitter.h
+@@ -654,6 +654,10 @@ private:
+   // DOLRECOMP_GATHER_PIPE=inline: stores to the write-gather pipe's page
+   // append to the host's pipe buffer in generated code (memory.cpp).
+   bool inline_gather_pipe_ = false;
++  // DOLRECOMP_EE_EXIT=pending (SR-Source Net Plus): when a write sets MSR[EE], leave for the run
++  // loop only if the host says an external interrupt is pending (dolrecomp_exceptions, a pointer
++  // to its exception word, handed over through staticrecomp_set_exceptions; null: always leave).
++  bool ee_exit_pending_ = false;
+   bool float_single_math_ = false;
+   bool track_singles_ = false;
+   SinglePlan *single_plan_ = nullptr;
+diff --git a/src/backend/llvm/special_instructions.cpp b/src/backend/llvm/special_instructions.cpp
+index ec4c286..3fb55f3 100644
+--- a/src/backend/llvm/special_instructions.cpp
++++ b/src/backend/llvm/special_instructions.cpp
+@@ -4,6 +4,7 @@
+ #include <llvm/ADT/SmallVector.h>
+ #include <llvm/IR/Constants.h>
+ #include <llvm/IR/Function.h>
++#include <llvm/IR/GlobalVariable.h>
+ #include <llvm/IR/Intrinsics.h>
+ #include <llvm/IR/Module.h>
+ 
+@@ -50,7 +51,32 @@ void FunctionEmitter::emitStateWrite(const DolIRInstruction &inst) {
+       builder_.getInt32(0));
+   BasicBlock *exit = BasicBlock::Create(context_, "msr_ee_exit", function_);
+   BasicBlock *resume = BasicBlock::Create(context_, "msr_ee_resume", function_);
+-  builder_.CreateCondBr(enabled, exit, resume);
++  if (ee_exit_pending_) {
++    // DOLRECOMP_EE_EXIT=pending (SR-Source Net Plus): the run loop delivers an external interrupt
++    // at this boundary only when one is pending (the host's exception word has
++    // EXCEPTION_EXTERNAL_INT, 0x4); otherwise it dispatches the next instruction at once. Ask the
++    // host's word here and go on in place when nothing is pending. No word handed over: leave.
++    Type *pointer = PointerType::getUnqual(context_);
++    auto *word = cast<GlobalVariable>(
++        module_.getOrInsertGlobal("dolrecomp_exceptions", pointer));
++    word->setVisibility(GlobalValue::HiddenVisibility);
++    word->setDSOLocal(true);
++    word->setThreadLocal(true);
++    BasicBlock *ask = BasicBlock::Create(context_, "msr_ee_ask", function_);
++    BasicBlock *check = BasicBlock::Create(context_, "msr_ee_check", function_);
++    builder_.CreateCondBr(enabled, ask, resume);
++    builder_.SetInsertPoint(ask);
++    Value *where = builder_.CreateLoad(pointer, word, "ee.word");
++    builder_.CreateCondBr(builder_.CreateIsNull(where), exit, check);
++    builder_.SetInsertPoint(check);
++    Value *pending = builder_.CreateICmpNE(
++        builder_.CreateAnd(builder_.CreateLoad(Type::getInt32Ty(context_), where),
++                           builder_.getInt32(0x4)),
++        builder_.getInt32(0));
++    builder_.CreateCondBr(pending, exit, resume);
++  } else {
++    builder_.CreateCondBr(enabled, exit, resume);
++  }
+   builder_.SetInsertPoint(exit);
+   sideExit(inst.guest_pc + 4u);
+   builder_.SetInsertPoint(resume);
+diff --git a/tools/fastlookup.py b/tools/fastlookup.py
+index 2af2046..93af828 100755
+--- a/tools/fastlookup.py
++++ b/tools/fastlookup.py
+@@ -51,6 +51,13 @@ DOLRECOMP_THREAD_LOCAL struct dolrecomp_gather_pipe_t dolrecomp_gather_pipe = {0
+     dolrecomp_gather_pipe.start = start;
+     dolrecomp_gather_pipe.flush = flush;
+ }
++/* DOLRECOMP_EE_EXIT=pending (SR-Source Net Plus): the host's exception word, read where a write
++   sets MSR[EE]; generated code leaves for the run loop only when an external interrupt is pending
++   in it. Null (a host that says nothing): it always leaves, as before. Thread-local, like the pipe. */
++DOLRECOMP_THREAD_LOCAL unsigned int* dolrecomp_exceptions = 0;
++""" + EXPORT + """void staticrecomp_set_exceptions(unsigned int* word) {
++    dolrecomp_exceptions = word;
++}
+ """
+ SET_VALID = EXPORT + """void staticrecomp_set_native_valid(unsigned int start, unsigned int end, int state) {
+     unsigned int address;
+-- 
+2.34.1.windows.1
+

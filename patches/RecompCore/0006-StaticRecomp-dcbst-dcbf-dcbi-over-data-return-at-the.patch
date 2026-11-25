@@ -1,0 +1,167 @@
+From b5b09fb525dbd4fd38dccbea0bd2e5446df792be Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:34:15 +0100
+Subject: [PATCH 6/7] StaticRecomp: dcbst/dcbf/dcbi over data return at the
+ cache hook
+
+With the data cache not emulated, a dcbst/dcbf/dcbi only invalidates
+the icache line, and on this core that does nothing for a line of main
+RAM with no module code and no fallback JIT block (the fast reject of
+OnICacheInvalidate, now LineHoldsNoCode). HookCacheControl takes that
+answer first and skips the MSR sync, the MMU translation and the block
+cache plumbing it went through for every line of a guest DCStoreRange.
+The fallback JIT's valid-block bits are looked up once.
+
+Sonic Riders, demo race, 1800 frames, module with Piconet's switches
+(budget, native indirect calls, closed bodies, inline gather pipe):
+208.2-208.6 -> 220.3-222.6 frames/s; MEM1 at the exact pause frame
+identical bit for bit. SRNP_ICACHE_FAST=0 keeps the old path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../PowerPC/StaticRecomp/StaticRecompCore.cpp |  2 +
+ .../PowerPC/StaticRecomp/StaticRecompCore.h   |  4 ++
+ .../StaticRecomp/StaticRecompCore_Hooks.cpp   |  8 +++
+ .../StaticRecomp/StaticRecompCore_SMC.cpp     | 65 ++++++++++---------
+ 4 files changed, 49 insertions(+), 30 deletions(-)
+
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 8e50477ae0..71e4213d6f 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -195,6 +195,7 @@ void StaticRecompCore::Init()
+ #elif defined(_M_X86_64)
+   m_fallback_jit = std::make_unique<Jit64>(m_system);
+ #endif
++  m_fallback_block_bits = nullptr;
+   if (m_fallback_jit)
+   {
+     m_fallback_jit->SetStaticRecompFallback(true);
+@@ -248,6 +249,7 @@ void StaticRecompCore::Shutdown()
+   {
+     m_fallback_jit->Shutdown();
+     m_fallback_jit.reset();
++    m_fallback_block_bits = nullptr;
+   }
+ }
+ 
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index 8cb3aef71e..f2113f3a50 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -127,6 +127,10 @@ private:
+   };
+ 
+   void OnICacheInvalidate(u32 address, u32 length);
++  // True when [address, address + length) is one cache line of main RAM with no code of the module
++  // and no block of the fallback JIT: invalidating it does nothing (SRNP_ICACHE_FAST=0: never).
++  bool LineHoldsNoCode(u32 address, u32 length);
++  u32* m_fallback_block_bits = nullptr;  // the fallback JIT's valid-block bits (fixed array)
+   int ChunkIndexOf(u32 address);
+   bool IsForcedFallbackAddress(u32 address) const;
+   bool ChunkContainsHostCall(u32 index) const;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 27d4eb1129..3697d7b4cf 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -418,6 +418,14 @@ void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32
+ {
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+   ea = core->TranslateRelAddress(ea);
++  // SR-Source Net Plus: dcbst/dcbf/dcbi with the data cache not emulated only invalidate the
++  // icache line, and on this core that does nothing for a line of main RAM with no module code
++  // and no fallback JIT block (OnICacheInvalidate's fast reject). Taking that answer here skips
++  // the MSR sync, the MMU translation and the block cache plumbing: ~8 % of a race's host time
++  // after B1-B7 (profile of 2026-11-25). SRNP_ICACHE_FAST=0 keeps the old path.
++  if (operation != PPC_CACHE_ICBI && !core->m_system.GetPPCState().m_enable_dcache &&
++      core->LineHoldsNoCode(ea & ~31u, 32))
++    return;
+   core->PropagateGuestMSR();
+   auto& ppc = core->m_system.GetPPCState();
+   auto& mmu = core->m_system.GetMMU();
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 425289b801..0e8475714a 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -361,43 +361,48 @@ void StaticRecompCore::VerifyChunk(u32 index)
+   }
+ }
+ 
+-void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
++// From Piconet's RecompCore (piconet-live/recompcore, StaticRecompCore_SMC.cpp, GPL-2.0-or-later):
++// one cache line of main RAM that holds no code of the module and no block of the fallback JIT
++// has nothing to invalidate. That is every line of a guest DCFlushRange/DCStoreRange over data
++// (thousands a frame in Sonic Riders too: ~15 % of a race's host time went to the icache
++// invalidation, profile of 2026-11-25), and what Jit64's own dcbx fast path tests (the block bit
++// of the line). SRNP_ICACHE_FAST=0 keeps the old path, for comparisons.
++bool StaticRecompCore::LineHoldsNoCode(u32 address, u32 length)
+ {
+-  // From Piconet's RecompCore (piconet-live/recompcore, StaticRecompCore_SMC.cpp, GPL-2.0-or-later):
+-  // one cache line of main RAM that holds no code of the module and no block of the fallback JIT
+-  // has nothing to invalidate. That is every line of a guest DCFlushRange/DCStoreRange over data
+-  // (thousands a frame in Sonic Riders too: ~15 % of a race's host time went to this function and
+-  // the fallback JIT's InvalidateICache, profile of 2026-11-25), and what Jit64's own dcbx fast
+-  // path tests (the block bit of the line). SRNP_ICACHE_FAST=0 keeps the old path, for comparisons.
+   static const bool fast_reject = [] {
+     const char* off = std::getenv("SRNP_ICACHE_FAST");
+     return !(off && off[0] == '0');
+   }();
+-  if (fast_reject && m_module_active && !m_has_rel_modules && length != 0 && length <= 32u &&
+-      ((address ^ (address + (length - 1u))) & ~31u) == 0 && address >= 0x80000000u &&
+-      (address | 31u) - 0x80000000u < m_lookup_ram_size && !m_chunk_lookup_table.empty())
++  if (!(fast_reject && m_module_active && !m_has_rel_modules && length != 0 && length <= 32u &&
++        ((address ^ (address + (length - 1u))) & ~31u) == 0 && address >= 0x80000000u &&
++        (address | 31u) - 0x80000000u < m_lookup_ram_size && !m_chunk_lookup_table.empty()))
++    return false;
++  // The line's eight entries of the lookup table. The line number is taken first and then
++  // scaled (Piconet: MSVC 19.44 miscompiles `((address & ~31u) - 0x80000000u) >> 2`).
++  const std::size_t first_word = static_cast<std::size_t>((address - 0x80000000u) >> 5) << 3;
++  if (first_word + 8 > m_chunk_lookup_table.size())
++    return false;
++  const int* const entries = m_chunk_lookup_table.data() + first_word;
++  bool code = false;
++  for (std::size_t i = 0; i < 8; ++i)
++    code |= entries[i] >= 0;
++  if (code)
++    return false;
++  if (m_fallback_jit)
+   {
+-    // The line's eight entries of the lookup table. The line number is taken first and then
+-    // scaled (Piconet: MSVC 19.44 miscompiles `((address & ~31u) - 0x80000000u) >> 2`).
+-    const std::size_t first_word = static_cast<std::size_t>((address - 0x80000000u) >> 5) << 3;
+-    bool code = true;
+-    if (first_word + 8 <= m_chunk_lookup_table.size())
+-    {
+-      const int* const entries = m_chunk_lookup_table.data() + first_word;
+-      code = false;
+-      for (std::size_t i = 0; i < 8; ++i)
+-        code |= entries[i] >= 0;
+-    }
+-    bool jit_block = false;
+-    if (m_fallback_jit)
+-    {
+-      const u32 line = (address & 0x3FFFFFFFu) >> 5;
+-      jit_block = (m_fallback_jit->GetBlockCache()->GetBlockBitSet()[line / 32u] &
+-                   (1u << (line % 32u))) != 0;
+-    }
+-    if (!code && !jit_block)
+-      return;
++    if (!m_fallback_block_bits)
++      m_fallback_block_bits = m_fallback_jit->GetBlockCache()->GetBlockBitSet();
++    const u32 line = (address & 0x3FFFFFFFu) >> 5;
++    if ((m_fallback_block_bits[line / 32u] & (1u << (line % 32u))) != 0)
++      return false;
+   }
++  return true;
++}
++
++void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
++{
++  if (LineHoldsNoCode(address, length))
++    return;
+   if (m_fallback_jit)
+   {
+     m_fallback_jit->GetBlockCache()->InvalidateICache(address, length, false);
+-- 
+2.34.1.windows.1
+

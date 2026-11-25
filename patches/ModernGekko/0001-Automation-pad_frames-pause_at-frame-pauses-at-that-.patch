@@ -1,0 +1,126 @@
+From 3173c6ccd527d621b45e7a8b25a868d19930eb2e Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:22:10 +0100
+Subject: [PATCH] Automation: pad_frames pause_at=<frame> pauses at that exact
+ frame
+
+SR-Source Net Plus, phase 0. pad_frames counts frames on the automation
+thread, which reads the presenter's frame counter every millisecond; a
+pause asked for after it lands some time later, at a point in the frame
+(or frames later under load) that depends on the host. RAM taken there
+differed by thousands of words between identical runs.
+
+With pause_at=<frame> (the presenter's counter, saved in save states),
+the after-present hook breaks the emulated CPU (CPUManager::Break) when
+the counter reaches it, on the emulation thread, and pad_frames waits for
+that. Two runs of Sonic Riders' demo race from the same state, paused at
+frame 10712, one under load and one not: 0 words of MEM1 differ.
+The pad_frames trace (start frame, pause frame) goes to stderr.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp | 27 +++++++++++++++++++++++++++
+ tools/automation_protocol.cpp   | 12 ++++++++++++
+ tools/automation_protocol.hpp   |  4 ++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 83d279a..4a0c364 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -12,6 +12,7 @@
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
++#include "Core/HW/CPU.h"
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GCPad.h"
+ #include "Core/HW/Memmap.h"
+@@ -480,6 +481,8 @@ struct RuntimeAutomationState
+   mutable std::mutex mutex;
+   std::atomic<std::uint64_t> frame_count{0};
+   std::atomic<std::uint64_t> present_count{0};
++  // SR-Source Net Plus: pad_frames pause_at=<frame>; the present hook breaks the CPU there.
++  std::atomic<std::uint64_t> pause_at_frame{0};
+   std::uint64_t processed_commands = 0;
+   std::string last_command;
+   std::string last_error;
+@@ -623,6 +626,21 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
+     }
+     std::uint64_t first_frame = state.frame_count.load(std::memory_order_relaxed);
+     ApplyAutomationPad(command.pad);
++    std::fprintf(stderr, "automation: pad_frames from frame %llu (%u frames, pause at %llu)\n",
++                 static_cast<unsigned long long>(first_frame), command.frames,
++                 static_cast<unsigned long long>(command.pause_at));
++    if (command.pause_at != 0)
++    {
++      // Exact pause (SR-Source Net Plus): the present hook breaks the CPU at that frame, on the
++      // emulation thread; this thread only waits for it.
++      state.pause_at_frame.store(command.pause_at, std::memory_order_relaxed);
++      while (!stop_token.stop_requested() &&
++             (state.pause_at_frame.load(std::memory_order_relaxed) != 0 ||
++              Core::GetState(system) != Core::State::Paused))
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++      ClearAutomationPad(command.pad.port);
++      break;
++    }
+     while (!stop_token.stop_requested())
+     {
+       const std::uint64_t current_frame =
+@@ -1446,6 +1464,15 @@ RuntimeRunResult Runtime::Run() {
+       GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
+         m_impl->automation_state.frame_count.store(info.frame_count,
+                                                    std::memory_order_relaxed);
++        // SR-Source Net Plus: an exact pause (pad_frames pause_at=<frame>), on this thread.
++        const std::uint64_t pause_at =
++            m_impl->automation_state.pause_at_frame.load(std::memory_order_relaxed);
++        if (pause_at != 0 && info.frame_count >= pause_at) {
++          Core::System::GetInstance().GetCPU().Break();
++          std::fprintf(stderr, "automation: paused at frame %llu\n",
++                       static_cast<unsigned long long>(info.frame_count));
++          m_impl->automation_state.pause_at_frame.store(0, std::memory_order_relaxed);
++        }
+         m_impl->automation_state.present_count.store(info.present_count,
+                                                      std::memory_order_relaxed);
+         // The window has its first picture: the launcher can step aside.
+diff --git a/tools/automation_protocol.cpp b/tools/automation_protocol.cpp
+index f7a51cf..abdbc22 100644
+--- a/tools/automation_protocol.cpp
++++ b/tools/automation_protocol.cpp
+@@ -263,6 +263,18 @@ bool ParsePadCommand(const std::map<std::string, std::string>& values, Command*
+   {
+     if (key == "command" || key == "port" || (require_frames && key == "frames"))
+       continue;
++    if (require_frames && key == "pause_at")
++    {
++      const auto pause_at = ParseUnsigned(value);
++      if (!pause_at || *pause_at == 0)
++      {
++        if (error)
++          *error = "pause_at must be a frame number above 0";
++        return false;
++      }
++      command->pause_at = *pause_at;
++      continue;
++    }
+     const PadField* field = FindPadField(key);
+     if (!field)
+     {
+diff --git a/tools/automation_protocol.hpp b/tools/automation_protocol.hpp
+index 2396f01..e484715 100644
+--- a/tools/automation_protocol.hpp
++++ b/tools/automation_protocol.hpp
+@@ -42,6 +42,10 @@ struct Command
+   std::uint32_t address = 0;
+   std::uint32_t size = 0;
+   std::uint32_t frames = 0;
++  // SR-Source Net Plus: pad_frames with pause_at=<frame> pauses the emulated CPU exactly when the
++  // presenter's frame counter (saved in save states) reaches it, from the emulation thread, instead
++  // of a pause the automation thread asks for some time after counting `frames` (0: not used).
++  std::uint64_t pause_at = 0;
+   std::vector<std::uint8_t> data;
+ };
+ 
+-- 
+2.34.1.windows.1
+

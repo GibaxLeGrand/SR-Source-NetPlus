@@ -1,0 +1,121 @@
+From cc2b260ca554640f2d121502b8282c9f3f7375e6 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:47:12 +0100
+Subject: [PATCH 7/7] StaticRecomp: hand the module Dolphin's exception word
+
+For modules built with DOLRECOMP_EE_EXIT=pending (a switch of our local
+copy of Piconet's DolRecomp fork, branch srnp/ee-pending): through the
+module's staticrecomp_set_exceptions, generated code gets a pointer to
+PowerPCState::Exceptions and, where a write sets MSR[EE], leaves for the
+run loop only when an external interrupt is pending, which is the only
+case where the run loop delivers one there. Before, every
+OSRestoreInterrupts/OSEnableInterrupts left and unwound the native stack.
+SRNP_EE_EXIT_ALWAYS=1 hands over nothing (the old exit).
+
+Sonic Riders, demo race: fewer dispatches, no measurable speed change
+(221.2-221.9 against 215.5-223.5 frames/s); deterministic; lockstep: the
+same kinds of divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Core/PowerPC/StaticRecomp/StaticRecompCore.cpp  | 12 ++++++++++--
+ .../Core/PowerPC/StaticRecomp/StaticRecompCore.h    |  8 +++++++-
+ .../PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp | 13 +++++++++++++
+ .../PowerPC/StaticRecomp/StaticRecompCore_Run.cpp   |  1 +
+ 4 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 71e4213d6f..509c388bc4 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -242,6 +242,7 @@ void StaticRecompCore::Shutdown()
+   m_module = nullptr;
+   m_set_native_valid = nullptr;
+   m_set_gather_pipe = nullptr;
++  m_set_exceptions = nullptr;
+   if (m_library.IsOpen())
+     m_library.Close();
+ 
+@@ -285,6 +286,7 @@ void StaticRecompCore::LoadModule()
+     m_module = nullptr;
+     m_set_native_valid = nullptr;
+     m_set_gather_pipe = nullptr;
++    m_set_exceptions = nullptr;
+     if (m_library.IsOpen())
+       m_library.Close();
+   };
+@@ -330,8 +332,14 @@ void StaticRecompCore::LoadModule()
+                           reinterpret_cast<SetGatherPipeFn>(
+                               m_library.GetSymbolAddress("staticrecomp_set_gather_pipe")) :
+                           nullptr;
+-  std::fprintf(stderr, "[staticrecomp] module tables: native_valid %s, gather_pipe %s\n",
+-               m_set_native_valid ? "yes" : "no", m_set_gather_pipe ? "yes" : "no");
++  m_set_exceptions = m_library.IsOpen() ?
++                         reinterpret_cast<SetExceptionsFn>(
++                             m_library.GetSymbolAddress("staticrecomp_set_exceptions")) :
++                         nullptr;
++  std::fprintf(stderr,
++               "[staticrecomp] module tables: native_valid %s, gather_pipe %s, exceptions %s\n",
++               m_set_native_valid ? "yes" : "no", m_set_gather_pipe ? "yes" : "no",
++               m_set_exceptions ? "yes" : "no");
+   PublishChunkState(~0u);
+   m_chunk_host_call_state.assign(desc->num_chunk_ranges, 0);
+   m_effective_chunk_hashes.assign(desc->chunk_hashes,
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index f2113f3a50..8c57ef0a8d 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -219,7 +219,13 @@ private:
+   using SetNativeValidFn = void (*)(u32 start, u32 end, int valid);
+   SetNativeValidFn m_set_native_valid = nullptr;
+   using SetGatherPipeFn = void (*)(u8** position, u8* start, void (*flush)(CPUState*));
+-  SetGatherPipeFn m_set_gather_pipe = nullptr;  // SRNP_NO_HOOK_FLUSH=1 turns FlushDispatchCharge off (for bisecting)
++  SetGatherPipeFn m_set_gather_pipe = nullptr;
++  // SR-Source Net Plus: a module built with DOLRECOMP_EE_EXIT=pending leaves for the run loop where
++  // a write sets MSR[EE] only when this word (Dolphin's PowerPCState::Exceptions) has an external
++  // interrupt pending, which is when the run loop would deliver one there.
++  using SetExceptionsFn = void (*)(u32* word);
++  SetExceptionsFn m_set_exceptions = nullptr;
++  void PublishExceptions();  // SRNP_NO_HOOK_FLUSH=1 turns FlushDispatchCharge off (for bisecting)
+ 
+   // D4 guard state: parallel to m_module->chunk_ranges.
+   std::vector<u8> m_chunk_state;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 3697d7b4cf..0815ccae73 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -209,6 +209,19 @@ void StaticRecompCore::PublishGatherPipe()
+                inline_ok ? "yes" : "no");
+ }
+ 
++// SR-Source Net Plus: hands the module Dolphin's exception word (DOLRECOMP_EE_EXIT=pending).
++// SRNP_EE_EXIT_ALWAYS=1 hands it none: generated code then leaves at every MSR[EE] 0->1, as before.
++void StaticRecompCore::PublishExceptions()
++{
++  if (!m_set_exceptions)
++    return;
++  const char* always = std::getenv("SRNP_EE_EXIT_ALWAYS");
++  const bool give = !(always && always[0] == '1');
++  m_set_exceptions(give ? &m_system.GetPPCState().Exceptions : nullptr);
++  std::fprintf(stderr, "[staticrecomp] exception word given to generated code: %s\n",
++               give ? "yes" : "no");
++}
++
+ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
+ {
+   // eciwx external-control read. EAR-enable and alignment were checked by the
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index c740fc9746..b1fe1407e5 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -64,6 +64,7 @@ void StaticRecompCore::Run()
+   m_guest.exram_size = memory.GetExRamSizeReal();
+   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
+   PublishGatherPipe();
++  PublishExceptions();
+   const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
+   const auto fast_dispatchable_at = [this](u32 address) {
+     if (m_has_rel_modules || !m_forced_fallback_ranges.empty())
+-- 
+2.34.1.windows.1
+

@@ -1,0 +1,246 @@
+From 6291e083a98e54a3240dc305e46f0ab68902247b Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:50:37 +0100
+Subject: [PATCH 3/7] StaticRecomp: a runtime cycle budget for generated code
+
+From Piconet's RecompCore (StaticRecompCore_Sync/Run/Hooks): a module
+built with DOLRECOMP_BUDGET_CYCLES=runtime reads CPUState.cycle_budget
+at its calls and loop heads instead of leaving every 256 cycles.
+- BeginDispatchBudget: before a dispatch, the budget is the downcount
+  left to Dolphin's next event (256 after a wait loop, m_wait_streak).
+- FlushDispatchCharge / RefreshDispatchBudget: a hardware access first
+  charges the cycles run so far to Dolphin's clock (downcount, timebase),
+  then sets the budget again (the access may schedule an earlier event).
+- A dispatch whose cycles a hardware access already charged costs no
+  extra cycle.
+- AdvanceGuestTimebase counts the charge as ticks with the CPU clock
+  factor (Core.Overclock); unchanged at 1.
+SRNP_NO_HOOK_FLUSH=1 turns the flush off, for comparisons.
+
+Sonic Riders, demo race, 1800 frames: with the step-A module (fixed
+budget of 256) 169.8 frames/s (B1: 174.8-176.5, within the noise);
+_Main.rel's BSS at the pause identical; lockstep 600 frames: the same
+kinds of divergences as without it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../PowerPC/StaticRecomp/StaticRecompCore.cpp |  1 +
+ .../PowerPC/StaticRecomp/StaticRecompCore.h   | 17 +++++++
+ .../StaticRecomp/StaticRecompCore_Hooks.cpp   | 16 +++++++
+ .../StaticRecomp/StaticRecompCore_Run.cpp     | 19 +++++---
+ .../StaticRecomp/StaticRecompCore_Sync.cpp    | 44 +++++++++++++++++++
+ 5 files changed, 92 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 2c45db4ef0..32cc5dc8cb 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -151,6 +151,7 @@ void StaticRecompCore::Init()
+   g_static_recomp_core = this;
+   RefreshConfig();
+   m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
++  m_hook_flush = std::getenv("SRNP_NO_HOOK_FLUSH") == nullptr;
+   const char* fallback_override = std::getenv("STATICRECOMP_FALLBACK_RANGES");
+   std::istringstream fallback_ranges(fallback_override ? fallback_override :
+                                                          Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index d084fea634..ba7103e7a6 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -139,6 +139,15 @@ private:
+   void SyncOut();  // m_guest -> Dolphin PowerPCState
+   void AdvanceGuestTimebase(u64 cpu_cycles);
+ 
++  // From Piconet's RecompCore. Cycle budget for a module built to read CPUState.cycle_budget
++  // (DOLRECOMP_BUDGET_CYCLES=runtime): generated code runs until Dolphin's next scheduled event
++  // instead of leaving every 256 cycles. A hardware access first brings Dolphin's downcount and
++  // the timebase up to date with the cycles charged so far in this dispatch, and afterwards the
++  // budget is set again, because the access may have scheduled an earlier event.
++  void BeginDispatchBudget(bool waiting);
++  void FlushDispatchCharge();
++  void RefreshDispatchBudget();
++
+   // CPUState hooks (module -> chassis environment). `cpu->external_user_data`
+   // is the StaticRecompCore*.
+   static u64 HookExternalRead(CPUState* cpu, u32 ea, u8 size);
+@@ -174,9 +183,17 @@ private:
+   u64 m_native_exceptions = 0;
+   u64 m_hook_fallback_instructions = 0;
+   u64 m_timebase_cycle_remainder = 0;
++  double m_timebase_tick_fraction = 0.0;  // of a tick, while the emulated CPU clock is not 1
+   std::unordered_map<u32, u64> m_dispatch_samples;
+   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
+   u64 m_charged_cycles = 0;  // cycles flushed from module charges (diagnostic)
++  u64 m_dispatch_flushed = 0;  // cycles of the current dispatch already charged by FlushDispatchCharge
++  // Dispatches left on the short fixed budget after a wait loop was seen at its head. A wait loop
++  // is only skipped when a dispatch ends exactly at its head, so while the game waits the old
++  // 256-cycle budget gives that chance often; on a long budget the loop would spin natively
++  // through whole slices.
++  u32 m_wait_streak = 0;
++  bool m_hook_flush = true;  // SRNP_NO_HOOK_FLUSH=1 turns FlushDispatchCharge off (for bisecting)
+ 
+   // D4 guard state: parallel to m_module->chunk_ranges.
+   std::vector<u8> m_chunk_state;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index e39c7559e6..1688e4fa1a 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -79,6 +79,10 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
+     std::fprintf(stderr, "[zero-access] read size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
+                  cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
+   core->PropagateGuestMSR();
++  // Dispatch budget (from Piconet's RecompCore): Dolphin's clock first catches up with the
++  // cycles this dispatch charged so far; the budget is set again after the access.
++  core->FlushDispatchCharge();
++  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
+   auto& mmu = core->m_system.GetMMU();
+   u64 value;
+   switch (size)
+@@ -114,6 +118,10 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
+   if (ea == 0)
+     std::fprintf(stderr, "[zero-access] write size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
+                  cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
++  // Dispatch budget (from Piconet's RecompCore): Dolphin's clock first catches up with the
++  // cycles this dispatch charged so far; the budget is set again after the access.
++  core->FlushDispatchCharge();
++  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
+ 
+   // Gather-pipe fast path: stores to the write-gather pipe page at effective
+   // 0xCC008000 go straight to GPFifo, mirroring the MMU's masked-write
+@@ -181,6 +189,10 @@ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+   ea = core->TranslateRelAddress(ea);
+   core->PropagateGuestMSR();
++  // Dispatch budget (from Piconet's RecompCore): Dolphin's clock first catches up with the
++  // cycles this dispatch charged so far; the budget is set again after the access.
++  core->FlushDispatchCharge();
++  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
+   auto& mmu = core->m_system.GetMMU();
+   const u32 value = mmu.Read<u32>(ea);
+   if (core->m_lockstep_verifier->m_ls_journaling &&
+@@ -197,6 +209,10 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+   ea = core->TranslateRelAddress(ea);
+   core->PropagateGuestMSR();
++  // Dispatch budget (from Piconet's RecompCore): Dolphin's clock first catches up with the
++  // cycles this dispatch charged so far; the budget is set again after the access.
++  core->FlushDispatchCharge();
++  struct Refresh { StaticRecompCore* c; ~Refresh() { c->RefreshDispatchBudget(); } } refresh{core};
+   auto& mmu = core->m_system.GetMMU();
+   if (core->m_lockstep_verifier->m_ls_journaling &&
+       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index d91ec2dc19..61886fa59f 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -155,6 +155,7 @@ void StaticRecompCore::Run()
+           if (m_has_rel_modules)
+             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
+           m_guest.pc = linked_dispatch_address;
++          BeginDispatchBudget(m_wait_streak != 0);
+           m_module->dispatch(&m_guest, linked_dispatch_address);
+           if (m_has_rel_modules)
+             m_guest.pc = TranslateRelAddress(m_guest.pc);
+@@ -174,17 +175,25 @@ void StaticRecompCore::Run()
+           // external-interrupt latency matches stock.
+           const s64 charge = -m_guest.downcount;
+           m_guest.downcount = 0;
+-          const u64 effective_charge = static_cast<u64>(charge > 0 ? charge : 1);
++          // Cycles a hardware access already charged during the dispatch (FlushDispatchCharge)
++          // count as progress (from Piconet's RecompCore).
++          const u64 effective_charge =
++              static_cast<u64>(charge > 0 ? charge : (m_dispatch_flushed != 0 ? 0 : 1));
+           ppc.downcount -= static_cast<int>(effective_charge);
+           m_charged_cycles += effective_charge;
+-          const u64 total_cycles = m_timebase_cycle_remainder + effective_charge;
+-          m_guest.timebase += total_cycles / SystemTimers::TIMER_RATIO;
+-          m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
++          AdvanceGuestTimebase(effective_charge);
+ 
+-          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
++          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread). After
++          // one, the next dispatches keep the short budget (m_wait_streak), so that a long
++          // runtime budget does not spin through the wait natively (from Piconet's RecompCore).
+           if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+           {
+             m_system.GetCoreTiming().Idle();
++            m_wait_streak = 8;
++          }
++          else if (m_wait_streak != 0)
++          {
++            --m_wait_streak;
+           }
+ 
+           // ctx->timebase is refreshed at burst start (SyncIn), and here we
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
+index e8d0287008..60e1db0ad8 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Sync.cpp
+@@ -37,13 +37,56 @@ void StaticRecompCore::SetPPCStateFromGuestState(const CPUState& s, PowerPC::Pow
+   ppc.reserve = s.reserve_valid;
+ }
+ 
++// From Piconet's RecompCore. The time base counts emulated ticks, twelve to a step. What
++// generated code charges are the cycles of the instructions it ran, which is Dolphin's downcount:
++// with the emulated CPU clock raised (Core.Overclock) that is the clock's factor times the ticks
++// that passed. The quotient is kept as a fraction of a tick, so nothing is lost between
++// dispatches; with the clock at 1 the arithmetic is the old one.
+ void StaticRecompCore::AdvanceGuestTimebase(u64 cpu_cycles)
+ {
++  const double per_cycle = m_system.GetCoreTiming().GetGlobals().last_OC_factor_inverted;
++  if (per_cycle > 0.0 && per_cycle != 1.0)
++  {
++    const double ticks = static_cast<double>(cpu_cycles) * per_cycle + m_timebase_tick_fraction;
++    cpu_cycles = static_cast<u64>(ticks);
++    m_timebase_tick_fraction = ticks - static_cast<double>(cpu_cycles);
++  }
+   const u64 total_cycles = m_timebase_cycle_remainder + cpu_cycles;
+   m_guest.timebase += total_cycles / SystemTimers::TIMER_RATIO;
+   m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
+ }
+ 
++void StaticRecompCore::BeginDispatchBudget(bool waiting)
++{
++  const s64 left = m_system.GetPPCState().downcount;
++  m_dispatch_flushed = 0;
++  m_guest.cycle_budget = waiting ? 256 : (left > 0 ? left : 1);
++}
++
++void StaticRecompCore::FlushDispatchCharge()
++{
++  if (!m_hook_flush)
++    return;
++  const s64 charge = -m_guest.downcount;
++  if (charge <= 0)
++    return;
++  m_guest.downcount = 0;
++  m_system.GetPPCState().downcount -= static_cast<int>(charge);
++  m_charged_cycles += static_cast<u64>(charge);
++  m_dispatch_flushed += static_cast<u64>(charge);
++  AdvanceGuestTimebase(static_cast<u64>(charge));
++}
++
++void StaticRecompCore::RefreshDispatchBudget()
++{
++  if (m_wait_streak != 0)
++    return;
++  // Generated code compares the cycles since the dispatch began with the budget. Those already
++  // charged are in m_dispatch_flushed; Dolphin's downcount is what is left after them.
++  const s64 left = m_system.GetPPCState().downcount;
++  m_guest.cycle_budget = static_cast<s64>(m_dispatch_flushed) + (left > 0 ? left : 0);
++}
++
+ void StaticRecompCore::SyncIn()
+ {
+   auto& power_pc = m_system.GetPowerPC();
+@@ -78,6 +121,7 @@ void StaticRecompCore::SyncIn()
+   const auto& core_timing = m_system.GetCoreTiming();
+   m_timebase_cycle_remainder =
+       (core_timing.GetTicks() - core_timing.GetFakeTBStartTicks()) % SystemTimers::TIMER_RATIO;
++  m_timebase_tick_fraction = 0.0;
+   m_guest.reserve_addr = ppc.reserve_address;
+   m_guest.reserve_valid = ppc.reserve;
+   m_guest.exception = 0;
+-- 
+2.34.1.windows.1
+

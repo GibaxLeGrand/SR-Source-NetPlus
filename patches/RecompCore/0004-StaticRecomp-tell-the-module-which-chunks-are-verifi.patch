@@ -1,0 +1,247 @@
+From 4a5572aeac576ebbb4aabee605d58c053bf651b5 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:52:52 +0100
+Subject: [PATCH 4/7] StaticRecomp: tell the module which chunks are verified;
+ hand it the pipe
+
+From Piconet's RecompCore, for modules built with Piconet's DolRecomp
+fork and its fastlookup.py (native_tables.c):
+- PublishChunkState: through the module's staticrecomp_set_native_valid,
+  each function's entry byte follows its chunk's state (verified or not)
+  and its indirect-call table entry is set only when it may be called
+  through the table (not with relocatable RELs, forced-fallback ranges or
+  host calls in it). All cleared at load and at ClearCache; set again
+  wherever a chunk's state changes (verification, invalidation, REL
+  relink). Needed by DOLRECOMP_INDIRECT_CALLS=native and closed bodies.
+- PublishGatherPipe / HookGatherPipeFlush: through the module's
+  staticrecomp_set_gather_pipe, generated code built with
+  DOLRECOMP_GATHER_PIPE=inline appends write-gather pipe stores to
+  Dolphin's pipe itself and calls the flush hook at 32 bytes. Not while
+  the lockstep verifier runs; SRNP_GATHER_INLINE=0 keeps the hook path.
+- STATICRECOMP_DISPATCH_SAMPLES=1 prints up to 2000 dispatch sites.
+A module without these symbols runs as before (both are looked up at
+load and printed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../PowerPC/StaticRecomp/StaticRecompCore.cpp | 19 +++++++++++-
+ .../PowerPC/StaticRecomp/StaticRecompCore.h   | 19 +++++++++++-
+ .../StaticRecomp/StaticRecompCore_Hooks.cpp   | 28 +++++++++++++++++
+ .../StaticRecomp/StaticRecompCore_Run.cpp     |  1 +
+ .../StaticRecomp/StaticRecompCore_SMC.cpp     | 31 +++++++++++++++++++
+ 5 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 32cc5dc8cb..6f73eeba57 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -218,7 +218,8 @@ void StaticRecompCore::Shutdown()
+                                                     m_dispatch_samples.end());
+   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
+             [](const auto& left, const auto& right) { return left.second > right.second; });
+-  for (std::size_t i = 0; i < std::min<std::size_t>(dispatch_samples.size(), 16); ++i)
++  for (std::size_t i = 0;
++       i < std::min<std::size_t>(dispatch_samples.size(), m_collect_dispatch_samples ? 2000 : 16); ++i)
+   {
+     std::fprintf(stderr, "[staticrecomp] dispatch-site pc=%08x samples=%llu\n",
+                  dispatch_samples[i].first,
+@@ -234,6 +235,8 @@ void StaticRecompCore::Shutdown()
+   m_lockstep_verifier.reset();
+   m_block_cache.Shutdown();
+   m_module = nullptr;
++  m_set_native_valid = nullptr;
++  m_set_gather_pipe = nullptr;
+   if (m_library.IsOpen())
+     m_library.Close();
+ 
+@@ -274,6 +277,8 @@ void StaticRecompCore::LoadModule()
+   const auto reject = [&](const std::string& why) {
+     ERROR_LOG_FMT(POWERPC, "StaticRecomp: rejecting module '{}': {}. Interpreter-only.", path, why);
+     m_module = nullptr;
++    m_set_native_valid = nullptr;
++    m_set_gather_pipe = nullptr;
+     if (m_library.IsOpen())
+       m_library.Close();
+   };
+@@ -311,6 +316,17 @@ void StaticRecompCore::LoadModule()
+   m_module_active = (desc != nullptr);
+   m_has_rel_modules = desc->num_rel_modules != 0;
+   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
++  m_set_native_valid = m_library.IsOpen() ?
++                           reinterpret_cast<SetNativeValidFn>(
++                               m_library.GetSymbolAddress("staticrecomp_set_native_valid")) :
++                           nullptr;
++  m_set_gather_pipe = m_library.IsOpen() ?
++                          reinterpret_cast<SetGatherPipeFn>(
++                              m_library.GetSymbolAddress("staticrecomp_set_gather_pipe")) :
++                          nullptr;
++  std::fprintf(stderr, "[staticrecomp] module tables: native_valid %s, gather_pipe %s\n",
++               m_set_native_valid ? "yes" : "no", m_set_gather_pipe ? "yes" : "no");
++  PublishChunkState(~0u);
+   m_chunk_host_call_state.assign(desc->num_chunk_ranges, 0);
+   m_effective_chunk_hashes.assign(desc->chunk_hashes,
+                                   desc->chunk_hashes + desc->num_chunk_ranges);
+@@ -361,6 +377,7 @@ void StaticRecompCore::ClearCache()
+   if (!m_module)
+     return;
+   std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
++  PublishChunkState(~0u);
+   m_failed_chunks = 0;
+   ++m_reverify_events;
+ }
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index ba7103e7a6..dc1b31e312 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -125,6 +125,13 @@ private:
+   int ChunkIndexOf(u32 address);
+   bool IsForcedFallbackAddress(u32 address) const;
+   bool ChunkContainsHostCall(u32 index) const;
++  // From Piconet's RecompCore. A module may let the host say which of its functions native code
++  // may enter: a byte each function body tests at its entry, and the table indirect calls go
++  // through (DOLRECOMP_INDIRECT_CALLS=native, closed bodies). This sets both for one chunk (or
++  // clears all, index ~0u) to match what the run loop would do with a dispatch to it, and is
++  // called wherever a chunk's state changes, so a call from native code never enters a body the
++  // run loop would not dispatch to. Without the module's staticrecomp_set_native_valid: nothing.
++  void PublishChunkState(u32 index);
+   void VerifyChunk(u32 index);
+   bool ResolveNativeAddress(u32 runtime_address, u32* linked_address, u32* rel_section_index);
+   bool ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const;
+@@ -159,6 +166,12 @@ private:
+   static void HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia);
+   static void HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32 cia);
+   static void HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia);
++  // From Piconet's RecompCore. A module built with DOLRECOMP_GATHER_PIPE=inline appends
++  // write-gather pipe stores to the pipe buffer itself and calls this when 32 bytes or more are in
++  // it. It does what the tail of a pipe write through HookExternalWrite does: the clock is brought
++  // up to date, the burst goes to the FIFO, the budget is set again.
++  static void HookGatherPipeFlush(CPUState* cpu);
++  void PublishGatherPipe();
+   static bool HookHostCall(CPUState* cpu, u32 address);
+ 
+   // Keep Dolphin's MSR-derived state (translation mode, feature flags) in step
+@@ -193,7 +206,11 @@ private:
+   // 256-cycle budget gives that chance often; on a long budget the loop would spin natively
+   // through whole slices.
+   u32 m_wait_streak = 0;
+-  bool m_hook_flush = true;  // SRNP_NO_HOOK_FLUSH=1 turns FlushDispatchCharge off (for bisecting)
++  bool m_hook_flush = true;
++  using SetNativeValidFn = void (*)(u32 start, u32 end, int valid);
++  SetNativeValidFn m_set_native_valid = nullptr;
++  using SetGatherPipeFn = void (*)(u8** position, u8* start, void (*flush)(CPUState*));
++  SetGatherPipeFn m_set_gather_pipe = nullptr;  // SRNP_NO_HOOK_FLUSH=1 turns FlushDispatchCharge off (for bisecting)
+ 
+   // D4 guard state: parallel to m_module->chunk_ranges.
+   std::vector<u8> m_chunk_state;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 1688e4fa1a..27d4eb1129 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -181,6 +181,34 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
+   }
+ }
+ 
++void StaticRecompCore::HookGatherPipeFlush(CPUState* cpu)
++{
++  auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
++  core->FlushDispatchCharge();
++  core->m_system.GetGPFifo().FastCheckGatherPipe();
++  core->RefreshDispatchBudget();
++}
++
++// Hands the module the write-gather pipe (or takes it away): the address of Dolphin's pipe
++// pointer, the start of the pipe buffer and the flush hook. Not while the lockstep verifier
++// journals hardware writes, which must all pass through HookExternalWrite. SRNP_GATHER_INLINE=0
++// keeps every pipe write on the hook (for comparisons).
++void StaticRecompCore::PublishGatherPipe()
++{
++  if (!m_set_gather_pipe)
++    return;
++  auto& ppc = m_system.GetPPCState();
++  const char* off = std::getenv("SRNP_GATHER_INLINE");
++  const bool inline_ok = !(off && off[0] == '0') && !m_lockstep_verifier->IsEnabled() &&
++                         ppc.gather_pipe_base_ptr != nullptr;
++  if (inline_ok)
++    m_set_gather_pipe(&ppc.gather_pipe_ptr, ppc.gather_pipe_base_ptr, &HookGatherPipeFlush);
++  else
++    m_set_gather_pipe(nullptr, nullptr, nullptr);
++  std::fprintf(stderr, "[staticrecomp] gather pipe written by generated code: %s\n",
++               inline_ok ? "yes" : "no");
++}
++
+ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
+ {
+   // eciwx external-control read. EAR-enable and alignment were checked by the
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index 61886fa59f..b0f950dff7 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -63,6 +63,7 @@ void StaticRecompCore::Run()
+   m_guest.exram = memory.GetEXRAM();
+   m_guest.exram_size = memory.GetExRamSizeReal();
+   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
++  PublishGatherPipe();
+   const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
+   const auto fast_dispatchable_at = [this](u32 address) {
+     if (m_has_rel_modules || !m_forced_fallback_ranges.empty())
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 815aba5388..7dc4579fff 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -97,6 +97,7 @@ void StaticRecompCore::RefreshRelSections()
+     if (m_chunk_state[i] == CHUNK_FAILED && m_failed_chunks != 0)
+       --m_failed_chunks;
+     m_chunk_state[i] = CHUNK_UNVERIFIED;
++    PublishChunkState(i);
+     m_effective_chunk_hashes[i] = m_module->chunk_hashes[i];
+   }
+ }
+@@ -280,8 +281,37 @@ bool StaticRecompCore::ChunkContainsHostCall(u32 index) const
+   return found;
+ }
+ 
++void StaticRecompCore::PublishChunkState(u32 index)
++{
++  if (!m_set_native_valid || !m_module)
++    return;
++  if (index == ~0u)
++  {
++    m_set_native_valid(0u, 0xFFFFFFFCu, 0);
++    return;
++  }
++  // Bit 0: the chunk's guest code is verified, which is what a function body tests at its entry.
++  // It mirrors the chunk state exactly, because the run loop dispatches on that state. Bit 1: the
++  // chunk may also be called through the indirect-call table. That is narrower: not with
++  // relocatable RELs (the table is in linked addresses), not when a forced-fallback range or a
++  // host-call address lies in it.
++  const auto& chunk = m_module->chunk_ranges[index];
++  const bool verified = m_chunk_state[index] == CHUNK_VERIFIED;
++  bool callable = verified && !m_has_rel_modules;
++  for (const StaticRecompRange& range : m_forced_fallback_ranges)
++    callable = callable && !(range.start < chunk.end && chunk.start < range.end);
++  callable = callable && !(m_guest.host_call && ChunkContainsHostCall(index));
++  m_set_native_valid(chunk.start, chunk.end, (verified ? 1 : 0) | (callable ? 2 : 0));
++}
++
+ void StaticRecompCore::VerifyChunk(u32 index)
+ {
++  struct Publish
++  {
++    StaticRecompCore* c;
++    u32 i;
++    ~Publish() { c->PublishChunkState(i); }
++  } publish{this, index};
+   const auto& chunk = m_module->chunk_ranges[index];
+   auto& memory = m_system.GetMemory();
+   const u32 ram_size = memory.GetRamSizeReal();
+@@ -403,6 +433,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+       if (m_chunk_state[i] == CHUNK_FAILED)
+         --m_failed_chunks;
+       m_chunk_state[i] = CHUNK_UNVERIFIED;
++      PublishChunkState(i);
+       ++m_reverify_events;
+     }
+   }
+-- 
+2.34.1.windows.1
+

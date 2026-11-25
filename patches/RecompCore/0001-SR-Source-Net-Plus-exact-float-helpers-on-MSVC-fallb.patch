@@ -1,0 +1,237 @@
+From 3186e0eade81421f4b143d0384d608cd99d5950b Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:27:43 +0100
+Subject: [PATCH 1/7] SR-Source Net Plus: exact float helpers on MSVC, fallback
+ counter
+
+The state measured on 2026-11-24 (runner and modules of phase 0):
+- GXRuntime: psq dequantize/quantize scale by an exact power of two
+  instead of ldexp/ldexpf, and isnan/isinf/signbit inline on MSVC
+  (fp_fast_classify.h). Same results, no CRT call.
+- StaticRecomp: SRNP_FALLBACK_STATS=1 counts HookInstructionFallback
+  calls per guest address and prints them at shutdown (measurement only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ GXRuntime/src/core/cpu.c                      |  7 +-
+ GXRuntime/src/core/cpu_interpreter_private.h  |  1 +
+ GXRuntime/src/core/fp_fast_classify.h         | 68 +++++++++++++++++++
+ .../PowerPC/StaticRecomp/StaticRecompCore.cpp |  4 ++
+ .../StaticRecomp/StaticRecompCore_Hooks.cpp   | 53 +++++++++++++++
+ 5 files changed, 131 insertions(+), 2 deletions(-)
+ create mode 100644 GXRuntime/src/core/fp_fast_classify.h
+
+diff --git a/GXRuntime/src/core/cpu.c b/GXRuntime/src/core/cpu.c
+index 345b9602dd..dc04390379 100644
+--- a/GXRuntime/src/core/cpu.c
++++ b/GXRuntime/src/core/cpu.c
+@@ -4,6 +4,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
++#include "fp_fast_classify.h" /* SR-Source Net Plus: exact 2^e, inline isnan on MSVC */
+ #if defined(__x86_64__) || defined(_M_X64)
+ #include <immintrin.h>
+ #endif
+@@ -194,7 +195,9 @@ static u32 psq_type_size(u8 type) {
+ static f64 psq_dequant(f64 value, s32 scale) {
+     if (scale == 0)
+         return (f64)(f32)value;
+-    return (f64)(f32)ldexp(value, -scale);
++    /* SR-Source Net Plus: value * 2^-scale is exact here (a 16-bit integer and
++     * scale in [-32, 31]), the same double ldexp gives, without MSVC's call. */
++    return (f64)(f32)(value * gx_pow2_f64(-scale));
+ }
+ 
+ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
+@@ -215,7 +218,7 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
+ }
+ 
+ static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
+-    f32 conv = (f32)value * ldexpf(1.0f, scale);
++    f32 conv = (f32)value * gx_pow2_f32(scale); /* SR-Source Net Plus: = ldexpf(1.0f, scale) */
+     if (isnan(conv))
+         return 0;
+     if (conv <= (f32)min_value)
+diff --git a/GXRuntime/src/core/cpu_interpreter_private.h b/GXRuntime/src/core/cpu_interpreter_private.h
+index 09afe03a21..ee54a6f8a0 100644
+--- a/GXRuntime/src/core/cpu_interpreter_private.h
++++ b/GXRuntime/src/core/cpu_interpreter_private.h
+@@ -3,6 +3,7 @@
+ 
+ #include "core/cpu.h"
+ #include <math.h>
++#include "fp_fast_classify.h" /* SR-Source Net Plus: inline isnan/isinf/signbit on MSVC */
+ 
+ #if defined(__x86_64__) || defined(_M_X64)
+ #include <immintrin.h>
+diff --git a/GXRuntime/src/core/fp_fast_classify.h b/GXRuntime/src/core/fp_fast_classify.h
+new file mode 100644
+index 0000000000..2ff17d245e
+--- /dev/null
++++ b/GXRuntime/src/core/fp_fast_classify.h
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// SR-Source Net Plus (local change, measured on Windows): MSVC's C <math.h> turns isnan,
++// isinf and signbit into calls to _dclass/_fdclass/_dsign in ucrtbase, and the FP helpers
++// call them on every emulated operation (~7 % of the native core's time in a profile).
++// These test the bits inline and give the same answer for every input. GCC and Clang
++// already inline the standard macros, so they keep them.
++#ifndef GXRUNTIME_FP_FAST_CLASSIFY_H
++#define GXRUNTIME_FP_FAST_CLASSIFY_H
++
++#include <math.h>
++#include <string.h>
++
++// 2^e built from the exponent bits: exact for e in [-126, 127] (f32) and
++// [-1022, 1023] (f64), the same values ldexpf(1.0f, e) and ldexp(1.0, e) give.
++static inline float gx_pow2_f32(int e) {
++    unsigned int bits = (unsigned int)(e + 127) << 23;
++    float value;
++    memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++static inline double gx_pow2_f64(int e) {
++    unsigned long long bits = (unsigned long long)(e + 1023) << 52;
++    double value;
++    memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++#if defined(_MSC_VER) && !defined(__clang__) && !defined(__cplusplus)
++static __forceinline int gx_isnan_f64(double x) {
++    unsigned long long b;
++    memcpy(&b, &x, sizeof(b));
++    return (b & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull;
++}
++static __forceinline int gx_isinf_f64(double x) {
++    unsigned long long b;
++    memcpy(&b, &x, sizeof(b));
++    return (b & 0x7FFFFFFFFFFFFFFFull) == 0x7FF0000000000000ull;
++}
++static __forceinline int gx_signbit_f64(double x) {
++    unsigned long long b;
++    memcpy(&b, &x, sizeof(b));
++    return (int)(b >> 63);
++}
++static __forceinline int gx_isnan_f32(float x) {
++    unsigned int b;
++    memcpy(&b, &x, sizeof(b));
++    return (b & 0x7FFFFFFFu) > 0x7F800000u;
++}
++static __forceinline int gx_isinf_f32(float x) {
++    unsigned int b;
++    memcpy(&b, &x, sizeof(b));
++    return (b & 0x7FFFFFFFu) == 0x7F800000u;
++}
++static __forceinline int gx_signbit_f32(float x) {
++    unsigned int b;
++    memcpy(&b, &x, sizeof(b));
++    return (int)(b >> 31);
++}
++#undef isnan
++#undef isinf
++#undef signbit
++#define isnan(x) (sizeof(x) == sizeof(float) ? gx_isnan_f32((float)(x)) : gx_isnan_f64((double)(x)))
++#define isinf(x) (sizeof(x) == sizeof(float) ? gx_isinf_f32((float)(x)) : gx_isinf_f64((double)(x)))
++#define signbit(x) (sizeof(x) == sizeof(float) ? gx_signbit_f32((float)(x)) : gx_signbit_f64((double)(x)))
++#endif
++
++#endif
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index e3581cc938..2c45db4ef0 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -29,6 +29,9 @@
+ 
+ StaticRecompCore* g_static_recomp_core = nullptr;
+ 
++// SR-Source Net Plus, local measurement (StaticRecompCore_Hooks.cpp).
++void SrnpDumpFallbackStats();
++
+ u32 StaticRecompShouldYieldAt(u32 address)
+ {
+   return g_static_recomp_core && g_static_recomp_core->ShouldYieldAt(address);
+@@ -209,6 +212,7 @@ void StaticRecompCore::Shutdown()
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
+                (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
++  SrnpDumpFallbackStats();
+   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
+                                                     m_dispatch_samples.end());
+   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 7b3d845cee..e39c7559e6 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -14,6 +14,51 @@
+ 
+ #include <cstdio>
+ 
++// SR-Source Net Plus, local measurement (not upstream): SRNP_FALLBACK_STATS=1 counts
++// HookInstructionFallback calls per guest address and the host time spent in them,
++// printed at shutdown by SrnpDumpFallbackStats().
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <optional>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++namespace srnp_fallback_stats
++{
++const bool enabled = std::getenv("SRNP_FALLBACK_STATS") != nullptr;
++std::unordered_map<u32, std::pair<u32, u64>> per_cia;  // cia -> (raw, count)
++u64 total_ns = 0;
++struct Timer
++{
++  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  ~Timer()
++  {
++    total_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                     std::chrono::steady_clock::now() - start)
++                                     .count());
++  }
++};
++}  // namespace srnp_fallback_stats
++
++void SrnpDumpFallbackStats()
++{
++  using namespace srnp_fallback_stats;
++  if (!enabled)
++    return;
++  u64 calls = 0;
++  std::vector<std::pair<u32, std::pair<u32, u64>>> sites(per_cia.begin(), per_cia.end());
++  for (const auto& site : sites)
++    calls += site.second.second;
++  std::sort(sites.begin(), sites.end(),
++            [](const auto& l, const auto& r) { return l.second.second > r.second.second; });
++  std::fprintf(stderr, "[srnp] fallback: %llu calls at %zu sites, %.3f s in the hook\n",
++               static_cast<unsigned long long>(calls), sites.size(), total_ns / 1e9);
++  for (std::size_t i = 0; i < std::min<std::size_t>(sites.size(), 24); ++i)
++    std::fprintf(stderr, "[srnp] fallback-site pc=%08x raw=%08x count=%llu\n", sites[i].first,
++                 sites[i].second.first, static_cast<unsigned long long>(sites[i].second.second));
++}
++
+ namespace
+ {
+ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
+@@ -367,6 +412,14 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+   cia = core->TranslateRelAddress(cia);
+   ++core->m_hook_fallback_instructions;
++  std::optional<srnp_fallback_stats::Timer> srnp_timer;
++  if (srnp_fallback_stats::enabled)
++  {
++    auto& site = srnp_fallback_stats::per_cia[cia];
++    site.first = raw;
++    ++site.second;
++    srnp_timer.emplace();
++  }
+ 
+   // Lockstep: a block that fell back to the interpreter for an unmodeled
+   // instruction (DMA mtspr, cache op, ...) performed side effects not captured
+-- 
+2.34.1.windows.1
+

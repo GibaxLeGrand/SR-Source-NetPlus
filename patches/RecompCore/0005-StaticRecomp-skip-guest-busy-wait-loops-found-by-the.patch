@@ -1,0 +1,151 @@
+From 421979846278382a5f2fab2ab736b700d7a85ace Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:54:50 +0100
+Subject: [PATCH 5/7] StaticRecomp: skip guest busy-wait loops found by the
+ analyzer
+
+RecompCore PR #19, as Piconet's RecompCore has it: a dispatch that
+comes back to the address it entered at is a self-loop; if Dolphin's
+PPCAnalyzer marks it an idle loop (branchIsIdleLoop to its own head),
+the run loop hands the rest of the slice to CoreTiming::Idle, as for
+the configured idle PC, and keeps the short budget for the next
+dispatches (m_wait_streak). Results are cached per address and dropped
+at ClearCache and at an icache invalidation that resets a chunk.
+SRNP_NO_BUSYWAIT=1 turns it off; the shutdown line counts the skips.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../PowerPC/StaticRecomp/StaticRecompCore.cpp | 37 +++++++++++++++++++
+ .../PowerPC/StaticRecomp/StaticRecompCore.h   | 10 +++++
+ .../StaticRecomp/StaticRecompCore_Run.cpp     | 10 ++++-
+ .../StaticRecomp/StaticRecompCore_SMC.cpp     |  1 +
+ 4 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 6f73eeba57..8e50477ae0 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -152,6 +152,7 @@ void StaticRecompCore::Init()
+   RefreshConfig();
+   m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
+   m_hook_flush = std::getenv("SRNP_NO_HOOK_FLUSH") == nullptr;
++  m_detect_busy_wait = std::getenv("SRNP_NO_BUSYWAIT") == nullptr;
+   const char* fallback_override = std::getenv("STATICRECOMP_FALLBACK_RANGES");
+   std::istringstream fallback_ranges(fallback_override ? fallback_override :
+                                                          Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
+@@ -214,6 +215,9 @@ void StaticRecompCore::Shutdown()
+                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
+                (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
+   SrnpDumpFallbackStats();
++  std::fprintf(stderr, "[staticrecomp] busy-wait skips: %llu (detection %s)\n",
++               static_cast<unsigned long long>(m_busy_wait_skips),
++               m_detect_busy_wait ? "on" : "off");
+   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
+                                                     m_dispatch_samples.end());
+   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
+@@ -369,8 +373,41 @@ void StaticRecompCore::LoadModule()
+                  desc->num_smc_ranges);
+ }
+ 
++bool StaticRecompCore::IsBusyWaitLoop(u32 address)
++{
++  // Analysis reads guest memory and is not meaningful while a debugger or branch watch is active,
++  // both of which want every block to actually execute.
++  if (IsDebuggingEnabled() || IsBranchWatchEnabled())
++    return false;
++
++  const auto cached = m_busy_wait_cache.find(address);
++  if (cached != m_busy_wait_cache.end())
++    return cached->second;
++
++  constexpr std::size_t max_loop_instructions = 64;
++  // The analyzer writes its statistics through these; nothing else in this core sets them.
++  code_block.m_stats = &js.st;
++  code_block.m_gpa = &js.gpa;
++  code_block.m_fpa = &js.fpa;
++  analyzer.Analyze(address, &code_block, &m_code_buffer,
++                   std::min(max_loop_instructions, m_code_buffer.size()));
++
++  const bool is_busy_wait =
++      !code_block.m_memory_exception &&
++      std::any_of(m_code_buffer.begin(), m_code_buffer.begin() + code_block.m_num_instructions,
++                  [address](const PPCAnalyst::CodeOp& op) {
++                    return op.branchIsIdleLoop && op.branchTo == address;
++                  });
++  m_busy_wait_cache.emplace(address, is_busy_wait);
++  if (is_busy_wait)
++    std::fprintf(stderr, "[staticrecomp] busy-wait loop detected at %08x (%u instructions)\n",
++                 address, code_block.m_num_instructions);
++  return is_busy_wait;
++}
++
+ void StaticRecompCore::ClearCache()
+ {
++  m_busy_wait_cache.clear();
+   if (m_fallback_jit)
+     m_fallback_jit->ClearCache();
+ 
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index dc1b31e312..8cb3aef71e 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -56,6 +56,11 @@ public:
+   bool IsHostCallAddress(u32 address) const;
+   bool ShouldYieldAt(u32 address);
+ 
++  // From Piconet's RecompCore (RecompCore PR #19): true when `address` is the head of a guest
++  // busy-wait loop, so the dispatcher can hand the remaining slice back to CoreTiming instead of
++  // spinning through it in real time.
++  bool IsBusyWaitLoop(u32 address);
++
+   void ClearCache() override;
+   void Jit(u32 em_address) override {}
+   bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
+@@ -246,6 +251,11 @@ private:
+   bool m_collect_dispatch_samples = false;
+   bool m_has_rel_modules = false;
+   u32 m_idle_pc = 0;
++  // Analysis result per loop-head address. Invalidated whenever guest code could have changed
++  // (ClearCache, SMC re-verification, REL relink).
++  std::unordered_map<u32, bool> m_busy_wait_cache;
++  bool m_detect_busy_wait = true;  // SRNP_NO_BUSYWAIT=1 turns the detection off
++  u64 m_busy_wait_skips = 0;       // diagnostic
+ };
+ 
+ extern StaticRecompCore* g_static_recomp_core;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index b0f950dff7..c740fc9746 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -187,7 +187,15 @@ void StaticRecompCore::Run()
+           // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread). After
+           // one, the next dispatches keep the short budget (m_wait_streak), so that a long
+           // runtime budget does not spin through the wait natively (from Piconet's RecompCore).
+-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
++          // A dispatch that returns to the address it entered at is a self-loop, and if the
++          // analyzer agrees it is an idle loop there is nothing to gain from spinning it in real
++          // time (RecompCore PR #19, as Piconet has it).
++          const bool configured_idle = m_guest.pc == m_idle_pc && m_idle_pc != 0;
++          const bool detected_idle = !configured_idle && m_detect_busy_wait &&
++                                     m_guest.pc == runtime_dispatch_address &&
++                                     IsBusyWaitLoop(runtime_dispatch_address);
++          m_busy_wait_skips += detected_idle;
++          if (configured_idle || detected_idle)
+           {
+             m_system.GetCoreTiming().Idle();
+             m_wait_streak = 8;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 7dc4579fff..425289b801 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -434,6 +434,7 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+         --m_failed_chunks;
+       m_chunk_state[i] = CHUNK_UNVERIFIED;
+       PublishChunkState(i);
++      m_busy_wait_cache.clear();
+       ++m_reverify_events;
+     }
+   }
+-- 
+2.34.1.windows.1
+
