@@ -1,0 +1,55 @@
+From 1b085bb2a7f60f4e97837293477ac4f775905593 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:44:01 +0100
+Subject: [PATCH] Runner: the seat's rank on its HUD; the rank back in the
+ checksum
+
+The HUD task 0x80421D00 (rank, lap, record panel) reads racer 0 as a
+constant too (0x80421D20); it only reads it, so it joins the words
+changed on the local seat's machine. Measured: 8 native runners, a whole
+race, each shows its own place (all 8 places), 143 checksums equal
+(runner 0 unpatched, the 7 others patched).
+
++0x102C (the rank, read by the item and AI code) leaves the camera
+fields: it never differed between runners over two whole native races
+(143 and 167 dumps); it differed once in a JIT trial.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index a4fe364..8740c92 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -167,7 +167,8 @@ constexpr CodeWord kHudCode[] = {
+     {0x8042D440, 0x39049440},  // addi r8, r4, -0x6BC0 (racer 0)
+     {0x8042EEF4, 0x7F43D378},  // mr r3, r26
+     {0x8042EEF8, 0x809A0B98},  // lwz r4, 0xB98(r26)
+-    {0x8042BC10, 0x39C49440},  // addi r14, r4, -0x6BC0: racer 0 in the HUD task 0x8042BBEC (rank?)
++    {0x8042BC10, 0x39C49440},  // addi r14, r4, -0x6BC0: racer 0 in the HUD task 0x8042BBEC
++    {0x80421D20, 0x3B649440},  // addi r27, r4, -0x6BC0: racer 0 in the HUD task 0x80421D00 (rank)
+ };
+ int s_hud_seat = 0;
+ 
+@@ -185,6 +186,7 @@ void PatchHud(int seat)
+       seat ? 0x387A0000u | ((0u - shift) & 0xFFFFu) : 0x7F43D378u,  // addi r3, r26, -shift
+       0x809A0000u | ((0x0B98u - shift) & 0xFFFFu),           // lwz r4, 0xB98 - shift(r26)
+       0x39C40000u | ((0x9440u + shift) & 0xFFFFu),           // addi r14, r4, -0x6BC0 + shift
++      0x3B640000u | ((0x9440u + shift) & 0xFFFFu),           // addi r27, r4, -0x6BC0 + shift
+   };
+   if (s_hud_seat == 0)  // the game's code must be there (same game, same version)
+   {
+@@ -387,7 +389,7 @@ std::uint64_t RacersHash()
+   // vectors and positions, likely a light or a shadow): left out of the checksum.
+   static constexpr std::pair<std::uint32_t, std::uint32_t> kCameraFields[] = {
+       {0x370, 0x394},   {0x8B4, 0x8B8},   {0x8C0, 0x8C4},  {0xDC4, 0xE74},  {0xFD8, 0xFDC},
+-      {0x1000, 0x1004}, {0x102C, 0x102D}, {0x1036, 0x1037}, {0x105C, 0x1060}};
++      {0x1000, 0x1004}, {0x1036, 0x1037}, {0x105C, 0x1060}};  // not +0x102C: the rank
+   std::uint64_t hash = 0xCBF29CE484222325ull;
+   for (std::uint32_t k = 0; k < 8; ++k)
+   {
+-- 
+2.34.1.windows.1
+
