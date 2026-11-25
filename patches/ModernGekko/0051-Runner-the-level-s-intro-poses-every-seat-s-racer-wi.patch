@@ -1,0 +1,141 @@
+From fef975feb0a2a53750b086df954df7367a8e7f4c Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:49:18 +0100
+Subject: [PATCH 51/51] Runner: the level's intro poses every seat's racer,
+ with this machine's voice
+
+In a 1-2 player game the intro task (0x80434414, step 2 at 0x80434A30) poses
+racer 0 (animation 86) and starts the voice task with racer 0's character, so
+every machine showed and played Sonic's intro (Gibax). Posing only the seat's
+racer left +0x788 different between machines for the whole race (18
+divergences from frame 480). Now, as the game does with 3-4 players, every
+seat's racer poses on every machine (a loop in free low memory at 0x80002B00
+replaces the three calls on racer 0), and the voice is this machine's seat's
+character: only the voice differs between machines.
+
+Measured in the 2-player race at frame 520: Sonic and Knuckles both pose, each
+camera on its own; 25 identical checksums, 0 divergences; the race at 6"00 is
+the same picture as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 89 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 3e43a7a..be36892 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -880,6 +880,93 @@ void PatchSeatDisplays(int seat)
+   PatchSeatDisplay(s_prompts_c, seat);
+ }
+ 
++// The level's intro (2026-11-26, Gibax: on his machine "ya que l'animation et le son de Sonic qui sort
++// (1P)"). The intro task (0x80434414, its step 2 at 0x80434A30), in a game of 1 or 2 players, poses
++// racer 0 (0x804B2430, then animation 86 by 0x804B2404, then 0x804B2388) and starts the voice task
++// (0x800E2724, 32010) with racer 0's character (+0xBA); with 3 or 4 players every player's racer poses
++// at once. Posing this machine's seat alone left a racer field different between machines for the
++// whole race (+0x788, measured on 2026-11-26: 18 divergences from frame 480). Here, as with 3-4
++// players, every seat's racer poses on every machine (a loop in free low memory, called instead of the
++// three calls on racer 0), and the voice is this machine's seat's character: only the voice differs.
++// SRNP_FIGURES=0 keeps the game's.
++constexpr std::uint32_t kIntroCave = 0x80002B00;  // free low memory (0x80001810-0x80002C00, zero in races)
++constexpr CodeWord kIntroWords[] = {
++    {0x80434A74, 0x38639440},  // addi r3, r3, -0x6BC0 (racer 0)  -> bl kIntroCave
++    {0x80434A78, 0x4807D9B9},  // bl 0x804B2430                    -> b 0x80434AA8 (after the 3 calls)
++    {0x80434AB0, 0x38A49440},  // addi r5, r4, -0x6BC0 (the voice's character: racer 0's) -> the seat's
++};
++bool s_intro_patched = false;
++
++void PatchIntro(int seat, int seats)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_FIGURES");
++    return v && *v == '0';
++  }();
++  const bool on = !off && seat >= 0 && seat < 8 && seats >= 1 && seats <= 8;
++  if (on == s_intro_patched)
++    return;
++  const auto bl = [](std::uint32_t from, std::uint32_t to) {
++    return 0x48000001u | ((to - from) & 0x03FFFFFCu);
++  };
++  const std::uint32_t loop = kIntroCave + 8 * 4;
++  const std::uint32_t cave[] = {
++      0x9421FFE0, 0x7C0802A6, 0x90010024, 0x93E1001C,  // stwu r1,-32(r1); mflr r0; stw r0,36(r1); stw r31
++      0x93C10018, 0x3FE08061, 0x3BFF9440,              // stw r30; r31 = racer 0 (0x80609440)
++      0x3BC00000u | static_cast<std::uint32_t>(seats),  // li r30, seats
++      0x7FE3FB78, bl(loop + 4, 0x804B2430),            // loop: mr r3, r31; bl 0x804B2430
++      0x3C60805C, 0xC023FC0C, 0x7FE3FB78,              // lfs f1, [0x805BFC0C]; mr r3, r31
++      0x38800056, 0x38A0000C, 0xFC400890,              // li r4, 86; li r5, 12; fmr f2, f1
++      bl(loop + 32, 0x804B2404),                       // bl 0x804B2404 (the pose's animation)
++      0x7FE3FB78, bl(loop + 40, 0x804B2388),           // mr r3, r31; bl 0x804B2388
++      0x3BFF1080, 0x37DEFFFF, 0x4082FFCC,              // next racer; addic. r30, r30, -1; bne loop
++      0x83C10018, 0x83E1001C, 0x80010024, 0x7C0803A6,  // restore r30, r31, lr
++      0x38210020, 0x4E800020,                          // addi r1, r1, 32; blr
++  };
++  const std::uint32_t patched[] = {bl(kIntroWords[0].address, kIntroCave), 0x48000030u,
++                                   0x38A40000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(
++                                                                         std::max(seat, 0))) & 0xFFFFu)};
++  for (std::size_t i = 0; i < std::size(kIntroWords); ++i)
++  {
++    const std::uint32_t expected = on ? kIntroWords[i].original : Read32(kIntroWords[i].address);
++    if (on && Read32(kIntroWords[i].address) != expected)
++    {
++      std::fprintf(stderr, "[srnp racers] intro: 0x%08X holds %08X, not %08X: left alone\n",
++                   kIntroWords[i].address, Read32(kIntroWords[i].address), expected);
++      return;
++    }
++  }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  if (on)
++  {
++    for (std::size_t i = 0; i < std::size(cave); ++i)
++    {
++      const std::uint32_t word = Read32(kIntroCave + 4 * static_cast<std::uint32_t>(i));
++      if (word != 0 && word != cave[i] && !(i == 7 && (word & 0xFFFF0000u) == 0x3BC00000u))
++      {
++        std::fprintf(stderr, "[srnp racers] intro: 0x%08X is not free (%08X): left alone\n",
++                     kIntroCave + 4 * static_cast<std::uint32_t>(i), word);
++        return;
++      }
++    }
++    for (std::size_t i = 0; i < std::size(cave); ++i)
++      if (std::uint8_t* p = Guest(kIntroCave + 4 * static_cast<std::uint32_t>(i), 4))
++        Put32(p, cave[i]);
++    jit.InvalidateICache(kIntroCave, static_cast<std::uint32_t>(4 * std::size(cave)), true);
++  }
++  for (std::size_t i = 0; i < std::size(kIntroWords); ++i)
++  {
++    if (std::uint8_t* p = Guest(kIntroWords[i].address, 4))
++      Put32(p, on ? patched[i] : kIntroWords[i].original);
++    jit.InvalidateICache(kIntroWords[i].address, 4, true);
++  }
++  s_intro_patched = on;
++  if (on)
++    std::fprintf(stderr, "[srnp racers] intro: the %d seats' racers pose, racer %d's voice\n", seats, seat);
++  else
++    std::fprintf(stderr, "[srnp racers] intro: the game's\n");
++}
++
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+ // (finding which HUD task shows what); the game's words come back at the end of the race.
+ std::vector<std::pair<std::uint32_t, std::uint32_t>> s_test_patch_saved;
+@@ -996,6 +1083,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchAnimation(true);
+     PatchZones(true);
+     PatchSeatDisplays(camera_seat);
++    PatchIntro(camera_seat, static_cast<int>(std::min<std::size_t>(pads.size(), count)));
+     PatchCameras(racers, camera_seat, camera_seat2);
+     PatchTest(true);
+     // SRNP_BD5=<address>,... (test, hexadecimal): those reads of the CPUs' flag (lbz rD, 0xBD(rA))
+@@ -1073,6 +1161,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchAnimation(false);
+     PatchZones(false);
+     PatchSeatDisplays(-1);
++    PatchIntro(-1, 0);
+     PatchCameras(racers, -1, -1);
+     PatchTest(false);
+     std::fprintf(stderr, "[srnp racers] race over (0x%X, loading %u, scene %u): racers back to the game\n",
+-- 
+2.34.1.windows.1
+

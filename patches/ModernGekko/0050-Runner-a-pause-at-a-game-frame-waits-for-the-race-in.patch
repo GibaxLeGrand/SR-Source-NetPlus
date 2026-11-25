@@ -1,0 +1,34 @@
+From 920bc8a24b5dfe4594fe23333a0e9073313e94d7 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:49:18 +0100
+Subject: [PATCH 50/51] Runner: a pause at a game frame waits for the race in
+ the game's-menus lobby
+
+With SRNP_LOBBY=2 the relay counts frames in the lobby too, so pause_at below
+the lobby's length paused there (frame 60 stopped the lobby). The count used
+by SRNP_PAUSE_JEU is now 0 until the lockstep from the start state, where
+frames count from 1 again: a pause at frame 520 lands in the level's intro.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 8800ede..79d609b 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -1012,6 +1012,10 @@ void GameFrameHook(CPUState*)
+ 
+ std::uint64_t RelayGameFrames()
+ {
++  // The lobby through the game's menus counts frames before the race too: a pause (SRNP_PAUSE_JEU)
++  // waits for the lockstep from the start state, where frames count from 1 again.
++  if (LobbyVanilla() && s_vanilla.load() != Vanilla::Synced)
++    return 0;
+   return s_game_frames.load(std::memory_order_relaxed);
+ }
+ 
+-- 
+2.34.1.windows.1
+

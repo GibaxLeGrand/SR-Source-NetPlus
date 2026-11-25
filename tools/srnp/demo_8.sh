@@ -63,7 +63,7 @@ lance() {  # lance <siège>
     powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
     printf 'mod=srnp_etiquettes\n' >> "$D/userdir/config.ini"
   fi
-  local SON=--mute; [[ "$r" == "${SON_RUNNER:-0}" ]] && SON=
+  local SON=--mute; [[ -n "${SON_RUNNER:-}" && "$r" == "$SON_RUNNER" ]] && SON=   # muet par défaut (Gibax dort, 26/11)
   (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU="${TOUS_CPU:-1}" \
      SRNP_PERSOS="$PERSOS" SRNP_INPUT="$(entree_de "$r")" SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_TAG="$(tag_de "$r")" SRNP_LOBBY="${LOBBY:-0}" SRNP_LOBBY_AUTO="$(auto_de "$r")" SRNP_LOBBY_KEYS="$(touches_de "$r")" SRNP_CKDUMP="$(w "$D/ck")" \
      MODERNGEKKO_STATICRECOMP=1 ./moderngekko-run.exe --game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" \
@@ -121,6 +121,18 @@ for s in ${PHOTOS_ATTENTE:-}; do
   for k in $(seq 0 $((N - 1))); do fenetre $k "lobby_${s}s"; done
   echo "$(date +%T) photos de l'attente à ${s} s"
 done
+# RAFALE_GO="<secondes>:<nombre>" : <nombre> captures de chaque runner (toutes les RAFALE_PAS s, 0,1 par
+# défaut), <secondes> après le GO du relais, sans pause : l'intro du niveau (une pause avant la course
+# tomberait dans le lobby, où les frames comptent déjà).
+if [[ -n "${RAFALE_GO:-}" ]]; then
+  for i in $(seq 1 1200); do grep -q ": GO" "$RUN/relais.log" 2>/dev/null && break; sleep 0.5; done
+  echo "$(date +%T) GO du relais"
+  sleep "${RAFALE_GO%%:*}"
+  "$PY" -I "$(w "$W/phase2/rafale.py")" "$(w "$RUN")" "$N" "${RAFALE_GO##*:}" "${RAFALE_PAS:-0.1}"
+  for i in $(seq 1 60); do [[ -z "$(ls "$RUN"/runner*/auto/commands/s*.txt 2>/dev/null)" ]] && break; sleep 0.5; done
+  sleep 1
+  "$PY" "$(w "$W/phase2/rafale_planche.py")" "$(w "$RUN")" "$N"
+fi
 # 3. La course : les moments demandés, les N fenêtres. VIDAGE=1 : MEM1 (bas, 16 Mo) du runner VIDAGE_RUNNER (0) à chaque
 #    moment, dans <run>/f<frame>_lo.bin (hors dépôt : c'est la mémoire du jeu).
 vide_ram() {  # vide_ram <frame>
@@ -153,7 +165,7 @@ for c in "${CAPTS[@]}"; do
   # (commande screenshot du runner, sans pause) toutes les 0,1 s, dans <run>/rafale/j<k>_<n>.png.
   # Elles partent ~1,5 s de jeu après la reprise : viser la pause plus tôt ; le chrono à l'image fait foi.
   if [[ -n "${RAFALE:-}" && "${RAFALE%%:*}" == "$c" ]]; then
-    "$PY" -I "$(w "$W/phase2/rafale.py")" "$(w "$RUN")" "$N" "${RAFALE##*:}" 0.1
+    "$PY" -I "$(w "$W/phase2/rafale.py")" "$(w "$RUN")" "$N" "${RAFALE##*:}" "${RAFALE_PAS:-0.1}"
     for i in $(seq 1 60); do [[ -z "$(ls "$RUN"/runner*/auto/commands/s*.txt 2>/dev/null)" ]] && break; sleep 0.5; done
     sleep 1   # la dernière image s'écrit après le traitement de sa commande
     "$PY" "$(w "$W/phase2/rafale_planche.py")" "$(w "$RUN")" "$N"
