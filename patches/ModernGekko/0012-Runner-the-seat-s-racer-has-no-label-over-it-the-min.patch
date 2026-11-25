@@ -1,0 +1,71 @@
+From c65c9b19f29a20176dc9cfd5465da823f628845c Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:20:07 +0100
+Subject: [PATCH] Runner: the seat's racer has no label over it; the minimap's
+ code moves to 0x80002D80
+
+- The 1P labels over the racers (0x8042F47C, called by the 1P HUD: "nP"
+  by racer index for a human, "COM" for a CPU, the character's head)
+  leave out the player's own racer, racer 0 in the game's code
+  (cmplwi r31, 0 at 0x8042F710, 0x8042F9B8, 0x8042FD28, each read by one
+  beq). Set with the HUD: cmplwi r31, seat. The numbers stay the same on
+  every machine (racer k is (k+1)P).
+- The minimap's three words move from 0x80002E00 to 0x80002D80, right
+  after the seats' pads: 0x80002E00-0x80002FBC is the 5P-8P labels'.
+
+Measured: camera and HUD on racer 3, no label over it (without the
+patch, "4P"); the minimap's images the same to the pixel after the
+move. 8 runners on one PC, each its own seat's HUD, a full race: 142
+checksums equal, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 21a2cea..c4e1d91 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -172,14 +172,21 @@ constexpr CodeWord kHudCode[] = {
+     {0x8042BC10, 0x39C49440},  // addi r14, r4, -0x6BC0: racer 0 in the HUD task 0x8042BBEC
+     {0x80421D20, 0x3B649440},  // addi r27, r4, -0x6BC0: racer 0 in the HUD task 0x80421D00 (rank)
+     {0x80415C54, 0x89331029},  // lbz r9, 0x1029(r19): the minimap's racer index (below)
++    // The 1P labels over the racers (0x8042F47C, called by the 1P HUD: "nP" by racer index for a
++    // human, +0xBD = 0, "COM" for a CPU, with the character's head; the same number on every machine)
++    // leave out the player's own racer, racer 0 (loop index r31 == 0). It is the seat's racer that must
++    // go without: cmplwi r31, seat (each is read by one beq only). (0x804297C8 is the split screen's.)
++    {0x8042F710, 0x281F0000},  // cmplwi r31, 0
++    {0x8042F9B8, 0x281F0000},  // cmplwi r31, 0
++    {0x8042FD28, 0x281F0000},  // cmplwi r31, 0
+ };
+ // The minimap (task 0x80414758) draws every racer's head, from last place to first, the players'
+-// heads (index +0x1029 below the player count, 0x8021B8C8) bright and the others greyed: on a 1P
+-// machine, racer 0. For this machine's seat to be the bright one, the index is read through a few
+-// words of code in free low memory (after the seats' pads): index - seat, so that only the seat's
+-// racer is below 1 (unsigned). 2026-11-25.
++// heads (index +0x1029 below the player count, 0x8021B8C8) blinking and the others fixed: on a 1P
++// machine, racer 0. For this machine's seat to be the blinking one, the index is read through a few
++// words of code in free low memory (right after the seats' pads; 0x80002E00-0x80002FBC is the
++// 5P-8P labels'): index - seat, so that only the seat's racer is below 1 (unsigned). 2026-11-25.
+ constexpr std::uint32_t kMinimapIndex = 0x80415C54;
+-constexpr std::uint32_t kMinimapCave = 0x80002E00;
++constexpr std::uint32_t kMinimapCave = 0x80002D80;
+ int s_hud_seat = 0;
+ 
+ void PatchHud(int seat)
+@@ -199,7 +206,11 @@ void PatchHud(int seat)
+       0x3B640000u | ((0x9440u + shift) & 0xFFFFu),           // addi r27, r4, -0x6BC0 + shift
+       // bl kMinimapCave (seat 0: the game's lbz)
+       seat ? 0x48000001u | ((kMinimapCave - kMinimapIndex) & 0x03FFFFFCu) : 0x89331029u,
++      0x281F0000u | static_cast<std::uint32_t>(seat),  // cmplwi r31, seat
++      0x281F0000u | static_cast<std::uint32_t>(seat),
++      0x281F0000u | static_cast<std::uint32_t>(seat),
+   };
++  static_assert(std::size(kHudCode) == 9);
+   if (s_hud_seat == 0)  // the game's code must be there (same game, same version)
+   {
+     for (const CodeWord& word : kHudCode)
+-- 
+2.34.1.windows.1
+

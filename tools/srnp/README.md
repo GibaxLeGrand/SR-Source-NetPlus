@@ -52,6 +52,9 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
 - The seat's head is the one that blinks on the minimap (patch 0011, with the HUD); with a relay the
   runner's menu never pauses the game. `SRNP_PATCH=<address>=<word>,...` writes code words for the
   race (experiments: which HUD task shows what).
+- The seat's racer has no label over it (patch 0012: the 1P labels, 0x8042F47C, left out racer 0); the
+  label numbers stay the racer's index on every machine. The minimap's three words of code now sit at
+  0x80002D80 (0x80002E00-0x80002FBC is kept for the 5P-8P labels).
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same
