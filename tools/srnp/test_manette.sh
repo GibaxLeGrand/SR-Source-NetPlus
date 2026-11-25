@@ -12,7 +12,7 @@
 #   - départ depuis « Are you ready? » : Gibax appuie sur Start ; sommes de contrôle du relais à la fin.
 #   test_manette.sh            (fermer les fenêtres pour finir)
 # MANETTE=SDL/0/Xbox One Controller par défaut (XInput/0/Gamepad ne donnait rien le 25/11), MANETTE2,
-# ETAT=<state> (course1p : la course tourne déjà), CAM1, DELAI, ENTREE0=ia (vérifier le Start du menu
+# ETAT=<state> (course1p : la course tourne déjà), CAM1, DELAI, LOBBY=1 (AUTO1), ENTREE0=ia (vérifier le Start du menu
 # sans manette : le siège 0 appuie seul sur Start).
 set -uo pipefail
 W=/d/_SonicRidersSource/work
@@ -78,7 +78,17 @@ D-Pad/Right = \`Pad E\`
   powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
   printf 'mod=srnp_etiquettes\n' >> "$D/userdir/config.ini"
   local SON=--mute; [[ "$4" == son ]] && SON=
+  # LOBBY=1 : le lobby à l'essai ; le runner 1 choisit seul (AUTO1, défaut Shadow sur la planche 1, prêt
+  # après 8 s), le runner 0 (l'hôte) à la manette.
+  # LOBBY=2 : le lobby par les menus du jeu (chaque runner part sur le choix du perso) ; le runner 1 y
+  # passe seul (TOUCHES1, défaut : droite droite A A Start, Knuckles).
+  local auto="" keys=""
+  if [[ "$r" == 1 && -z "$MANETTE2" ]]; then
+    [[ "${LOBBY:-0}" == 1 ]] && auto="${AUTO1:-10/1/8}"
+    [[ "${LOBBY:-0}" == 2 ]] && keys="${TOUCHES1:-RRAAS}"
+  fi
   (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7846 SRNP_SEAT=$r SRNP_SEATS=2 SRNP_RACERS=1 SRNP_INPUT=$2 \
+     SRNP_LOBBY="${LOBBY:-0}" SRNP_LOBBY_AUTO="$auto" SRNP_LOBBY_KEYS="$keys" \
      SRNP_CAMERA=$3 SRNP_DELAY="${DELAI:-2}" SRNP_CHECK=60 SRNP_CKDUMP="$(w "$D/ck")" \
      MODERNGEKKO_STATICRECOMP=1 ./moderngekko-run.exe --game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" \
      $SON --load-state "$(w "$STATE")" --module "$(w "$CHASSIS/gGXEE8P_recomp.dll")" > "$D/runner.log" 2>&1) &

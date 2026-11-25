@@ -1,0 +1,497 @@
+From 207dedbade0ce86ca07e5699538306c4da231116 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 22:43:59 +0100
+Subject: [PATCH] Runner: the lobby through the game's own menus (SRNP_LOBBY=2,
+ experimental)
+
+Gibax's design: each player chooses in the game's own Player Entry (the host also in Track Select and
+Rule Settings), then a waiting screen with everyone's choice, then the race. The runner starts free:
+its game runs alone (no lockstep) with the player's pad on port 0, two B presses bring Player Entry back
+to the character choice. When the player presses Start, the menu sets the race up (the racer count
+leaves 1): racer 0's character and gear (+0xBA, +0xBB: the menu writes the gear there, 0 being each
+character's own board) go to the relay (PICK, READY), the host's course and laps too (RULES), and the
+waiting screen shows until GO (the host may still set the racers, Z). At GO every runner loads its start
+state again (on another thread: State::LoadAs waits for the CPU to stop), notices it back (the racer
+count is 1 again), writes the rules, counts the game frames from 1 and starts the lockstep as from the
+boot; seat 0 presses Start (frame 10). The waiting screen stays over the running game (a before-present
+hook) until 15 frames after that Start has set the race up, so the start state's Player Entry is never
+seen; at GO it shows everyone ready ("EVERYONE READY!").
+Measured: 2 runners with simulated presses (Sonic; right right A A Start: Knuckles) and Gibax with his
+pad (Sonic on gear 7 against Knuckles): the choices read from the menus, both runners load the start
+state again and race them; 19 and 104 identical checksums, 0 divergence. The start state's path comes
+from the runtime (SetStartState).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp     |   8 +
+ src/runtime/srnp_relay.cpp          | 245 +++++++++++++++++++++++++++-
+ src/runtime/srnp_relay.hpp          |  12 ++
+ src/runtime/srnp_waiting_screen.cpp |  20 ++-
+ 4 files changed, 272 insertions(+), 13 deletions(-)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index df0aedc..7a89c40 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -965,6 +965,8 @@ struct Runtime::Impl {
+   // The menu opened over the game (config.menu), drawn by menu_hook.
+   std::unique_ptr<detail::GameMenu> menu;
+   Common::EventHook menu_hook;
++  // SR-Source Net Plus: the waiting screen over the running game (srnp::WaitingVeilOnPresent).
++  Common::EventHook srnp_veil_hook;
+ #if MODERNGEKKO_HAS_PULSE
+   // The game's volume, which Dolphin's PulseAudio backend leaves out.
+   std::unique_ptr<detail::PulseStreamVolume> pulse_volume;
+@@ -1102,6 +1104,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   // SR-Source Net Plus: the game's own pictures for the runner's screens (srnp_game_textures.hpp).
+   srnp::SetGameRoot(impl->config.game_root);
+   srnp::SetModDirectories(impl->config.mod_directories);
++  if (impl->config.load_state_path)
++    srnp::SetStartState(PathToString(*impl->config.load_state_path));
+   const ModLoadReport mod_report = impl->mods->LoadDirectories(
+       impl->config.mod_directories, impl->metadata.disc_id);
+   for (const ModLoadIssue &issue : mod_report.issues)
+@@ -1536,6 +1540,9 @@ RuntimeRunResult Runtime::Run() {
+           [menu = m_impl->menu.get()](const PresentInfo &) { menu->AddToFrame(); });
+     }
+   }
++  if (srnp::RelayConfigured())
++    m_impl->srnp_veil_hook = GetVideoEvents().before_present_event.Register(
++        [](const PresentInfo &) { srnp::WaitingVeilOnPresent(); });
+   m_impl->present_hook =
+       GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
+         m_impl->automation_state.frame_count.store(info.frame_count,
+@@ -1615,6 +1622,7 @@ RuntimeRunResult Runtime::Run() {
+   // Unhooked before Dolphin stops: the video thread calls the hooks until then.
+   m_impl->menu_hook = {};
+   m_impl->border_hook = {};
++  m_impl->srnp_veil_hook = {};
+   const detail::GameMenuChoice menu_choice =
+       m_impl->menu ? m_impl->menu->Choice() : detail::GameMenuChoice::None;
+   // Its thread reads the controllers, which go away with the runtime.
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 50feb12..bed3122 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -46,6 +46,7 @@
+ 
+ #include "Core/HW/DSP.h"
+ #include "Core/HW/Memmap.h"
++#include "Core/State.h"
+ #include "Core/System.h"
+ #include "Core/HW/GCPad.h"
+ #include "InputCommon/ControllerInterface/ControllerInterface.h"
+@@ -95,6 +96,21 @@ std::atomic<int> s_wait_seats{0};
+ std::mutex s_wait_mutex;
+ std::string s_wait_states;  // one letter a seat: O expected, V there, X left
+ 
++// The lobby through the game's menus (SRNP_LOBBY=2): free (each game runs alone, its player in the
++// game's menus), waiting (the player pressed Start: the waiting screen until GO), reloading (the start
++// state being loaded again), synced (the lockstep, from the start state on every machine).
++enum class Vanilla
++{
++  Free,
++  Waiting,
++  Reloading,
++  Synced,
++};
++std::atomic<Vanilla> s_vanilla{Vanilla::Free};
++std::string s_start_state;
++std::atomic<bool> s_veil{false};  // the waiting screen over the running game (WaitView::veil)
++bool LobbyVanilla();
++
+ void Off(const char* why)
+ {
+   std::fprintf(stderr, "[srnp relay] off: %s\n", why);
+@@ -261,6 +277,15 @@ Pad RealPad()
+ Pad LocalInput(std::uint64_t frame, int seat)
+ {
+   Pad pad{};
++  // The lobby through the game's menus: everyone has chosen already; from the start state, seat 0
++  // presses Start for the whole match (frames 10-14, then every 120 until the race is taken), nobody
++  // else touches the menus.
++  if (LobbyVanilla() && RaceFrame() < 0)
++  {
++    if (seat == 0 && frame % 120 >= 10 && frame % 120 < 15)
++      pad[1] = 0x20;
++    return pad;
++  }
+   if (s_relay.input_mode == "manette")
+     return RealPad();
+   if (s_relay.input_mode == "ia")
+@@ -357,6 +382,17 @@ std::uint64_t StateHash()
+ 
+ bool LobbyOn();
+ 
++// SRNP_LOBBY=2 (experimental): each player chooses in the game's own menus (Player Entry; the host also
++// Track Select and Rule Settings), then the waiting screen, then the race from the start state.
++bool LobbyVanilla()
++{
++  static const bool on = [] {
++    const char* v = std::getenv("SRNP_LOBBY");
++    return v && *v == '2';
++  }();
++  return on;
++}
++
+ bool Connect()
+ {
+   const char* address = std::getenv("SRNP_RELAY");
+@@ -454,7 +490,7 @@ bool Connect()
+              sizeof(one));
+   for (const int seat : s_relay.local)
+     if (!SendLine("HELLO " + std::to_string(seat) + " " + std::to_string(s_relay.seats) + " " +
+-                  std::to_string(s_relay.delay) + (LobbyOn() ? " LOBBY" : "")))
++                  std::to_string(s_relay.delay) + (LobbyOn() || LobbyVanilla() ? " LOBBY" : "")))
+       return false;
+   // Each local seat's tag (SRNP_TAG for the first, else SRNP_TAGS' entry): the relay passes them on.
+   const char* own = std::getenv("SRNP_TAG");
+@@ -717,6 +753,47 @@ bool LobbyStep(LobbyLocal* l)
+   return changed;
+ }
+ 
++// The relay's bits for a key of SRNP_LOBBY_KEYS (tests): L R U D (D-pad), A B X Y, + - (R, L), Z,
++// S (Start).
++unsigned KeyBits(char k)
++{
++  switch (k)
++  {
++  case 'L': return 0x100u;
++  case 'R': return 0x200u;
++  case 'U': return 0x40u;
++  case 'D': return 0x80u;
++  case 'A': return 0x1u;
++  case 'B': return 0x2u;
++  case 'X': return 0x4u;
++  case 'Y': return 0x8u;
++  case '+': return 0x800u;
++  case '-': return 0x400u;
++  case 'Z': return 0x10u;
++  case 'S': return 0x20u;
++  default: return 0u;
++  }
++}
++
++// The waiting screen of the lobby through the game's menus: the host still sets the racers (Z, from the
++// seats to 8); course and laps came from its own menus.
++bool VanillaWaitStep()
++{
++  if (s_relay.local.front() != 0 || s_rule_course < 1)
++    return false;
++  static unsigned previous = 0;
++  g_controller_interface.UpdateInput();  // the game stands still: nothing else reads the pads now
++  const Pad pad = s_relay.input_mode == "manette" ? RealPad() : Pad{};
++  const unsigned bits = (static_cast<unsigned>(pad[0]) << 8) | pad[1];
++  const unsigned pressed = bits & ~previous;
++  previous = bits;
++  if (!(pressed & 0x10u))
++    return false;
++  const int racers = std::max(s_relay.seats, static_cast<int>(s_rule_racers));
++  SendRules(s_rule_course, s_rule_laps, racers >= 8 ? s_relay.seats : racers + 1);
++  return true;
++}
++
+ // The start together: after HELLO, the runner waits at its first frame until every seat is there. The
+ // relay says WAIT <present> <seats> <states> at each arrival and every 2 s (which keeps the connection
+ // alive past the receive time limit), then GO, with the characters of the seats the AI takes over.
+@@ -735,10 +812,11 @@ void WaitForGo()
+   LobbyLocal lobby;
+   for (;;)
+   {
+-    // Lobby: the local choice between the relay's lines, every 16 ms.
+-    if (LobbyOn() && !s_relay.local.empty() && !LineReady(16))
++    // Lobby: the local choice between the relay's lines, every 16 ms (through the game's menus: the
++    // host's racers only).
++    if ((LobbyOn() || LobbyVanilla()) && !s_relay.local.empty() && !LineReady(16))
+     {
+-      if (LobbyStep(&lobby))
++      if (LobbyVanilla() ? VanillaWaitStep() : LobbyStep(&lobby))
+         RedrawWhileWaiting();
+       continue;
+     }
+@@ -764,7 +842,15 @@ void WaitForGo()
+         const std::size_t next = line.find(' ', p);
+         p = next == std::string::npos ? line.size() : next + 1;
+       }
+-      ApplyRules();
++      if (!LobbyVanilla())  // through the game's menus: written once the start state is back
++        ApplyRules();
++      {
++        // Everyone is there: the screen (still shown under the veil) says so (Gibax: "everyone ready").
++        std::lock_guard lock(s_wait_mutex);
++        for (char& s : s_wait_states)
++          if (s == 'O')
++            s = 'V';
++      }
+       break;
+     }
+     int present = 0, seats = 0;
+@@ -806,7 +892,9 @@ WaitView RelayWaitView()
+     view.states = s_wait_states;
+   }
+   view.local = s_relay.local;
+-  view.lobby = LobbyOn();
++  view.lobby = LobbyOn() || LobbyVanilla();
++  view.vanilla = LobbyVanilla();
++  view.veil = s_veil;
+   view.host = view.lobby && std::find(view.local.begin(), view.local.end(), 0) != view.local.end();
+   view.course = s_rule_course;
+   view.laps = s_rule_laps;
+@@ -834,6 +922,11 @@ std::atomic<std::uint64_t> s_game_frames{0};
+ void RelayStep(std::uint64_t frame);
+ }  // namespace
+ 
++void SetStartState(const std::string& path)
++{
++  s_start_state = path;
++}
++
+ bool RelayConfigured()
+ {
+   static const bool configured = [] {
+@@ -928,6 +1021,134 @@ void RelayOnFrame(std::uint64_t frame)
+ 
+ namespace
+ {
++std::uint32_t GuestWord(std::uint32_t address)
++{
++  const std::uint8_t* p = GuestByte(address);
++  return p ? (static_cast<std::uint32_t>(p[0]) << 24) | (static_cast<std::uint32_t>(p[1]) << 16) |
++                 (static_cast<std::uint32_t>(p[2]) << 8) | p[3] :
++             0;
++}
++
++// The player's pad in the game's menus (port 0, this machine only): the real one, or SRNP_LOBBY_KEYS for
++// tests (one key every 30 frames, held 12, from frame 120). The start state is on Player Entry's "ARE
++// YOU READY?": B at frames 30 and 60 (held 6) brings the player back to the character choice first
++// (Gibax, 2026-11-25: start where you choose).
++Pad VanillaPad(std::uint64_t frame)
++{
++  Pad pad{};
++  if ((frame >= 30 && frame < 36) || (frame >= 60 && frame < 66))
++  {
++    pad[1] = 0x2;  // B
++    return pad;
++  }
++  if (frame < 90)
++    return pad;
++  static const char* keys = std::getenv("SRNP_LOBBY_KEYS");
++  if (keys && *keys)
++  {
++    if (frame >= 120 && (frame - 120) / 30 < std::strlen(keys) && (frame - 120) % 30 < 12)
++    {
++      const unsigned bits = KeyBits(keys[(frame - 120) / 30]);
++      pad[0] = static_cast<std::uint8_t>(bits >> 8);
++      pad[1] = static_cast<std::uint8_t>(bits);
++    }
++    return pad;
++  }
++  return s_relay.input_mode == "manette" ? RealPad() : pad;
++}
++
++// The lobby through the game's menus, before the lockstep: one call a game frame. Free: the game runs
++// alone, the player's pad on port 0, until the player presses Start on Player Entry (the menu writes
++// the race's racers: the racer count leaves 1); then this player's character and gear (racer 0), the
++// host's course and laps (its own Track Select and Rule Settings), READY, and the waiting screen until
++// GO. At GO the start state is loaded again (on another thread: the CPU must reach a point where it can
++// stop); once it is back (the racer count is 1 again, the Player Entry's) the rules are written, the
++// game frames count from 1 again, and the lockstep starts as from the boot. True once in the lockstep
++// (*frame from 1).
++bool VanillaStep(std::uint64_t* frame)
++{
++  constexpr std::uint32_t kRacerCount = 0x8021B8C0u, kRacer0 = 0x80609440u;
++  static std::uint32_t last_count = 0;
++  static std::uint64_t setup_at = 0;
++  switch (s_vanilla.load())
++  {
++  case Vanilla::Free:
++  {
++    while (LineReady(0))  // the relay's lines between frames: nothing waits on them here
++    {
++      std::string line;
++      if (!ReadLine(&line))
++      {
++        Off("relay lost in the menus");
++        return false;
++      }
++      if (!TakeTags(line) && !TakePicks(line))
++        TakeRules(line);
++    }
++    ApplyPad(0, VanillaPad(*frame));
++    const std::uint32_t count = GuestWord(kRacerCount);
++    if (count != 1 && last_count == 1 && setup_at == 0)
++      setup_at = *frame;
++    last_count = count;
++    if (setup_at == 0 || *frame < setup_at + 2)
++      return false;
++    const int seat = s_relay.local.front();
++    const std::uint8_t* racer = GuestByte(kRacer0);
++    const int character = racer ? racer[0xBA] : 0, gear = racer ? racer[0xBB] : 0;
++    ApplyPad(0, Pad{});
++    SendLine("PICK " + std::to_string(seat) + " " + std::to_string(character) + " " + std::to_string(gear));
++    if (seat == 0)
++    {
++      const std::uint8_t* c = GuestByte(kRuleCourse);
++      const std::uint8_t* l = GuestByte(kRuleLaps);
++      if (c && l && *c >= 1 && *c <= kCourses && *l >= 1 && *l <= kMaxLaps)
++        SendRules(*c, *l, std::max(s_relay.seats, RacersWanted() ? RacersWanted() : 8));
++    }
++    SendLine("READY " + std::to_string(seat));
++    std::fprintf(stderr, "[srnp relay] chosen in the game's menus: character %d, gear %d (frame %llu)\n",
++                 character, gear, static_cast<unsigned long long>(*frame));
++    s_vanilla = Vanilla::Waiting;
++    s_veil = true;  // from now until the race's loading: the waiting screen, not the game
++    WaitForGo();
++    if (!s_relay.on)
++      return false;
++    s_vanilla = Vanilla::Reloading;
++    std::thread([] {
++      State::LoadAs(Core::System::GetInstance(), s_start_state);
++      std::fprintf(stderr, "[srnp relay] start state asked again: %s\n", s_start_state.c_str());
++    }).detach();
++    return false;
++  }
++  case Vanilla::Reloading:
++    if (GuestWord(kRacerCount) != 1)
++      return false;  // still the menus' race: the start state is not back yet
++    s_game_frames.store(1);
++    *frame = 1;
++    ApplyRules();
++    s_vanilla = Vanilla::Synced;
++    std::fprintf(stderr, "[srnp relay] start state back: the lockstep starts\n");
++    return true;
++  case Vanilla::Synced:
++  {
++    // The veil comes off 15 frames after seat 0's Start has set the race up (the racer count leaves 1,
++    // at the end of the menu's fade): the screen is black by then (Gibax: "juste avant que le
++    // chargement commence").
++    static std::uint64_t loading_at = 0;
++    if (s_veil && loading_at == 0 && GuestWord(kRacerCount) != 1)
++      loading_at = *frame;
++    if (s_veil && loading_at != 0 && *frame >= loading_at + 15)
++    {
++      s_veil = false;
++      std::fprintf(stderr, "[srnp relay] waiting screen off: the race loads (frame %llu)\n",
++                   static_cast<unsigned long long>(*frame));
++    }
++    return true;
++  }
++  default:
++    return false;
++  }
++}
++
+ void RelayStep(std::uint64_t frame)
+ {
+   if (!s_relay.tried)
+@@ -943,16 +1164,22 @@ void RelayStep(std::uint64_t frame)
+           s_relay.racers ? ", racers mode, camera on racer " + std::to_string(s_relay.camera) : "";
+       std::fprintf(stderr,
+                    "[srnp relay] seat(s) %s of %d, input %s, delay %d frames, checksum every %d "
+-                   "frames%s\n",
++                   "frames%s%s\n",
+                    seats.c_str(), s_relay.seats, s_relay.input_mode.c_str(), s_relay.delay,
+-                   s_relay.check_every, racers.c_str());
+-      WaitForGo();
++                   s_relay.check_every, racers.c_str(),
++                   LobbyVanilla() ? ", the lobby through the game's menus" : "");
++      if (!LobbyVanilla())
++        WaitForGo();
++      else if (s_start_state.empty())
++        Off("the lobby through the game's menus needs a start state (--load-state)");
+     }
+     else if (std::getenv("SRNP_RELAY"))
+       Off("cannot reach the relay");
+   }
+   if (!s_relay.on)
+     return;
++  if (LobbyVanilla() && !VanillaStep(&frame))
++    return;
+ 
+   if (s_relay.check_every > 0 && frame % static_cast<std::uint64_t>(s_relay.check_every) == 0)
+   {
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 40e3297..200d269 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -27,6 +27,10 @@ void RelayOnFrame(std::uint64_t frame);
+ // opens as in Netplay, the match going on behind it).
+ bool RelayConfigured();
+ 
++// The save state the runner booted from (--load-state): the lobby through the game's menus
++// (SRNP_LOBBY=2) loads it again on every machine at GO, so that all start the race from the same point.
++void SetStartState(const std::string& path);
++
+ // The start together: true while this runner waits at its first frame for the other seats (the relay's
+ // WAIT <present> <seats>, until GO), with how many are there. For a waiting screen (any thread).
+ bool RelayWaiting(int* present, int* seats);
+@@ -39,6 +43,7 @@ struct WaitView
+   bool waiting = false;
+   bool lobby = false;
+   bool host = false;  // this machine has seat 0: it sets the rules
++  bool vanilla = false;  // the lobby through the game's menus (SRNP_LOBBY=2): chosen already
+   int course = -1, laps = -1;  // the host's rules (-1: the save state's)
+   int racers = -1;             // the host's racers, the AI's included (-1: the seats)
+   int seats = 0;
+@@ -46,6 +51,9 @@ struct WaitView
+   std::vector<int> local;
+   std::array<int, 8> characters{-1, -1, -1, -1, -1, -1, -1, -1};
+   std::array<int, 8> gears{-1, -1, -1, -1, -1, -1, -1, -1};
++  // The lobby through the game's menus: the waiting screen stays over the game while it runs (the start
++  // state loaded again, its Player Entry, the Start) until the race's loading has begun.
++  bool veil = false;
+ };
+ WaitView RelayWaitView();
+ 
+@@ -53,6 +61,10 @@ WaitView RelayWaitView();
+ // frame is presented again with the screen over it. Called from the emulation thread.
+ void RedrawWhileWaiting();
+ 
++// The waiting screen over each frame the game presents while the veil is on (video thread, before the
++// present).
++void WaitingVeilOnPresent();
++
+ // Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
+ // Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
+ // drawn), through a StaticRecomp host hook. Inputs are then applied, and checksums taken, at the same
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 8535fce..7764ed4 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -158,10 +158,14 @@ void LobbyHint(const WaitView& view, ImDrawList* list, ImFont* font, ImVec2 disp
+     return;
+   const int seat = view.local.front();
+   const char s = seat < static_cast<int>(view.states.size()) ? view.states[static_cast<std::size_t>(seat)] : 'O';
+-  // (the names' font has "/" but no ":")
+-  const char* hint = s == 'O' ? "LEFT/RIGHT  CHARACTER      UP/DOWN  GEAR      A  READY" :
+-                     s == 'V' ? "B  BACK TO CHOOSING" :
+-                                nullptr;
++  // (the names' font has "/" but no ":"). Through the game's menus everyone has chosen already: the
++  // host may still set the racers.
++  const bool everyone = view.veil && view.states.find('O') == std::string::npos;
++  const char* hint = everyone     ? "EVERYONE READY!" :
++                     view.vanilla ? (view.host && s == 'V' ? "Z  RACERS" : nullptr) :
++                     s == 'O'     ? "LEFT/RIGHT  CHARACTER      UP/DOWN  GEAR      A  READY" :
++                     s == 'V'     ? "B  BACK TO CHOOSING" :
++                                    nullptr;
+   if (!hint)
+     return;
+   const ImVec2 at(display.x * 0.5f, display.y * 0.93f);
+@@ -428,6 +432,14 @@ void Draw(const WaitView& view)
+ }
+ }  // namespace
+ 
++void WaitingVeilOnPresent()
++{
++  // While the game runs under the veil (not while it waits: RedrawWhileWaiting draws then).
++  const WaitView view = RelayWaitView();
++  if (view.veil && !view.waiting)
++    Draw(view);
++}
++
+ void RedrawWhileWaiting()
+ {
+   // One redraw queued at a time: the relay's lines come every 2 s at most, the video thread keeps up.
+-- 
+2.34.1.windows.1
+
