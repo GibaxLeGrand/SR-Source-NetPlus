@@ -1,0 +1,170 @@
+From 23fe2ede0584b16676fab1d5266a656fe9725d64 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:58:30 +0100
+Subject: [PATCH] Runner: the tricks' display ("RANK", "AIR +n") for this
+ machine's seat
+
+The game makes the trick display tasks (0x8041AD20 and others, kept per racer at 0x80612934, 0x80612964,
+0x80612974) only for a racer whose index is under the player count (0x80473178: r0 = index + 1, compared
+with the count; else return), so racer 0's tricks showed on every screen. During the race the runner
+compares r0 with its seat + 1 instead (0x8047318C: cmplwi; 0x80473190: bne). The rest of that function
+only makes those tasks. Found with RAM dumps of the same race: 0x8041AD20 was the only task function
+present while "RANK" showed.
+The item boxes' patch and this one now share one helper (code words checked against the game's, put
+back after the race; SRNP_FIGURES=0 keeps the game's).
+Measured on the same race as the control (SEGA Illusion, 3 seats, 4 racers, 7 moments): at frame 2100
+Sonic's screen shows his RANK B / AIR +030, Shadow's his own RANK C / AIR +020 (his HUD hidden meanwhile,
+as the game does for its player), Tails's none; everything else as in the control; 66 identical
+checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 98 ++++++++++++++++++++++++-------------
+ 1 file changed, 65 insertions(+), 33 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index c92969d..30d1bb7 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -593,57 +593,89 @@ void PatchZones(bool on)
+                on ? "camera 0's, from racer 0's path only" : "the game's");
+ }
+ 
++// Displays the game starts for its players only (racer index under the player count, 0x8021B8C8: 1 in
++// the 1P race), so racer 0's on every screen: during the race the runner starts them for its seat's racer
++// instead. Each is a few code words, checked against the game's before they are written and put back
++// after the race. SRNP_FIGURES=0: the game's.
++struct SeatDisplay
++{
++  const char* name;
++  CodeWord words[3];
++  std::size_t count;
++  std::uint32_t (*patched)(std::size_t i, int seat);
++  bool on = false;
++  std::uint32_t written[3] = {};
++};
++
+ // The item boxes' display (the box picked up, "20" rings...): the racers' function (0x80484A3C) starts
+ // its display task (0x80488788: a task of 0x8052C674 given the racer) for a racer that is human
+-// (+0xBC == 0) or whose index is under the player count (0x8021B8C8: 1 in the 1P race) — racer 0 in the
+-// AI's races, every human racer in a real match, shown on every screen alike. During the race it is
+-// started for the racer of this machine's seat alone: lbz r0, 0x1029(r21) (the index); cmplwi r0,
+-// <seat>; beq (the call, as before); b past the call where the player count was compared. Measured on
+-// 2026-11-25 against SRNP_FIGURES=0 (the game's), same race: the boxes of Shadow and Tails show on their
+-// own screens, nothing else changes (66 identical checksums each). The tricks' "RANK"/"AIR" are not
+-// this task: still racer 0's on every screen.
+-constexpr CodeWord kItemBoxWords[] = {
+-    {0x80485EA8, 0x881500BC},  // lbz r0, 0xBC(r21)
+-    {0x80485EAC, 0x28000000},  // cmplwi r0, 0
+-    {0x80485EC8, 0x40810040},  // ble 0x80485F08
+-};
+-bool s_item_boxes_patched = false;
++// (+0xBC == 0) or a player; written: lbz r0, 0x1029(r21) (the index); cmplwi r0, <seat>; beq (the call,
++// as before); b past the call where the player count was compared. Measured on 2026-11-25 against
++// SRNP_FIGURES=0, same race: the boxes of Shadow and Tails show on their own screens, nothing else
++// changes (66 identical checksums each).
++SeatDisplay s_item_boxes{
++    "item boxes",
++    {{0x80485EA8, 0x881500BC},   // lbz r0, 0xBC(r21)
++     {0x80485EAC, 0x28000000},   // cmplwi r0, 0
++     {0x80485EC8, 0x40810040}},  // ble 0x80485F08
++    3,
++    [](std::size_t i, int seat) {
++      constexpr std::uint32_t words[] = {0x88151029u, 0x28000000u, 0x48000040u};
++      return i == 1 ? words[1] | static_cast<std::uint32_t>(seat) : words[i];
++    }};
+ 
+-void PatchItemBoxes(int seat)
++// The tricks' display ("RANK" and its letter, "AIR +n"...): the function at 0x80473178 returns before
++// making its display tasks (0x8041AD20 and others, kept per racer at 0x80612934, 0x80612964, 0x80612974)
++// unless index + 1 <= the player count (r0 = index + 1, r3 = the count); written: cmplwi r0, <seat> + 1;
++// bne (return). The rest of that function only makes those tasks (found on 2026-11-25: the only task
++// functions present while "RANK" shows, in RAM dumps of the same race).
++SeatDisplay s_tricks{
++    "tricks",
++    {{0x8047318C, 0x7C030040},   // cmplw r3, r0
++     {0x80473190, 0x41800790}},  // blt 0x80473920
++    2,
++    [](std::size_t i, int seat) {
++      return i == 0 ? 0x28000000u | static_cast<std::uint32_t>(seat + 1) : 0x40820790u;
++    }};
++
++void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+     const char* v = std::getenv("SRNP_FIGURES");
+     return v && *v == '0';
+   }();
+   const bool on = seat >= 0 && seat < 8;
+-  if (off || on == s_item_boxes_patched)
++  if (off || on == d.on)
+     return;
+-  const std::uint32_t patched[] = {0x88151029u, 0x28000000u | static_cast<std::uint32_t>(on ? seat : 0),
+-                                   0x48000040u};
+-  static std::uint32_t written[3] = {};
+-  for (std::size_t i = 0; i < std::size(kItemBoxWords); ++i)
++  for (std::size_t i = 0; i < d.count; ++i)
+   {
+-    const std::uint32_t expected = on ? kItemBoxWords[i].original : written[i];
+-    if (Read32(kItemBoxWords[i].address) != expected)
++    const std::uint32_t expected = on ? d.words[i].original : d.written[i];
++    if (Read32(d.words[i].address) != expected)
+     {
+-      std::fprintf(stderr, "[srnp racers] item boxes: 0x%08X holds %08X, not %08X: left alone\n",
+-                   kItemBoxWords[i].address, Read32(kItemBoxWords[i].address), expected);
++      std::fprintf(stderr, "[srnp racers] %s: 0x%08X holds %08X, not %08X: left alone\n", d.name,
++                   d.words[i].address, Read32(d.words[i].address), expected);
+       return;
+     }
+   }
+   auto& jit = Core::System::GetInstance().GetJitInterface();
+-  for (std::size_t i = 0; i < std::size(kItemBoxWords); ++i)
++  for (std::size_t i = 0; i < d.count; ++i)
+   {
+-    if (std::uint8_t* p = Guest(kItemBoxWords[i].address, 4))
+-      Put32(p, on ? patched[i] : kItemBoxWords[i].original);
+-    written[i] = patched[i];
+-    jit.InvalidateICache(kItemBoxWords[i].address, 4, true);
++    d.written[i] = on ? d.patched(i, seat) : d.written[i];
++    if (std::uint8_t* p = Guest(d.words[i].address, 4))
++      Put32(p, on ? d.written[i] : d.words[i].original);
++    jit.InvalidateICache(d.words[i].address, 4, true);
+   }
+-  s_item_boxes_patched = on;
++  d.on = on;
+   if (on)
+-    std::fprintf(stderr, "[srnp racers] item boxes shown for racer %d (this machine's seat)\n", seat);
++    std::fprintf(stderr, "[srnp racers] %s shown for racer %d (this machine's seat)\n", d.name, seat);
+   else
+-    std::fprintf(stderr, "[srnp racers] item boxes: the game's\n");
++    std::fprintf(stderr, "[srnp racers] %s: the game's\n", d.name);
++}
++
++void PatchSeatDisplays(int seat)
++{
++  PatchSeatDisplay(s_item_boxes, seat);
++  PatchSeatDisplay(s_tricks, seat);
+ }
+ 
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+@@ -761,7 +793,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchHud(camera_seat);
+     PatchAnimation(true);
+     PatchZones(true);
+-    PatchItemBoxes(camera_seat);
++    PatchSeatDisplays(camera_seat);
+     PatchTest(true);
+     // SRNP_BD5=<address>,... (test, hexadecimal): those reads of the CPUs' flag (lbz rD, 0xBD(rA))
+     // see racer 5 as a CPU, through code in free low memory (0x80001810-0x80002C00, zero in races):
+@@ -837,7 +869,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchHud(0);
+     PatchAnimation(false);
+     PatchZones(false);
+-    PatchItemBoxes(-1);
++    PatchSeatDisplays(-1);
+     PatchTest(false);
+     std::fprintf(stderr, "[srnp racers] race over (0x%X, loading %u, scene %u): racers back to the game\n",
+                  phase, Read32(kRaceLoading), Read32(kRaceScene));
+-- 
+2.34.1.windows.1
+

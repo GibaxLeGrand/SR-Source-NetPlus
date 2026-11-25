@@ -118,10 +118,17 @@ for s in ${PHOTOS_ATTENTE:-}; do
   for k in $(seq 0 $((N - 1))); do fenetre $k "lobby_${s}s"; done
   echo "$(date +%T) photos de l'attente à ${s} s"
 done
-# 3. La course : trois moments, les 8 fenêtres.
+# 3. La course : les moments demandés, les N fenêtres. VIDAGE=1 : MEM1 (bas, 16 Mo) du runner 0 à chaque
+#    moment, dans <run>/f<frame>_lo.bin (hors dépôt : c'est la mémoire du jeu).
+vide_ram() {  # vide_ram <frame>
+  local f="$RUN/f$1_lo.bin" nom="v$1"
+  commande 0 "$nom" "command=read_memory\naddress=0x80000000\nsize=16777216\npath=$(w "$f" | sed 's/\\/\\\\/g')\n"
+  for i in $(seq 1 120); do [[ -f "$RUN/runner0/auto/processed/$nom.txt" ]] && break; sleep 0.5; done
+}
 for c in "${CAPTS[@]}"; do
   pause_a "$c"
   for r in $(seq 0 $((N - 1))); do fenetre $r "course_f$c"; done
+  [[ "${VIDAGE:-0}" == 1 ]] && vide_ram "$c"
   echo "$(date +%T) photos à la frame $c"
   reprise "$c"
 done
