@@ -104,6 +104,11 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
 - Patch 0027 (the labels session's, merged): the waiting screen's counts on one line, each seat's tag
   (`SRNP_TAGS`) under its card and "YOU" in yellow, in the font of the game's names (GoalResult_01_E,
   read from the player's GTSE; the ImGui text without it).
+- Gibax's controller test (2026-11-25, `test_manette.sh`): his Xbox pad read through SDL (`XInput/0/Gamepad`
+  gave nothing), from a race already running (`ETAT=...course1p...`): his inputs drive racer 0 on both
+  runners, 147 checksums equal over 8848 frames, racer 0 at the same place on both. Not yet: the menu's
+  Start from the pad (with no device on GCPad1 the relay's Start does not reach the menu). Patch 0028:
+  the runner logs what the pad gives.
 - `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (leftovers of an earlier demo
   are stopped, other sessions' runners waited for; `N=<seats>`, `TOUS_CPU`): the waiting screen fills up, then the race, photos of the 8 windows at
   three frames of the game, and contact sheets.

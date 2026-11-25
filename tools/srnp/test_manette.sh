@@ -8,14 +8,15 @@
 #     mettrait pas un seul runner en pause ;
 #   - départ depuis « Are you ready? » : Gibax appuie sur Start ; sommes de contrôle du relais à la fin.
 #   test_manette.sh            (fermer les fenêtres pour finir)
-# MANETTE=XInput/0/Gamepad par défaut (le nom que le runner voit), CAM1, DELAI (frames, 2 par défaut).
+# MANETTE=SDL/0/Xbox One Controller par défaut (XInput/0/Gamepad ne donnait rien le 25/11), ETAT=<state>
+# (course1p : la course tourne déjà ; depuis pret1p, le Start du menu ne passe pas encore), CAM1, DELAI.
 set -uo pipefail
 W=/d/_SonicRidersSource/work
 CHASSIS="${CHASSIS:-$W/chassis_p2}"
 PY="/c/Program Files/Python313/python.exe"
 RELAIS=/d/_SonicRidersSource/SR-Source-NetPlus/tools/srnp/relais.py
-STATE="$W/states/gxee8p_pret1p_100pc_metal_1tour_jit.sav"
-MANETTE="${MANETTE:-XInput/0/Gamepad}"
+STATE="${ETAT:-$W/states/gxee8p_pret1p_100pc_metal_1tour_jit.sav}"
+MANETTE="${MANETTE:-SDL/0/Xbox One Controller}"
 RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-manette"
 mkdir -p "$RUN"
 w() { cygpath -w "$1"; }
@@ -29,6 +30,9 @@ lance() {  # lance <siège> <entrée> <caméra> <son>
   cp -a "$W/userdir_modele" "$D/userdir"
   sed -i "s/^\[Core\]\$/[Core]\nEmulationSpeed = 1.0\nSIDevice3 = 0/" "$D/userdir/Config/Dolphin.ini"
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$D/userdir/Config/Dolphin.ini"
+  # La manette lue même sans le focus et sous l'interface ImGui (écran d'attente, menu) : sinon
+  # Dolphin coupe les entrées (Core::UpdateInputGate).
+  sed -i 's/^BackgroundInput = False$/BackgroundInput = True/' "$D/userdir/Config/Dolphin.ini"
   # Aucun port du jeu ne lit une manette ; le port 4 (que le jeu ne voit pas) lit celle de Gibax.
   cat > "$D/userdir/Config/GCPadNew.ini" <<EOF
 [GCPad1]
