@@ -149,6 +149,16 @@ for c in "${CAPTS[@]}"; do
   [[ -n "${ECRIT:-}" ]] && ecrit "$c"
   echo "$(date +%T) photos à la frame $c"
   reprise "$c"
+  # RAFALE="<frame>:<nombre>" : juste après la reprise de cette frame, <nombre> captures de chaque runner
+  # (commande screenshot du runner, sans pause) toutes les 0,1 s, dans <run>/rafale/j<k>_<n>.png.
+  # Elles partent ~1,5 s de jeu après la reprise : viser la pause plus tôt ; le chrono à l'image fait foi.
+  if [[ -n "${RAFALE:-}" && "${RAFALE%%:*}" == "$c" ]]; then
+    "$PY" -I "$(w "$W/phase2/rafale.py")" "$(w "$RUN")" "$N" "${RAFALE##*:}" 0.1
+    for i in $(seq 1 60); do [[ -z "$(ls "$RUN"/runner*/auto/commands/s*.txt 2>/dev/null)" ]] && break; sleep 0.5; done
+    sleep 1   # la dernière image s'écrit après le traitement de sa commande
+    "$PY" "$(w "$W/phase2/rafale_planche.py")" "$(w "$RUN")" "$N"
+    echo "$(date +%T) rafale : $(ls "$RUN/rafale" | wc -l) captures"
+  fi
 done
 sleep 3
 for r in $(seq 0 $((N - 1))); do printf 'command=stop\n' > "$RUN/runner$r/auto/commands/z.txt"; done
