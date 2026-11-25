@@ -1,0 +1,33 @@
+From 203c99125133f60fbe57d1216f681d338d2ac645 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:15:28 +0100
+Subject: [PATCH] Launcher: MODERNGEKKO_LAUNCHER_PAGE=<0-6> opens it on a page
+ (pictures of each page, no clicks)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/moderngekko_launcher.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index 399620d..fd6c131 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -3318,6 +3318,14 @@ int main(int argc, char** argv)
+   // The game selection screen chose the game, and ended in black.
+   bool launch_from_black = false;
+   LauncherPage current_page = LauncherPage::Play;
++  // MODERNGEKKO_LAUNCHER_PAGE=<0-6> (development: pictures of each page): the page it opens on, in the
++  // sidebar's order (PLAY, Settings, Controls, Game Files, Mods & expansions, Screenshots, Credits).
++  if (const char* page = std::getenv("MODERNGEKKO_LAUNCHER_PAGE"))
++  {
++    const int index = std::atoi(page);
++    if (index >= 0 && index < static_cast<int>(LAUNCHER_PAGES.size()))
++      current_page = LAUNCHER_PAGES[static_cast<std::size_t>(index)].first;
++  }
+   // Moving through the launcher with a gamepad.
+   // The Controls page tests the controller: while it does, the gamepad's
+   // buttons and the keyboard's keys only light the tester up, and neither
+-- 
+2.34.1.windows.1
+
