@@ -1,0 +1,165 @@
+From a40db6aa8b6ae44973b34e77384428b7102599dd Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:55:44 +0100
+Subject: [PATCH] Runner: simulated players, pauses at a game frame, three
+ drawing-only fields, no crash at exit
+
+- SRNP_IA_JOUEUR=1 (tests): a racer the AI takes over at the start keeps +0xBD = 0, so it races
+  under the players' rules and shows its "nP" label rather than "COM": the 2P-8P labels can be
+  seen with no one at the pads.
+- SRNP_PAUSE_JEU=1: an automation pause (pad_frames pause_at=<n>) waits for that frame of the game,
+  counted by the main loop's hook, instead of the present's: in lockstep every runner pauses at the
+  same frame, whatever time each one waited before the start.
+- The racers' checksum leaves out +0x84C-0x857, +0x8BC and +0x8DB: written by the characters' own
+  drawing functions for the racers the camera sees, read by the drawing only (Shadow close up in
+  the 8-player demo).
+- The waiting screen's textures are never freed: at exit the video backend is gone first, and
+  freeing them then crashed the runner.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp    |  8 ++++++--
+ src/runtime/srnp_game_textures.cpp | 10 ++++++++--
+ src/runtime/srnp_racers.cpp        | 17 ++++++++++++++---
+ src/runtime/srnp_relay.cpp         | 18 ++++++++++++++++--
+ src/runtime/srnp_relay.hpp         |  5 +++++
+ 5 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 77282cf..c4fa1bf 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -1503,9 +1503,13 @@ RuntimeRunResult Runtime::Run() {
+         // SR-Source Net Plus: an exact pause (pad_frames pause_at=<frame>), on this thread.
+         const std::uint64_t pause_at =
+             m_impl->automation_state.pause_at_frame.load(std::memory_order_relaxed);
+-        if (pause_at != 0 && info.frame_count >= pause_at) {
++        // With SRNP_PAUSE_JEU=1, at that frame of the game (the same on every machine in lockstep).
++        const std::uint64_t pause_frame =
++            srnp::PauseAtGameFrame() ? srnp::RelayGameFrames() : info.frame_count;
++        if (pause_at != 0 && pause_frame >= pause_at) {
+           Core::System::GetInstance().GetCPU().Break();
+-          std::fprintf(stderr, "automation: paused at frame %llu\n",
++          std::fprintf(stderr, "automation: paused at frame %llu (present %llu)\n",
++                       static_cast<unsigned long long>(pause_frame),
+                        static_cast<unsigned long long>(info.frame_count));
+           m_impl->automation_state.pause_at_frame.store(0, std::memory_order_relaxed);
+         }
+diff --git a/src/runtime/srnp_game_textures.cpp b/src/runtime/srnp_game_textures.cpp
+index e35bc7d..b08ed2a 100644
+--- a/src/runtime/srnp_game_textures.cpp
++++ b/src/runtime/srnp_game_textures.cpp
+@@ -158,7 +158,13 @@ struct Loaded
+   const void* presenter = nullptr;
+ };
+ std::map<std::string, std::vector<std::uint8_t>> s_files;  // decompressed, by path
+-std::map<std::pair<std::string, int>, Loaded> s_textures;
++// Never destroyed: at exit the video backend is already gone, and destroying its textures then crashes
++// (as the 4:3 border has it). Built on first use, kept for the life of the runner.
++std::map<std::pair<std::string, int>, Loaded>& Textures()
++{
++  static auto* textures = new std::map<std::pair<std::string, int>, Loaded>();
++  return *textures;
++}
+ std::vector<std::filesystem::path> s_mod_directories;
+ 
+ const std::vector<std::uint8_t>& File(const std::filesystem::path& path)
+@@ -183,7 +189,7 @@ GamePicture Cached(const std::string& file, int index, F decode)
+   GamePicture result;
+   if (!g_gfx || !g_presenter)
+     return result;
+-  Loaded& t = s_textures[{file, index}];
++  Loaded& t = Textures()[{file, index}];
+   if (!(t.texture && t.presenter == g_presenter.get()))
+   {
+     if (t.failed)
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 110f0bd..a25793c 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -601,10 +601,17 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     {
+       if (seat.cpu_at_start)
+       {
++        // SRNP_IA_JOUEUR=1 (tests): simulated players: the AI drives, but the racer stays a player's
++        // (+0xBD = 0: the humans' rules, and its "nP" label rather than "COM").
++        static const bool simulated = [] {
++          const char* v = std::getenv("SRNP_IA_JOUEUR");
++          return v && *v == '1';
++        }();
+         racer[kControl] = 1;
+-        racer[kCpuFlag] = 1;  // the AI, with the CPUs' rules
++        racer[kCpuFlag] = simulated ? 0 : 1;  // the AI, with the CPUs' rules (or a player's)
+         seat.released = true;
+-        std::fprintf(stderr, "[srnp racers] racer %zu: seat %zu gives it to the AI\n", k, k);
++        std::fprintf(stderr, "[srnp racers] racer %zu: seat %zu gives it to the AI%s\n", k, k,
++                     simulated ? " (a simulated player: still nP)" : "");
+         continue;
+       }
+       if (!seat.neutral)
+@@ -646,7 +653,11 @@ std::uint64_t RacersHash()
+   // vectors and positions, likely a light or a shadow): left out of the checksum.
+   static constexpr std::pair<std::uint32_t, std::uint32_t> kCameraFields[] = {
+       {0x370, 0x394},   {0x8B4, 0x8B8},   {0x8C0, 0x8C4},  {0xDC4, 0xE74},  {0xFD8, 0xFDC},
+-      {0x1000, 0x1004}, {0x1036, 0x1037}, {0x105C, 0x1060}};  // not +0x102C: the rank
++      {0x1000, 0x1004}, {0x1036, 0x1037}, {0x105C, 0x1060},  // not +0x102C: the rank
++      // Written by the characters' own drawing functions (the tables around 0x805E3FF0, for the racers
++      // the camera sees) and read by the drawing only; the race logic resets them (0x8049195C):
++      // measured in the 8-player demo, Shadow seen close up (2026-11-25).
++      {0x84C, 0x858}, {0x8BC, 0x8C0}, {0x8DB, 0x8DC}};
+   // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
+   // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index e886b20..e6ed383 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -452,7 +452,7 @@ bool RelayWaiting(int* present, int* seats)
+ 
+ namespace
+ {
+-std::uint64_t s_game_frames = 0;
++std::atomic<std::uint64_t> s_game_frames{0};
+ void RelayStep(std::uint64_t frame);
+ }  // namespace
+ 
+@@ -483,7 +483,21 @@ std::uint32_t GameFrameHookAddress()
+ 
+ void GameFrameHook(CPUState*)
+ {
+-  RelayStep(++s_game_frames);
++  RelayStep(s_game_frames.fetch_add(1, std::memory_order_relaxed) + 1);
++}
++
++std::uint64_t RelayGameFrames()
++{
++  return s_game_frames.load(std::memory_order_relaxed);
++}
++
++bool PauseAtGameFrame()
++{
++  static const bool on = [] {
++    const char* v = std::getenv("SRNP_PAUSE_JEU");
++    return v && *v == '1' && GameFrameHookAddress() != 0;
++  }();
++  return on;
+ }
+ 
+ void RelayOnFrame(std::uint64_t frame)
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 2a115c0..a8ffdbc 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -58,4 +58,9 @@ void GameFrameHook(CPUState* state);
+ // The main loop's whole function, to run in the interpreter while the hook is in place: StaticRecomp's
+ // native code loops inside a function without going back to its dispatcher, where hooks are seen.
+ inline constexpr const char* kGameFrameHookFallbackRange = "805B80CC-805B82D8";
++// The game frames counted by that hook so far (0 without it). With SRNP_PAUSE_JEU=1, an automation
++// pause (pad_frames pause_at=<n>) waits for this count instead of the present's: the presents of
++// machines in lockstep differ (each has waited its own time), their game frames don't.
++std::uint64_t RelayGameFrames();
++bool PauseAtGameFrame();
+ }  // namespace srnp
+-- 
+2.34.1.windows.1
+

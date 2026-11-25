@@ -71,6 +71,16 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   there, X left); a seat that leaves before the start no longer holds it: `GO` names it with a character
   the relay drew at random, and the AI races it. `test_attente.sh`: four seats, one leaves, photos of the
   real window (`capture_fenetre.ps1`, PrintWindow: the runner's own screenshots leave out its interface).
+- Patch 0018: `SRNP_IA_JOUEUR=1` makes the racers that the AI takes over (a seat with the AI's pad,
+  one that left) keep their "nP" label instead of COM: simulated players, to see the 2P-8P labels with
+  no one at the pads. `SRNP_PAUSE_JEU=1`: an automation pause (`pad_frames pause_at=<n>`) waits for
+  that frame of the game, the same on every runner in lockstep (their present counts differ: each one
+  waited its own time). The racers' checksum also leaves out three fields that only the characters'
+  drawing writes (+0x84C-0x857, +0x8BC, +0x8DB). The waiting screen's pictures are no longer freed
+  at exit (the video backend is gone by then: the runner crashed).
+- `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (every Sonic Riders Source
+  process is stopped first): the waiting screen fills up, then the race, photos of the 8 windows at
+  three frames of the game, and contact sheets.
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same

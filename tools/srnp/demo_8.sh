@@ -5,11 +5,12 @@
 #     remplit (photos du runner 0 et de tous) ;
 #   - GO, course complète depuis « Are you ready? » (8 racers en CPU au montage, conduits par l'IA) :
 #     chaque runner sa caméra, son HUD, sa mini-carte, son spotter, les étiquettes 5P-8P du mod ;
-#   - photos des 8 fenêtres à CAPT1 (début), CAPT2 (milieu), CAPT3 (arrivée) ; sommes de contrôle du relais ;
+#   - photos des 8 fenêtres aux frames du jeu CAPT1, CAPT2, CAPT3 (pause à la même frame partout :
+#     SRNP_PAUSE_JEU=1) ; sommes de contrôle du relais ; SRNP_IA_JOUEUR=1 : racers « nP » conduits par l IA ;
 #   - planches (une par moment) dans le dossier du run.
 #   demo_8.sh [CAPT1] [CAPT2] [CAPT3]
 set -uo pipefail
-C1="${1:-8600}"; C2="${2:-10600}"; C3="${3:-12400}"
+C1="${1:-1900}"; C2="${2:-3850}"; C3="${3:-5650}"   # frames du jeu (SRNP_PAUSE_JEU)
 N=8
 W=/d/_SonicRidersSource/work
 CHASSIS="${CHASSIS:-$W/chassis_p2}"
@@ -38,7 +39,7 @@ lance() {  # lance <siège>
   printf 'mod=srnp_etiquettes\n' >> "$D/userdir/config.ini"
   local SON=--mute; [[ "$r" == "${SON_RUNNER:-0}" ]] && SON=
   (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU=1 \
-     SRNP_PERSOS="$PERSOS" SRNP_INPUT=ia SRNP_CHECK=60 SRNP_CKDUMP="$(w "$D/ck")" \
+     SRNP_PERSOS="$PERSOS" SRNP_INPUT=ia SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_CKDUMP="$(w "$D/ck")" \
      MODERNGEKKO_STATICRECOMP=1 ./moderngekko-run.exe --game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" \
      --automation-dir "$(w "$D/auto")" $SON --load-state "$(w "$STATE")" \
      --module "$(w "$CHASSIS/gGXEE8P_recomp.dll")" > "$D/runner.log" 2>&1) &
@@ -48,14 +49,35 @@ fenetre() {  # fenetre <siège> <nom> : photo de la vraie fenêtre (interface co
   powershell -NoProfile -ExecutionPolicy Bypass -File "$(w "$W/phase2/capture_fenetre.ps1")" \
     -Motif "$(basename "$RUN")\\runner$1\\" -Png "$(w "$RUN/$2_j$(($1 + 1)).png")" > /dev/null
 }
-pause_a() {  # pause_a <frame> : tous en pause à cette frame (attendue)
-  for r in $(seq 0 $((N - 1))); do printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$1" > "$RUN/runner$r/auto/commands/p$1.txt"; done
+commande() {  # commande <runner> <nom> <texte> : écrite à côté puis déplacée (jamais lue à moitié)
+  printf "$3" > "$RUN/runner$1/auto/$2.tmp" && mv "$RUN/runner$1/auto/$2.tmp" "$RUN/runner$1/auto/commands/$2.txt"
+}
+pause_a() {  # pause_a <frame> : tous en pause à cette frame du jeu (la même partout en lockstep)
+  local texte="command=pad_frames\nport=3\nframes=1\npause_at=$1\n"
+  for r in $(seq 0 $((N - 1))); do commande $r "p$1" "$texte"; done
   for r in $(seq 0 $((N - 1))); do
-    for i in $(seq 1 900); do [[ -f "$RUN/runner$r/auto/processed/p$1.txt" ]] && break; sleep 0.5; done
+    for i in $(seq 1 900); do
+      [[ -f "$RUN/runner$r/auto/processed/p$1.txt" ]] && break
+      # Refusée (le cœur n'était pas encore reparti, par exemple) : renvoyée.
+      if [[ -f "$RUN/runner$r/auto/failed/p$1.txt" ]]; then
+        rm -f "$RUN/runner$r/auto/failed/p$1.txt"; echo "$(date +%T) runner $r : pause $1 refusée, renvoyée"
+        sleep 0.5; commande $r "p$1" "$texte"
+      fi
+      sleep 0.5
+    done
   done
   sleep 1
 }
-reprise() { for r in $(seq 0 $((N - 1))); do printf 'command=resume\n' > "$RUN/runner$r/auto/commands/r$1.txt"; done; }
+reprise() {  # reprise <frame> : tous repartent ; attend que chacun tourne de nouveau
+  for r in $(seq 0 $((N - 1))); do commande $r "r$1" 'command=resume\n'; done
+  for r in $(seq 0 $((N - 1))); do
+    for i in $(seq 1 60); do
+      [[ -f "$RUN/runner$r/auto/processed/r$1.txt" ]] && grep -q '^state=running' "$RUN/runner$r/auto/status.txt" && break
+      sleep 0.5
+    done
+  done
+  sleep 1
+}
 
 # 2. Les joueurs arrivent : l'écran d'attente se remplit.
 ECART="${ECART:-3}"
