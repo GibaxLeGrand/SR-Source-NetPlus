@@ -67,7 +67,7 @@ for r in $(seq 0 $((N - 1))); do
   if [[ "$MODE" == "natif" ]]; then
     ARGS+=(--module "$(w "$CHASSIS/gGXEE8P_recomp.dll")"); export MODERNGEKKO_STATICRECOMP=1
   else export MODERNGEKKO_STATICRECOMP=0; fi
-  SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$SEATS SRNP_SEATS=$SIEGES SRNP_RACERS=1 SRNP_INPUT="${ENTREES:-course:1}" SRNP_CHECK=60 SRNP_CKDUMP="$(w "$D/ck")" \
+  SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$SEATS SRNP_SEATS=$SIEGES SRNP_RACERS=1 SRNP_INPUT="${ENTREES:-course:1}" SRNP_CHECK=${CHECK:-60} SRNP_CKDUMP="$(w "$D/ck")" \
     ./moderngekko-run.exe "${ARGS[@]}" > "$D/runner.log" 2>&1 &
   PIDS+=($!)
   echo "runner $r : sièges $SEATS"
