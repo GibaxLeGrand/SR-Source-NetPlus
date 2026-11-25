@@ -1,0 +1,36 @@
+From f0622b1fea41b23f470572e675476973f6a2f553 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:54:42 +0100
+Subject: [PATCH] Runner: the relay's pads reach the menus without an
+ automation folder
+
+The relay applies its official pads outside races (the menus' Start) through the GameCube input
+overriders, which the runner only registered with --automation-dir: a player's runner (no automation
+folder) never got them, and the race never left "Are you ready?" (found with Gibax's pad). They are
+registered when a relay is configured too. Measured: test_manette.sh from the menu, the seat's Start
+through the relay starts the race on both runners, 79 checksums equal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index c4fa1bf..3d91616 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -1153,7 +1153,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   if (!impl->config.headless)
+     impl->pad_devices = std::make_unique<PadDeviceWatch>();
+   EnsureAutomationDirectories(impl->config.automation.directory);
+-  if (!impl->config.automation.directory.empty()) {
++  // SR-Source Net Plus: the relay applies its official pads through the same overriders (the menus'
++  // Start, srnp_relay.cpp ApplyPad): without them, a runner started with no automation folder (a
++  // player's) never got them (found with Gibax's pad, 2026-11-25).
++  if (!impl->config.automation.directory.empty() || srnp::RelayConfigured()) {
+     for (int port = 0; port < 4; ++port)
+     {
+       ciface::Touch::RegisterGameCubeInputOverrider(port);
+-- 
+2.34.1.windows.1
+

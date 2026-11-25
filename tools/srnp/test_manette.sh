@@ -89,7 +89,7 @@ sleep 12
 if [[ -n "$MANETTE2" ]]; then
   lance 1 manette "${CAM1:-1}" muet "$MANETTE2" "$MANETTE"
 else
-  lance 1 neutre "${CAM1:-1}" muet "$MANETTE" ""   # la manette de Gibax réservée, pas lue
+  lance 1 "${ENTREE1:-neutre}" "${CAM1:-1}" muet "$MANETTE" ""   # la manette de Gibax réservée, pas lue
 fi
 echo "Gibax : la manette pilote le racer 0 (Start pour partir). Fermer les deux fenêtres pour finir."
 wait $(jobs -p | tail -2) 2>/dev/null

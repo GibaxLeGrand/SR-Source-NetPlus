@@ -1,0 +1,58 @@
+From a44dc91a684b2550e7896b8585c8374a307c577b Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:45:57 +0100
+Subject: [PATCH] Runner: "1P" over racer 0 on the other seats' machines
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 1P labels' loop (0x8042F47C) also leaves out racer 0 at its head: 0x8042F5B4 cntlzw r0, r31,
+then srwi r8, r0, 5 = "racer 0", whose label is skipped unless [0x806129A0] is 400 or 500. The three
+later "cmplwi r31, 0" were already the seat's; this one becomes it too: bl to three words after the
+index caves (0x80002DA4): xori r0, r31, seat; cntlzw r0, r0; blr. Seat 0: the game's word. Asked by
+Gibax ("1P sur Sonic sur l'écran de Amy"). Measured: a 5-player race (Shadow, Tails, Knuckles, Jet,
+Rouge), "1P" over Shadow on the other screens, none over a machine's own racer, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 34277d6..0b7c151 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -282,6 +282,30 @@ void PatchHud(int seat)
+       Put32(p, patched[i]);  // seat 0: the game's own words
+     jit.InvalidateICache(kHudCode[i].address, 4, true);
+   }
++  // The 1P labels also leave out racer 0 at the head of their loop: 0x8042F5B4 cntlzw r0, r31, then
++  // srwi r8, r0, 5 = "racer 0", whose label is skipped unless [0x806129A0] is 400 or 500. Gibax: the
++  // other machines must show "1P" over racer 0 as they do "2P" over racer 1. It becomes "the seat's
++  // racer": bl to three words after the index caves: xori r0, r31, seat; cntlzw r0, r0; blr (the
++  // function saved LR). Seat 0: the game's word.
++  {
++    constexpr std::uint32_t kSkipSite = 0x8042F5B4, kSkipOriginal = 0x7FE00034;  // cntlzw r0, r31
++    constexpr std::uint32_t kSkipCave = kIndexCaves + 3u * 12u;                   // 0x80002DA4
++    const std::uint32_t call = 0x48000001u | ((kSkipCave - kSkipSite) & 0x03FFFFFCu);
++    std::uint8_t* p = Guest(kSkipSite, 4);
++    std::uint8_t* c = Guest(kSkipCave, 12);
++    if (p && c && (Get32(p) == kSkipOriginal || Get32(p) == call))
++    {
++      Put32(c, 0x6BE00000u | static_cast<std::uint32_t>(seat));  // xori r0, r31, seat
++      Put32(c + 4, 0x7C000034u);                                  // cntlzw r0, r0
++      Put32(c + 8, 0x4E800020u);                                  // blr
++      jit.InvalidateICache(kSkipCave, 12, true);
++      Put32(p, seat ? call : kSkipOriginal);
++      jit.InvalidateICache(kSkipSite, 4, true);
++    }
++    else
++      std::fprintf(stderr, "[srnp racers] labels: 0x%08X holds %08X: racer 0's label left alone\n",
++                   kSkipSite, p ? Get32(p) : 0u);
++  }
+   s_hud_seat = seat;
+   std::fprintf(stderr, "[srnp racers] HUD shows racer %d\n", seat);
+ }
+-- 
+2.34.1.windows.1
+
