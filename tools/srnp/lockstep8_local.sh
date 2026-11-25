@@ -22,7 +22,13 @@ CHASSIS_DEFAUT=/d/_SonicRidersSource/SR-Source-NetPlus/build/chassis
 CHASSIS="${CHASSIS:-$CHASSIS_DEFAUT}"
 PY="/c/Program Files/Python313/python.exe"
 RELAIS=/d/_SonicRidersSource/SR-Source-NetPlus/tools/srnp/relais.py
-STATE="${ETAT:-$W/states/gxee8p_course8cpu_metal_1tour_jit.sav}"
+# Par défaut : « Are you ready? » (sauvegarde 100 %), Start par le relais, les 8 racers en CPU au montage
+# (SRNP_TOUS_CPU=1) : la piste se charge après le state. ⚠️ gxee8p_course8cpu_* a été sauvé pendant le
+# chargement de la piste : après ~17", elle ne s'affiche plus (collisions bonnes). À éviter pour regarder.
+if [[ -z "${ETAT:-}" ]]; then
+  ETAT="$W/states/gxee8p_pret1p_100pc_metal_1tour_jit.sav"; export SRNP_TOUS_CPU="${SRNP_TOUS_CPU:-1}"
+fi
+STATE="$ETAT"
 RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-lockstepn-$N-$MODE${ETIQUETTE:+-$ETIQUETTE}"
 mkdir -p "$RUN"
 w() { cygpath -w "$1"; }
