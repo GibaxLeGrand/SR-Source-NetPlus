@@ -1,0 +1,212 @@
+From d1f2680a595f4ea681130c80e53300c7bb28c9ec Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:33:19 +0100
+Subject: [PATCH] Runner: the lobby offers only the gears the character may
+ ride, by name
+
+Up/down in the lobby steps through the gears the game's table lets the character ride (all 41 if the
+table is not in memory), and a change of character moves a forbidden gear to the first allowed one, as
+the race would. The cards name the gear (the modding community's names, in the table's order; checked
+against who may ride them: 7 Sonic alone, 18 Super Sonic, Eggman's first 25, 30-32 and 37-39 the speed,
+fly and power types). The runner logs the table once. SRNP_LOBBY_KEYS=<L R U D A B...> plays presses
+through the pad's path for tests.
+Measured with 2 runners: Sonic -> Ulala, gear 2 (AUTO SLIDER); Shadow -> Eggman moves to 25 then down
+to 34 and 33 (SUPER HANG ON, HANG ON); A, B, A logged by the relay; 12 identical checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp         | 24 ++++++++++++
+ src/runtime/srnp_racers.hpp         |  5 +++
+ src/runtime/srnp_relay.cpp          | 59 +++++++++++++++++++++++------
+ src/runtime/srnp_waiting_screen.cpp | 24 ++++++++++--
+ 4 files changed, 97 insertions(+), 15 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 3201a65..52c9ec4 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -461,6 +461,30 @@ int SeatGear(int seat)
+   return seat >= 0 && seat < 8 ? Lobby()[static_cast<std::size_t>(seat)].gear : -1;
+ }
+ 
++int GearCount()
++{
++  return kGears;
++}
++
++bool GearAllowed(int gear, int character)
++{
++  // Once, in the log: who may ride each gear as the game's table says (one bit a character).
++  static const bool logged = [] {
++    std::string line;
++    for (int g = 0; g < kGears; ++g)
++    {
++      char text[16];
++      std::snprintf(text, sizeof(text), " %d:%05X", g,
++                    Read32(kGearTable + static_cast<std::uint32_t>(g) * 0x1D0u) & 0x1FFFFu);
++      line += text;
++    }
++    std::fprintf(stderr, "[srnp racers] gears, who may ride them (bit = character):%s\n", line.c_str());
++    return true;
++  }();
++  (void)logged;
++  return character >= 0 && character < 32 && GearAllows(gear, character);
++}
++
+ long long RaceFrame()
+ {
+   return s_race ? static_cast<long long>(s_frames - s_race_start) : -1;
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 237ce17..aefc28a 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -48,6 +48,11 @@ void SetSeatChoice(int seat, int character, int gear);
+ int SeatCharacter(int seat);
+ int SeatGear(int seat);
+ 
++// The game's gears (41) and whether a character may ride one (the gear table, in the game's memory
++// once its REL is loaded: false for every gear before).
++int GearCount();
++bool GearAllowed(int gear, int character);
++
+ // FNV-1a 64 of the 8 racers, without the fields that follow the camera (measured on 2026-11-25).
+ std::uint64_t RacersHash();
+ 
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 6ecea9d..e7b8ceb 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -518,9 +518,10 @@ bool TakePicks(const std::string& line)
+ }
+ 
+ // The local seat's choice on the waiting screen: left/right (D-pad or stick) the character (0-16 but
+-// Super Sonic), up/down the gear, A ready, B back to choosing. SRNP_LOBBY_AUTO=<c>/<g>/<seconds>[/<back>]
+-// (tests): that choice, then ready, after that many seconds; with <back>, B that many seconds later (back
+-// to choosing), then A again after as many.
++// Super Sonic), up/down the gear (only those the character may ride), A ready, B back to choosing.
++// Tests: SRNP_LOBBY_AUTO=<c>/<g>/<seconds>[/<back>]: that choice, then ready, after that many seconds;
++// with <back>, B that many seconds later (back to choosing), then A again after as many.
++// SRNP_LOBBY_KEYS=<L R U D A B...>: those presses in place of the pad's, one every 0.5 s after 3 s.
+ struct LobbyLocal
+ {
+   int character = 0, gear = 0;
+@@ -565,12 +566,31 @@ bool LobbyStep(LobbyLocal* l)
+     ++l->auto_step;
+     return true;
+   }
+-  g_controller_interface.UpdateInput();  // the game stands still: nothing else reads the pads now
+-  const Pad pad = s_relay.input_mode == "manette" ? RealPad() : Pad{};
+-  unsigned bits = (static_cast<unsigned>(pad[0]) << 8) | pad[1];
+-  const int x = static_cast<std::int8_t>(pad[2]), y = static_cast<std::int8_t>(pad[3]);
+-  bits |= (x < -40 ? 0x100u : 0u) | (x > 40 ? 0x200u : 0u) | (y > 40 ? 0x40u : 0u) |
+-          (y < -40 ? 0x80u : 0u);
++  unsigned bits = 0;
++  static const char* keys = std::getenv("SRNP_LOBBY_KEYS");
++  if (keys && *keys)
++  {
++    // Tests: the pad's presses from a string (L R U D A B), one every 0.5 s (held 0.25 s) after 3 s.
++    const long long ms =
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - l->since).count() -
++        3000;
++    const std::size_t i = ms >= 0 ? static_cast<std::size_t>(ms / 500) : std::strlen(keys);
++    if (i < std::strlen(keys) && ms % 500 < 250)
++    {
++      const char k = keys[i];
++      bits = k == 'L' ? 0x100u : k == 'R' ? 0x200u : k == 'U' ? 0x40u : k == 'D' ? 0x80u : k == 'A' ? 0x1u :
++             k == 'B' ? 0x2u : 0u;
++    }
++  }
++  else
++  {
++    g_controller_interface.UpdateInput();  // the game stands still: nothing else reads the pads now
++    const Pad pad = s_relay.input_mode == "manette" ? RealPad() : Pad{};
++    bits = (static_cast<unsigned>(pad[0]) << 8) | pad[1];
++    const int x = static_cast<std::int8_t>(pad[2]), y = static_cast<std::int8_t>(pad[3]);
++    bits |= (x < -40 ? 0x100u : 0u) | (x > 40 ? 0x200u : 0u) | (y > 40 ? 0x40u : 0u) |
++            (y < -40 ? 0x80u : 0u);
++  }
+   const unsigned pressed = bits & ~l->previous;
+   l->previous = bits;
+   if (l->ready)
+@@ -588,14 +608,31 @@ bool LobbyStep(LobbyLocal* l)
+     while (c == 11);  // not Super Sonic
+     return c;
+   };
++  // The gears the character may ride (the game's table), all of them if the table is not there.
++  const int gears = GearCount();
++  const auto any_gear = [&](int c) {
++    for (int g = 0; g < gears; ++g)
++      if (GearAllowed(g, c))
++        return true;
++    return false;
++  };
++  const auto next_gear = [&](int g, int step, int c) {
++    const bool filter = any_gear(c);
++    do
++      g = (g + step + gears) % gears;
++    while (filter && !GearAllowed(g, c));
++    return g;
++  };
+   if (pressed & 0x100u)
+     l->character = next(l->character, -1), changed = true;
+   if (pressed & 0x200u)
+     l->character = next(l->character, 1), changed = true;
++  if (changed && any_gear(l->character) && !GearAllowed(l->gear, l->character))
++    l->gear = next_gear(gears - 1, 1, l->character);  // the first gear it may ride, as the race would
+   if (pressed & 0x40u)
+-    l->gear = (l->gear + 1) % 40, changed = true;
++    l->gear = next_gear(l->gear, 1, l->character), changed = true;
+   if (pressed & 0x80u)
+-    l->gear = (l->gear + 39) % 40, changed = true;
++    l->gear = next_gear(l->gear, -1, l->character), changed = true;
+   if (changed)
+     LobbySend(seat, *l);
+   if (pressed & 0x1u)
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 92bef26..b5da4a5 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -34,6 +34,20 @@ constexpr const char* kCharacters[] = {"Sonic",  "Tails",       "Knuckles", "Amy
+                                        "Wave",   "Eggman",      "Cream",    "Rouge", "Shadow", "Super Sonic",
+                                        "NiGHTS", "AiAi",        "Ulala",    "E-10000G", "E-10000R"};
+ 
++// The gears in the order of the game's table (41 records at 0x805E5F40), as the modding community names
++// them (Sewer56's SonicRiders library, ExtremeGear); checked against who may ride them in the table on
++// 2026-11-25 (the runner logs it): 7 Sonic alone (Blue Star), 18 Super Sonic (Chaos Emerald), Eggman's
++// first 25 (E-Rider), 30-32 and 37-39 the speed, fly and power types (Cover, Advantage S/F/P).
++constexpr const char* kGearNames[] = {
++    "DEFAULT GEAR", "HIGH BOOSTER", "AUTO SLIDER", "POWERFUL GEAR", "FASTEST",     "TURBO STAR",
++    "SPEED BALANCER", "BLUE STAR", "ACCESS",      "BEGINNER",      "ACCELERATOR", "TRAP GEAR",
++    "LIGHT BOARD",  "SLIDE BOOSTER", "LEGEND",    "MAGIC CARPET",  "AIR BROOM",   "HOVERCRAFT",
++    "CHAOS EMERALD", "FASTER",     "GAMBLER",     "POWER GEAR",    "OPA OPA",     "THE CRAZY",
++    "BERSERKER",    "E RIDER",     "AIR TANK",    "HEAVY BIKE",    "DESTROYER",   "OMNIPOTENCE",
++    "COVER S",      "COVER F",     "COVER P",     "HANG ON",       "SUPER HANG ON", "DARKNESS",
++    "GRINDER",      "ADVANTAGE S", "ADVANTAGE F", "ADVANTAGE P",   "CANNONBALL"};
++static_assert(std::size(kGearNames) == 41);
++
+ std::atomic<bool> s_redraw_queued{false};
+ 
+ ImU32 Rgba(int r, int g, int b, float a = 1.0f)
+@@ -256,13 +270,15 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+       const float q = side_h;
+       Picture(list, unknown, ImVec2(x - q * 0.5f, i0.y), ImVec2(x + q * 0.5f, i0.y + q), ImVec2(0, 0), ImVec2(1, 1), tint);
+     }
+-    // Lobby: the gear chosen, under the head (its number for now: the race corrects a gear the
+-    // character may not ride).
++    // Lobby: the gear chosen, under the head, by its name (the names' font has no "-": a space).
+     const int gear = view.gears[static_cast<std::size_t>(k)];
+     if (view.lobby && s != 'X' && gear >= 0)
+     {
+-      char text[16];
+-      std::snprintf(text, sizeof(text), "GEAR %d", gear);
++      char text[24];
++      if (gear < static_cast<int>(std::size(kGearNames)))
++        std::snprintf(text, sizeof(text), "%s", kGearNames[gear]);
++      else
++        std::snprintf(text, sizeof(text), "GEAR %d", gear);
+       const ImVec2 at(x, top + card_h * 0.745f);
+       if (!(name_font && NameTextCentred(list, text, at, card_h * 0.075f, tint, card_w * 0.9f)))
+         TextCentred(list, font, card_h * 0.06f, at, tint, text);
+-- 
+2.34.1.windows.1
+
