@@ -46,7 +46,22 @@ for r in $(seq 0 $((N - 1))); do
   SEATS=${GROUPES[$r]:-$(seq -s, $((r * K)) $((r * K + K - 1)))}
   printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$CAPT" > "$A/commands/00_capt.txt"
   ARGS=(--game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" --automation-dir "$(w "$A")"
-        --no-mods --mute --load-state "$(w "$STATE")")
+        --mute --load-state "$(w "$STATE")")
+  # HD="0 1 2 3" (ou all) : ces runners-là chargent le pack de textures HD (work\textures\pack_hd), en
+  # deux mods (Gigapixel AI, puis Waifu Caffe qui gagne sur les doublons), par des jonctions.
+  if [[ " ${HD:-} " == *" $r "* || "${HD:-}" == all ]]; then
+    P="$W/textures/pack_hd/Vanilla(ECT_Optimized)"
+    for m in "hd_gigapixel:Gigapixel AI" "hd_waifu:Waifu Caffe (Denoise & Magnify)"; do
+      id="${m%%:*}"; src="${m#*:}"
+      mkdir -p "$D/userdir/Mods/$id"
+      printf 'name=%s\ngame=GXEE8P\n' "$id" > "$D/userdir/Mods/$id/mod.ini"
+      # (cmd mklink /J : Git Bash change /J en chemin ; PowerShell s'en sort, & et () compris.)
+      powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/$id/textures")' -Target '$(w "$P/$src")' | Out-Null"
+      printf 'mod=%s\n' "$id" >> "$D/userdir/config.ini"
+    done
+  else
+    ARGS+=(--no-mods)
+  fi
   if [[ "$MODE" == "natif" ]]; then
     ARGS+=(--module "$(w "$CHASSIS/gGXEE8P_recomp.dll")"); export MODERNGEKKO_STATICRECOMP=1
   else export MODERNGEKKO_STATICRECOMP=0; fi

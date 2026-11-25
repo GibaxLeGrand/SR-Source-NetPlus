@@ -39,6 +39,16 @@ if [[ "$c" == start ]]; then
   mkdir -p "$AUTO/commands"
   cp -a "$WORK/userdir_modele" "$RUN/userdir" || exit 2
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$RUN/userdir/Config/Dolphin.ini"
+  # COMPLETE=1 : la sauvegarde complète de SR-Source (tout débloqué) sur la carte mémoire A.
+  if [[ "${COMPLETE:-0}" == 1 ]]; then
+    mkdir -p "$RUN/userdir/GC/USA/Card A"
+    cp /d/_SonicRidersSource/SR-Source-NetPlus/docs/complete-save/GXEE8P/8P-GXEE-SONICRIDERS_GAMEDATA_01.gci "$RUN/userdir/GC/USA/Card A/"
+  fi
+  # SAVE=<fichier .gci> : cette sauvegarde-là sur la carte mémoire A (ex. work\saves\gxee8p_100pc_gibax.gci).
+  if [[ -n "${SAVE:-}" ]]; then
+    mkdir -p "$RUN/userdir/GC/USA/Card A"
+    cp "$SAVE" "$RUN/userdir/GC/USA/Card A/8P-GXEE-SONICRIDERS_GAMEDATA_01.gci"
+  fi
   # PORTS=<n> : des manettes standard (SIDevice = 6) sur les ports 1 à n-1 aussi.
   for p in $(seq 1 $(( ${PORTS:-1} - 1 ))); do
     sed -i "s/^\[Core\]\$/[Core]\nSIDevice$p = 6/" "$RUN/userdir/Config/Dolphin.ini"

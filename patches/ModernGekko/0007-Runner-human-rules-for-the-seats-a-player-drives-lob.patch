@@ -1,0 +1,131 @@
+From 23aa7571511a1ca5b5f30ae02ce7bbd9020dee6b Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:16:10 +0100
+Subject: [PATCH] Runner: human rules for the seats a player drives; lobby
+ gears checked
+
+- +0xBD (the CPU flag, read by 71 functions: AI, physics, items, the
+  "COM"/"nP" label) is 0 while a seat drives its racer (a player's rules
+  and label) and 1 when the AI takes it; SRNP_REGLES=cpu keeps the CPUs'
+  rules for every seat.
+- A lobby gear the character may not ride hung the loading (character 7
+  or 10 on gear 0): the gear table (0x805E5F40, 41 records of 0x1D0
+  bytes, +0x0 the characters that may ride it) is checked at set-up, and
+  the first gear the character may ride replaces a wrong one.
+
+Measured on one PC (8 native runners, a whole race, 100% save, base
+characters, human rules, the HD texture pack on 4 runners out of 8):
+173 checksums equal, 8 finishers. With newly unlocked characters
+(NiGHTS, AiAi...), the racer a camera follows gets other fields that
+differ (animation, model tables at +0xB70, +0x8D4): 104 to 107
+divergences with either rules, to be understood (Q1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 41 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 8740c92..a3c23cd 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -7,6 +7,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string_view>
+ #include <utility>
+ 
+ #include "Core/HW/Memmap.h"
+@@ -29,7 +30,8 @@ constexpr std::uint32_t kCameraRacer = 0x80601F71;  // racer followed by viewpor
+ constexpr std::uint32_t kCameraRacer1 = 0x806021CD;  // viewport 1's (viewports 0x25C apart)
+ constexpr std::uint32_t kPlayerCount = 0x8021B8C8;  // players (viewports)
+ constexpr std::uint32_t kPadStatusNow = 0x8021BB44;  // -> this frame's PADStatus[4] (12 bytes each)
+-constexpr std::uint32_t kControl = 0xBC;           // racer byte: 0 human, 1 CPU
++constexpr std::uint32_t kControl = 0xBC;           // racer byte: 0 human, 1 CPU (who writes its controls)
++constexpr std::uint32_t kCpuFlag = 0xBD;  // racer byte: 1 CPU, read by 71 functions (AI, physics, items, label)
+ 
+ std::uint8_t* Guest(std::uint32_t address, std::uint32_t size)
+ {
+@@ -244,6 +246,16 @@ std::uint32_t s_last_count = 0;
+ bool s_setting_up = false;
+ std::uint64_t s_race_start = 0;
+ 
++// The gear table (REL data, 41 records of 0x1D0 bytes): +0x0, the characters that may ride it.
++constexpr std::uint32_t kGearTable = 0x805E5F40;
++constexpr int kGears = 41;
++bool GearAllows(int gear, int character)
++{
++  if (gear < 0 || gear >= kGears)
++    return false;
++  return (Read32(kGearTable + static_cast<std::uint32_t>(gear) * 0x1D0u) >> character) & 1u;
++}
++
+ // SRNP_NB_RACERS=<n>: the number of racers the race is set up with (the menu only makes 8, or 4
+ // with 3 or more players).
+ int NbRacers()
+@@ -275,6 +287,7 @@ void SetUpRace(std::uint8_t* racers)
+   if (NbRacers())
+     if (std::uint8_t* p = Guest(kRacerCount, 4))
+       Put32(p, static_cast<std::uint32_t>(NbRacers()));
++  static bool told[8] = {};
+   for (std::size_t k = 0; k < 8; ++k)
+   {
+     std::uint8_t* racer = racers + k * kRacerSize;
+@@ -283,6 +296,22 @@ void SetUpRace(std::uint8_t* racers)
+       racer[0xBA] = racer[0xBF] = static_cast<std::uint8_t>(c.character);
+     if (c.gear >= 0)
+       racer[0xBB] = static_cast<std::uint8_t>(c.gear);
++    // A gear the character may not ride hangs the loading (2026-11-25: character 7 or 10 on gear
++    // 0): the gear table says who may ride each gear; else the first gear the character may ride.
++    const int character = racer[0xBA], gear = racer[0xBB];
++    if (character < 32 && !GearAllows(gear, character))
++    {
++      int fallback = -1;
++      for (int g = 0; g < kGears && fallback < 0; ++g)
++        if (GearAllows(g, character))
++          fallback = g;
++      if (!told[k])
++        std::fprintf(stderr, "[srnp racers] racer %zu: character %d may not ride gear %d: gear %d\n",
++                     k, character, gear, fallback);
++      told[k] = true;
++      if (fallback >= 0)
++        racer[0xBB] = static_cast<std::uint8_t>(fallback);
++    }
+     racer[kControl] = racer[0xBD] = 1;
+   }
+ }
+@@ -329,7 +358,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     // racer that was human at the start reads data the game did not make, 2026-11-25).
+     for (std::size_t k = 0; k < 8; ++k)
+       if (!s_seats[k].released && s_seats[k].written == 0 && s_seats[k].cpu_at_start)
+-        racers[k * kRacerSize + kControl] = 1;
++        racers[k * kRacerSize + kControl] = racers[k * kRacerSize + kCpuFlag] = 1;
+     s_race = false;
+     PatchHud(0);
+     std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
+@@ -353,6 +382,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+       if (seat.cpu_at_start)
+       {
+         racer[kControl] = 1;
++        racer[kCpuFlag] = 1;  // the AI, with the CPUs' rules
+         seat.released = true;
+         std::fprintf(stderr, "[srnp racers] racer %zu: seat %zu gives it to the AI\n", k, k);
+         continue;
+@@ -365,6 +395,13 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     FillPad(seat_pads + k * kPadSize, FromSeat(pad));
+     Put32(racer, kSeatPads + static_cast<std::uint32_t>(k) * kPadSize);
+     racer[kControl] = 0;
++    // A player: the human rules (speed, items, the "nP" label), not the CPUs'; SRNP_REGLES=cpu keeps
++    // the CPUs' rules for every seat.
++    static const bool cpu_rules = [] {
++      const char* v = std::getenv("SRNP_REGLES");
++      return v && std::string_view(v) == "cpu";
++    }();
++    racer[kCpuFlag] = cpu_rules ? 1 : 0;
+     seat.written = 0;
+   }
+   if (camera_seat >= 0 && camera_seat < 8)
+-- 
+2.34.1.windows.1
+
