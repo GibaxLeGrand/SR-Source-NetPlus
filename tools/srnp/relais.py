@@ -2,8 +2,8 @@
 
 usage: python -I relais.py --sieges N [--port 7845] [--delai-ms 100] [--cadence 60] [--journal relais.log]
 
-Each runner (moderngekko-run with SRNP_RELAY=<host>:<port> SRNP_SEAT=<k> SRNP_SEATS=<N>) sends
-  HELLO <seat> <seats>, then for every frame IN <frame> <seat> <pad> and now and then
+Each runner (moderngekko-run with SRNP_RELAY=<host>:<port> SRNP_SEAT=<k>[,<k2>] SRNP_SEATS=<N>)
+sends HELLO <seat> <seats> for each of its seats (one or two on one connection), then for every frame IN <frame> <seat> <pad> and now and then
   CK <frame> <seat> <hash>.
 The relay closes frame f (sends OF <frame> <pad seat 0> ... <pad seat N-1> to every seat) when every
 seat has sent its input for f, or --delai-ms after the first input for f arrived: a seat that is late
@@ -53,13 +53,15 @@ class Relais:
 
     async def diffuser(self, ligne):
         donnees = (ligne + "\n").encode()
-        for siege, writer in list(self.clients.items()):
+        # Une connexion peut porter deux sièges : un seul envoi par connexion.
+        for writer in {id(w): w for w in self.clients.values()}.values():
             try:
                 writer.write(donnees)
                 await writer.drain()
             except (ConnectionError, OSError):
-                self.log(f"siège {siege} : perdu à l'envoi")
-                self.clients.pop(siege, None)
+                for siege in [s for s, w in self.clients.items() if w is writer]:
+                    self.log(f"siège {siege} : perdu à l'envoi")
+                    self.clients.pop(siege, None)
 
     async def fermer_pretes(self):
         """Ferme, dans l'ordre, les frames complètes ou dont le délai est passé. Rien avant que tous
@@ -124,6 +126,7 @@ class Relais:
 
     async def client(self, reader, writer):
         siege = None
+        sieges = []                   # les sièges de cette connexion (un ou deux)
         try:
             while True:
                 ligne = await reader.readline()
@@ -134,6 +137,7 @@ class Relais:
                     continue
                 if mots[0] == "HELLO":
                     siege = int(mots[1])
+                    sieges.append(siege)
                     if len(mots) > 3:
                         self.delai_entree = max(self.delai_entree, int(mots[3]))
                     self.clients[siege] = writer
@@ -158,8 +162,9 @@ class Relais:
         except (ConnectionError, OSError, ValueError, IndexError) as e:
             self.log(f"siège {siege} : erreur {e!r}")
         finally:
-            self.clients.pop(siege, None)
-            self.log(f"siège {siege} parti ; {self.fermees} frames fermées, {self.en_retard} entrées en retard "
+            for s in sieges:
+                self.clients.pop(s, None)
+            self.log(f"siège(s) {sieges} parti(s) ; {self.fermees} frames fermées, {self.en_retard} entrées en retard "
                      f"(par siège : {self.retard_siege}), "
                      f"sommes de contrôle : {self.ck_ok} identiques, {self.ck_ko} divergences")
 

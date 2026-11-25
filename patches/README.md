@@ -20,6 +20,14 @@ git -C <piconet's dolrecomp checkout> am <this repo>/patches/DolRecomp-piconet/*
 ## What they do
 
 **ModernGekko**
+- (phase 2 prototype, branch `srnp/phase2`) with `SRNP_RACERS=1`, seat k drives Sonic Riders' racer k
+  instead of pad k: the runner fills a controller structure per seat the way the game does (main.dol
+  0x80006778; `SRNP_PADCHECK=1` compares them), points the racer to it and makes it human (+0xBC = 0);
+  a seat can give its racer to the AI; viewport 0's camera follows the local seat. Several seats per
+  runner (`SRNP_SEAT=3,4`), racing test inputs (`SRNP_INPUT=course:<seed>`), a checksum of the 8
+  racers without the fields that follow the camera, `SRNP_CKDUMP=<dir>`. On one PC: 8 native runners,
+  one seat each, a whole race (Metal City, 1 lap, from a race set up with 8 CPUs), 143 checksums
+  equal, the same results on all 8.
 - (phase 1 prototype, branch `srnp/phase1-relais`) a relay client in the runner: with
   `SRNP_RELAY=<host>:<port> SRNP_SEAT=<k> SRNP_SEATS=<n>`, after every present it sends its input for
   the frame `SRNP_DELAY` (2) frames ahead to `tools/srnp/relais.py`, waits for the next frame's official

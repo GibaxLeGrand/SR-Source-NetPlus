@@ -1,0 +1,616 @@
+From 27699e25b887dd7e7fbc2c53c990a8b4e4e71086 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:40:07 +0100
+Subject: [PATCH] Runner: seats drive Sonic Riders' 8 racers (phase 2
+ prototype)
+
+With SRNP_RACERS=1, seat k of the relay drives racer k of Sonic Riders
+(GXEE8P). Each racer's control byte (+0xBC: 0 human, 1 CPU) picks the
+function that writes its controls; the human one reads the controller
+structure the racer points to. The runner fills one structure per seat
+the way the game fills its own (main.dol 0x80006778, rumble left out;
+SRNP_PADCHECK=1 compares both, 0 differences over 1200 frames), in low
+memory the game leaves at zero, points the racer to it and makes it
+human. A seat can give its racer back to the AI for the rest of the race
+(the game's CPUs only: the AI of a racer that was human when the race
+was set up crashes the game). When the game makes a racer CPU itself
+(finish line), the runner leaves it. Viewport 0's camera follows the
+local seat's racer.
+
+The relay client takes several local seats (SRNP_SEAT=3,4), racing test
+inputs (SRNP_INPUT=course:<seed>), a checksum of the 8 racers without the
+fields that follow the camera, and SRNP_CKDUMP to dump the racers at
+each checksum.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt              |   1 +
+ src/runtime/srnp_racers.cpp | 312 ++++++++++++++++++++++++++++++++++++
+ src/runtime/srnp_racers.hpp |  35 ++++
+ src/runtime/srnp_relay.cpp  | 126 ++++++++++++---
+ 4 files changed, 450 insertions(+), 24 deletions(-)
+ create mode 100644 src/runtime/srnp_racers.cpp
+ create mode 100644 src/runtime/srnp_racers.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 51a3f90..d75c43a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -436,6 +436,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/mod_sounds.cpp
+         src/runtime/mod_hud.cpp
+         src/runtime/srnp_relay.cpp
++        src/runtime/srnp_racers.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+new file mode 100644
+index 0000000..76a5673
+--- /dev/null
++++ b/src/runtime/srnp_racers.cpp
+@@ -0,0 +1,312 @@
++// SR-Source Net Plus, phase 2 prototype: Sonic Riders' 8 racers driven by the relay's seats.
++// See srnp_racers.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "srnp_racers.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <utility>
++
++#include "Core/HW/Memmap.h"
++#include "Core/System.h"
++
++namespace srnp
++{
++namespace
++{
++// GXEE8P, _Main.rel loaded at 0x803FBD00 (read in the game's code on 2026-11-25).
++constexpr std::uint32_t kRacers = 0x80609440;  // 8 racers of 0x1080 bytes
++constexpr std::uint32_t kRacerSize = 0x1080;
++constexpr std::uint32_t kGamePads = 0x801AF9F0;  // the game's controller structures (ports 0-3 filled)
++constexpr std::uint32_t kSeatPads = 0x80002C00;  // ours: low memory that stays at zero in races
++constexpr std::uint32_t kPadSize = 0x30;
++constexpr std::uint32_t kRacerCount = 0x8021B8C0;  // racers in the race (CPUs + humans)
++constexpr std::uint32_t kRacePhase = 0x801DFC80;   // 0x10 before the start, 0xE racing (and on results)
++constexpr std::uint32_t kCameraRacer = 0x80601F71;  // racer followed by viewport 0's camera
++constexpr std::uint32_t kPadStatusNow = 0x8021BB44;  // -> this frame's PADStatus[4] (12 bytes each)
++constexpr std::uint32_t kControl = 0xBC;           // racer byte: 0 human, 1 CPU
++
++std::uint8_t* Guest(std::uint32_t address, std::uint32_t size)
++{
++  return Core::System::GetInstance().GetMemory().GetPointerForRange(address, size);
++}
++std::uint32_t Get32(const std::uint8_t* p)
++{
++  return (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) | (std::uint32_t{p[2]} << 8) | p[3];
++}
++void Put32(std::uint8_t* p, std::uint32_t v)
++{
++  p[0] = static_cast<std::uint8_t>(v >> 24);
++  p[1] = static_cast<std::uint8_t>(v >> 16);
++  p[2] = static_cast<std::uint8_t>(v >> 8);
++  p[3] = static_cast<std::uint8_t>(v);
++}
++std::uint32_t Read32(std::uint32_t address)
++{
++  const std::uint8_t* p = Guest(address, 4);
++  return p ? Get32(p) : 0;
++}
++
++// A PADStatus after PADClamp: buttons (PAD_BUTTON_*), stick, substick, triggers.
++struct PadStatus
++{
++  std::uint16_t buttons = 0;
++  std::int8_t x = 0, y = 0, cx = 0, cy = 0;
++  std::uint8_t l = 0, r = 0;
++};
++
++// The game's conversion: single-precision product, truncated (fctiwz), low byte stored.
++std::uint8_t Scale(int v, float k)
++{
++  return static_cast<std::uint8_t>(static_cast<std::int32_t>(static_cast<float>(v) * k));
++}
++
++// One port of the game's controller update (main.dol 0x80006778), rumble left out, on a 0x30-byte
++// structure in the game's byte order.
++void FillPad(std::uint8_t* s, const PadStatus& in)
++{
++  const std::uint32_t old = Get32(s + 0x08);
++  const std::uint32_t b = in.buttons;
++  std::uint32_t held = ((b >> 8) & 0xF)                         // A B X Y -> 1 2 4 8
++                       | ((b << 1) & 0x10) | ((b << 3) & 0x20)  // up, down
++                       | ((b << 6) & 0x40) | ((b << 6) & 0x80)  // left, right
++                       | ((b >> 4) & 0x100)                     // start
++                       | ((b << 3) & 0x200) | ((b << 5) & 0x400) | ((b << 7) & 0x800);  // L R Z
++  s[0x18] = Scale(in.x, 1.38888883590698242f);
++  s[0x19] = Scale(in.y, 1.38888883590698242f);
++  s[0x1C] = Scale(in.cx, 1.69491529464721680f);
++  s[0x1D] = Scale(in.cy, 1.69491529464721680f);
++  s[0x1A] = Scale(in.l, 0.666666686534881592f);
++  s[0x1B] = Scale(in.r, 0.666666686534881592f);
++  const int sx = static_cast<std::int8_t>(s[0x18]);
++  const int sy = static_cast<std::int8_t>(s[0x19]);
++  held |= (sy > 10 ? 0x1000u : 0u) | (sy < -10 ? 0x2000u : 0u) | (sx < -10 ? 0x4000u : 0u) |
++          (sx > 10 ? 0x8000u : 0u);
++  std::uint32_t rep = Get32(s + 0x00), rep2 = Get32(s + 0x04), repeat = 0;
++  if (held == old)
++  {
++    if (++rep > 20)
++    {
++      if (++rep2 > 3)
++      {
++        rep2 = 0;
++        repeat = held;
++      }
++    }
++    else if (rep == 1)
++      repeat = held;
++  }
++  else
++    rep = rep2 = 0;
++  std::uint32_t idle = Get32(s + 0x24);
++  if (held == 0)
++  {
++    if (++idle >= 300)
++    {
++      s[0x20] = s[0x21] = s[0x22] = s[0x23] = 0;
++    }
++  }
++  else
++    idle = 0;
++  Put32(s + 0x00, rep);
++  Put32(s + 0x04, rep2);
++  Put32(s + 0x08, held);
++  Put32(s + 0x0C, held & (old ^ held));
++  Put32(s + 0x10, old & (old ^ held));
++  Put32(s + 0x14, repeat);
++  Put32(s + 0x24, idle);
++  s[0x28] = 1;
++}
++
++PadStatus FromSeat(const Pad& p)
++{
++  const unsigned bits = (static_cast<unsigned>(p[0]) << 8) | p[1];
++  // A B X Y Z Start Up Down Left Right L R -> PAD_BUTTON_*
++  static constexpr std::uint16_t kPad[] = {0x0100, 0x0200, 0x0400, 0x0800, 0x0010, 0x1000,
++                                           0x0008, 0x0004, 0x0001, 0x0002, 0x0040, 0x0020};
++  PadStatus s;
++  for (unsigned i = 0; i < 12; ++i)
++    if ((bits >> i) & 1)
++      s.buttons |= kPad[i];
++  s.x = static_cast<std::int8_t>(p[2]);
++  s.y = static_cast<std::int8_t>(p[3]);
++  s.cx = static_cast<std::int8_t>(p[4]);
++  s.cy = static_cast<std::int8_t>(p[5]);
++  s.l = p[6];
++  s.r = p[7];
++  return s;
++}
++
++struct SeatState
++{
++  int written = -1;       // last value we wrote to the racer's control byte
++  bool released = false;  // the AI has the racer until the end of the race
++  bool cpu_at_start = false;  // a CPU when the game set the race up: the AI can take it back
++  bool neutral = false;   // asked for the AI but cannot have it (human at the start): neutral pad
++};
++std::array<SeatState, 8> s_seats;
++bool s_race = false;
++std::uint64_t s_frames = 0;
++}  // namespace
++
++void DriveRacers(const std::vector<Pad>& pads, int camera_seat)
++{
++  ++s_frames;
++  std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
++  std::uint8_t* seat_pads = Guest(kSeatPads, 8 * kPadSize);
++  if (!racers || !seat_pads)
++    return;
++  const std::uint32_t phase = Read32(kRacePhase);
++  const bool racing = Read32(kRacerCount) == 8 && (phase == 0x10 || phase == 0xE);
++  if (racing && !s_race && Get32(racers) == kGamePads)
++  {
++    // A race the game has set up (racer 0 points to port 0's structure), not taken yet.
++    s_race = true;
++    s_seats = {};
++    for (std::size_t k = 0; k < 8; ++k)
++      s_seats[k].cpu_at_start = racers[k * kRacerSize + kControl] == 1;
++    std::memset(seat_pads, 0, 8 * kPadSize);
++    std::fprintf(stderr, "[srnp racers] race (phase 0x%X): %zu seats drive racers 0-%zu\n", phase,
++                 pads.size(), pads.size() - 1);
++  }
++  if (!s_race)
++    return;
++  if (!racing)
++  {
++    // Race over: the AI finishes for the seats still driven (the game's CPUs only: the AI of a
++    // racer that was human at the start reads data the game did not make, 2026-11-25).
++    for (std::size_t k = 0; k < 8; ++k)
++      if (!s_seats[k].released && s_seats[k].written == 0 && s_seats[k].cpu_at_start)
++        racers[k * kRacerSize + kControl] = 1;
++    s_race = false;
++    std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
++    return;
++  }
++  for (std::size_t k = 0; k < pads.size() && k < 8; ++k)
++  {
++    std::uint8_t* racer = racers + k * kRacerSize;
++    SeatState& seat = s_seats[k];
++    if (seat.released)
++      continue;
++    if (seat.written >= 0 && racer[kControl] != seat.written)
++    {
++      seat.released = true;  // the game took the racer (finish line)
++      std::fprintf(stderr, "[srnp racers] racer %zu: made CPU by the game (finish?)\n", k);
++      continue;
++    }
++    Pad pad = pads[k];
++    if (((pad[0] << 8) | pad[1]) & kSeatAI)
++    {
++      if (seat.cpu_at_start)
++      {
++        racer[kControl] = 1;
++        seat.released = true;
++        std::fprintf(stderr, "[srnp racers] racer %zu: seat %zu gives it to the AI\n", k, k);
++        continue;
++      }
++      if (!seat.neutral)
++        std::fprintf(stderr, "[srnp racers] racer %zu: human at the start, no AI for it: neutral\n", k);
++      seat.neutral = true;
++      pad = {};
++    }
++    FillPad(seat_pads + k * kPadSize, FromSeat(pad));
++    Put32(racer, kSeatPads + static_cast<std::uint32_t>(k) * kPadSize);
++    racer[kControl] = 0;
++    seat.written = 0;
++  }
++  if (camera_seat >= 0 && camera_seat < 8)
++    if (std::uint8_t* camera = Guest(kCameraRacer, 1))
++      *camera = static_cast<std::uint8_t>(camera_seat);
++}
++
++std::uint64_t RacersHash()
++{
++  const std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
++  if (!racers)
++    return 0;
++  // Fields that differ when the camera follows another racer (same positions and speeds over a
++  // whole race, 2026-11-25; 0xDC4-0xE74: two 0x58-byte records of the followed racer, colours,
++  // vectors and positions, likely a light or a shadow): left out of the checksum.
++  static constexpr std::pair<std::uint32_t, std::uint32_t> kCameraFields[] = {
++      {0x370, 0x394},   {0x8C0, 0x8C4},   {0xDC4, 0xE74},  {0xFD8, 0xFDC},
++      {0x1000, 0x1004}, {0x102C, 0x102D}, {0x1036, 0x1037}, {0x105C, 0x1060}};
++  std::uint64_t hash = 0xCBF29CE484222325ull;
++  for (std::uint32_t k = 0; k < 8; ++k)
++  {
++    for (std::uint32_t i = 0; i < kRacerSize; ++i)
++    {
++      bool skip = false;
++      for (const auto& [a, b] : kCameraFields)
++        skip = skip || (i >= a && i < b);
++      hash ^= skip ? 0 : racers[k * kRacerSize + i];
++      hash *= 0x100000001B3ull;
++    }
++  }
++  return hash;
++}
++
++void PadCheckOnFrame(std::uint64_t frame)
++{
++  static const bool on = [] {
++    const char* v = std::getenv("SRNP_PADCHECK");
++    return v && *v && *v != '0';
++  }();
++  if (!on)
++    return;
++  static std::uint8_t shadow[kPadSize];
++  static bool started = false;
++  static std::uint32_t last_status = 0;
++  static std::uint64_t checked = 0, wrong = 0, skipped = 0;
++  const std::uint8_t* game = Guest(kGamePads, kPadSize);
++  const std::uint32_t status_at = Read32(kPadStatusNow);
++  const std::uint8_t* status = status_at ? Guest(status_at, 12) : nullptr;
++  if (!game || !status)
++    return;
++  if (status_at == last_status)
++  {
++    ++skipped;  // the game did not read the pads since the last present
++    return;
++  }
++  last_status = status_at;
++  if (!started || status[10] != 0)
++  {
++    std::memcpy(shadow, game, kPadSize);  // start (or a pad error): copy the game's
++    started = true;
++    return;
++  }
++  PadStatus in;
++  in.buttons = static_cast<std::uint16_t>((status[0] << 8) | status[1]);
++  in.x = static_cast<std::int8_t>(status[2]);
++  in.y = static_cast<std::int8_t>(status[3]);
++  in.cx = static_cast<std::int8_t>(status[4]);
++  in.cy = static_cast<std::int8_t>(status[5]);
++  in.l = status[6];
++  in.r = status[7];
++  FillPad(shadow, in);
++  ++checked;
++  bool same = std::memcmp(shadow, game, 0x1E) == 0 && std::memcmp(shadow + 0x24, game + 0x24, 5) == 0;
++  if (!same)
++  {
++    if (++wrong <= 5)
++    {
++      std::fprintf(stderr, "[srnp padcheck] frame %llu differs; status %02x%02x %d %d %d %d %u %u\n",
++                   static_cast<unsigned long long>(frame), status[0], status[1], in.x, in.y, in.cx,
++                   in.cy, in.l, in.r);
++      for (int part = 0; part < 2; ++part)
++      {
++        const std::uint8_t* p = part ? game : shadow;
++        std::fprintf(stderr, "[srnp padcheck]   %s:", part ? "game" : "ours");
++        for (std::uint32_t i = 0; i < 0x2C; i += 4)
++          std::fprintf(stderr, " %08x", Get32(p + i));
++        std::fprintf(stderr, "\n");
++      }
++    }
++    std::memcpy(shadow, game, kPadSize);
++  }
++  if (checked % 600 == 0)
++    std::fprintf(stderr, "[srnp padcheck] %llu frames compared, %llu different, %llu skipped\n",
++                 static_cast<unsigned long long>(checked), static_cast<unsigned long long>(wrong),
++                 static_cast<unsigned long long>(skipped));
++}
++}  // namespace srnp
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+new file mode 100644
+index 0000000..9d0a9bc
+--- /dev/null
++++ b/src/runtime/srnp_racers.hpp
+@@ -0,0 +1,35 @@
++// SR-Source Net Plus, phase 2 prototype: Sonic Riders' 8 racers driven by the relay's seats.
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// Sonic Riders (GXEE8P) gives each racer a control byte (+0xBC: 0 human, 1 CPU) that picks the
++// function writing its controls each frame: the human one reads the controller structure the racer
++// points to (+0x0), the CPU one is the AI. Both write the same fields of the racer (+0xA28 actions,
++// +0xA38 stick, +0xA3A trigger). With SRNP_RACERS=1, seat k drives racer k: the runner fills a
++// controller structure for each seat, the way the game fills its own from a pad (main.dol
++// 0x80006778, without the rumble), in memory the game leaves alone, points racer k to it and makes
++// it human. A seat whose input carries kSeatAI gives its racer back to the AI for the rest of the
++// race, as for a player who left. When the game makes a racer CPU itself (at the finish line), the
++// runner leaves it alone. Viewport 0's camera follows the local seat's racer.
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <vector>
++
++namespace srnp
++{
++// A seat's input: buttons (bit 0..11: A B X Y Z Start Up Down Left Right L R; kSeatAI), main stick
++// X, Y and C-stick X, Y (signed, as PADClamp leaves them: about -72..72 and -59..59), L, R.
++using Pad = std::array<std::uint8_t, 8>;
++constexpr std::uint16_t kSeatAI = 0x8000;
++
++// On the emulation thread, after a present, with the official inputs of the next frame.
++void DriveRacers(const std::vector<Pad>& pads, int camera_seat);
++
++// FNV-1a 64 of the 8 racers, without the fields that follow the camera (measured on 2026-11-25).
++std::uint64_t RacersHash();
++
++// SRNP_PADCHECK=1: after each present, fills a copy of port 0's controller structure from the
++// PADStatus the game used and compares it with the game's (counts in the runner's log).
++void PadCheckOnFrame(std::uint64_t frame);
++}  // namespace srnp
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 6cb1931..3467cbc 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -21,6 +21,7 @@
+ #endif
+ 
+ #include "srnp_relay.hpp"
++#include "srnp_racers.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -51,15 +52,15 @@ constexpr Socket kNoSocket = -1;
+ void CloseSocket(Socket s) { close(s); }
+ #endif
+ 
+-using Pad = std::array<std::uint8_t, 8>;
+-
+ struct Relay
+ {
+   bool tried = false;
+   bool on = false;
+   Socket socket = kNoSocket;
+-  int seat = 0;
++  std::vector<int> local;  // SRNP_SEAT: this runner's seats ("3" or "3,4")
+   int seats = 1;
++  bool racers = false;     // SRNP_RACERS=1 (phase 2): seat k drives racer k, not pad k
++  int camera = -1;         // SRNP_CAMERA: the racer viewport 0 follows (default: first local seat)
+   int check_every = 60;
+   int delay = 2;  // SRNP_DELAY: frames between a local input and the frame it is for
+   std::string input_mode = "neutral";
+@@ -142,16 +143,41 @@ bool ParsePad(const std::string& text, Pad* pad)
+ }
+ 
+ // Test inputs (no real pad yet): neutral, or a deterministic sequence per seat and frame.
+-Pad LocalInput(std::uint64_t frame)
++std::uint64_t Mix(std::uint64_t x)
++{
++  x ^= x >> 31;
++  x *= 0xD6E8FEB86659FD39ull;
++  x ^= x >> 29;
++  return x;
++}
++
++Pad LocalInput(std::uint64_t frame, int seat)
+ {
+   Pad pad{};
++  if (s_relay.input_mode == "course")
++  {
++    // Racing test input: forward with a steer that changes every 20 frames, A now and then; seat k
++    // drives for 600 + 300 k frames from the first input, then gives its racer to the AI for good.
++    static const std::uint64_t first = frame;
++    if (frame - first >= 600u + 300u * static_cast<std::uint64_t>(seat))
++    {
++      pad[0] = static_cast<std::uint8_t>(kSeatAI >> 8);
++      return pad;
++    }
++    const std::uint64_t x = Mix(s_relay.seed * 0x9E3779B97F4A7C15ull ^
++                                (frame / 20) * 0xBF58476D1CE4E5B9ull ^
++                                static_cast<std::uint64_t>(seat) * 0x94D049BB133111EBull);
++    pad[2] = static_cast<std::uint8_t>(static_cast<std::int8_t>(static_cast<int>(x % 81) - 40));
++    pad[3] = 72;
++    if ((x >> 8) % 16 == 0)
++      pad[1] |= 1;
++    return pad;
++  }
+   if (s_relay.input_mode == "random")
+   {
+-    std::uint64_t x = s_relay.seed * 0x9E3779B97F4A7C15ull ^ (frame / 15) * 0xBF58476D1CE4E5B9ull ^
+-                      static_cast<std::uint64_t>(s_relay.seat) * 0x94D049BB133111EBull;
+-    x ^= x >> 31;
+-    x *= 0xD6E8FEB86659FD39ull;
+-    x ^= x >> 29;
++    const std::uint64_t x =
++        Mix(s_relay.seed * 0x9E3779B97F4A7C15ull ^ (frame / 15) * 0xBF58476D1CE4E5B9ull ^
++            static_cast<std::uint64_t>(seat) * 0x94D049BB133111EBull);
+     const std::uint16_t buttons = static_cast<std::uint16_t>(x & 0x0E1F);  // no Start, no D-pad
+     pad[0] = static_cast<std::uint8_t>(buttons >> 8);
+     pad[1] = static_cast<std::uint8_t>(buttons);
+@@ -210,9 +236,26 @@ bool Connect()
+   if (!address || !*address)
+     return false;
+   if (const char* v = std::getenv("SRNP_SEAT"))
+-    s_relay.seat = std::atoi(v);
++  {
++    for (const char* p = v; *p;)
++    {
++      char* end = nullptr;
++      const long seat = std::strtol(p, &end, 10);
++      if (end == p)
++        break;
++      s_relay.local.push_back(static_cast<int>(seat));
++      p = *end == ',' ? end + 1 : end;
++    }
++  }
++  if (s_relay.local.empty())
++    s_relay.local.push_back(0);
+   if (const char* v = std::getenv("SRNP_SEATS"))
+     s_relay.seats = std::max(1, std::atoi(v));
++  if (const char* v = std::getenv("SRNP_RACERS"))
++    s_relay.racers = *v && *v != '0';
++  s_relay.camera = s_relay.local.front();
++  if (const char* v = std::getenv("SRNP_CAMERA"))
++    s_relay.camera = std::atoi(v);
+   if (const char* v = std::getenv("SRNP_CHECK"))
+     s_relay.check_every = std::max(0, std::atoi(v));
+   if (const char* v = std::getenv("SRNP_DELAY"))
+@@ -282,22 +325,34 @@ bool Connect()
+   int one = 1;
+   setsockopt(s_relay.socket, IPPROTO_TCP, 1 /* TCP_NODELAY */, reinterpret_cast<const char*>(&one),
+              sizeof(one));
+-  return SendLine("HELLO " + std::to_string(s_relay.seat) + " " + std::to_string(s_relay.seats) +
+-                  " " + std::to_string(s_relay.delay));
++  for (const int seat : s_relay.local)
++    if (!SendLine("HELLO " + std::to_string(seat) + " " + std::to_string(s_relay.seats) + " " +
++                  std::to_string(s_relay.delay)))
++      return false;
++  return true;
+ }
+ }  // namespace
+ 
+ void RelayOnFrame(std::uint64_t frame)
+ {
++  PadCheckOnFrame(frame);
+   if (!s_relay.tried)
+   {
+     s_relay.tried = true;
+     s_relay.on = Connect();
+     if (s_relay.on)
++    {
++      std::string seats;
++      for (const int seat : s_relay.local)
++        seats += (seats.empty() ? "" : ",") + std::to_string(seat);
++      const std::string racers =
++          s_relay.racers ? ", racers mode, camera on racer " + std::to_string(s_relay.camera) : "";
+       std::fprintf(stderr,
+-                   "[srnp relay] seat %d of %d, input %s, delay %d frames, checksum every %d frames\n",
+-                   s_relay.seat, s_relay.seats, s_relay.input_mode.c_str(), s_relay.delay,
+-                   s_relay.check_every);
++                   "[srnp relay] seat(s) %s of %d, input %s, delay %d frames, checksum every %d "
++                   "frames%s\n",
++                   seats.c_str(), s_relay.seats, s_relay.input_mode.c_str(), s_relay.delay,
++                   s_relay.check_every, racers.c_str());
++    }
+     else if (std::getenv("SRNP_RELAY"))
+       Off("cannot reach the relay");
+   }
+@@ -307,19 +362,39 @@ void RelayOnFrame(std::uint64_t frame)
+   if (s_relay.check_every > 0 && frame % static_cast<std::uint64_t>(s_relay.check_every) == 0)
+   {
+     char hash[17];
+-    std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(StateHash()));
+-    if (!SendLine("CK " + std::to_string(frame) + " " + std::to_string(s_relay.seat) + " " + hash))
+-      return Off("send failed");
++    std::snprintf(hash, sizeof(hash), "%016llx",
++                  static_cast<unsigned long long>(s_relay.racers ? RacersHash() : StateHash()));
++    for (const int seat : s_relay.local)
++      if (!SendLine("CK " + std::to_string(frame) + " " + std::to_string(seat) + " " + hash))
++        return Off("send failed");
++    // SRNP_CKDUMP=<dir>: the 8 racers at each checksum, to see what differs (racers mode).
++    static const char* dump_dir = std::getenv("SRNP_CKDUMP");
++    if (dump_dir && *dump_dir && s_relay.racers)
++    {
++      auto& memory = Core::System::GetInstance().GetMemory();
++      if (const std::uint8_t* racers = memory.GetPointerForRange(0x80609440u, 8 * 0x1080u))
++      {
++        const std::string path = std::string(dump_dir) + "/racers_" + std::to_string(frame) + ".bin";
++        if (std::FILE* f = std::fopen(path.c_str(), "wb"))
++        {
++          std::fwrite(racers, 1, 8 * 0x1080u, f);
++          std::fclose(f);
++        }
++      }
++    }
+   }
+ 
+   // The input of the frame SRNP_DELAY frames after the next (so that it reaches the relay before
+   // that frame is due), then the next frame's official inputs before it runs.
+   const std::uint64_t next = frame + 1;
+   const std::uint64_t ahead = next + static_cast<std::uint64_t>(s_relay.delay);
+-  const Pad local = LocalInput(ahead);
+-  if (!SendLine("IN " + std::to_string(ahead) + " " + std::to_string(s_relay.seat) + " " +
+-                Hex(local.data(), local.size())))
+-    return Off("send failed");
++  for (const int seat : s_relay.local)
++  {
++    const Pad local = LocalInput(ahead, seat);
++    if (!SendLine("IN " + std::to_string(ahead) + " " + std::to_string(seat) + " " +
++                  Hex(local.data(), local.size())))
++      return Off("send failed");
++  }
+   static const bool trace = std::getenv("SRNP_TRACE") != nullptr;
+   static int traced = 0;
+   if (trace && traced < 40)
+@@ -363,8 +438,11 @@ void RelayOnFrame(std::uint64_t frame)
+   s_relay.wait_max_ms = std::max(s_relay.wait_max_ms, waited);
+ 
+   const std::vector<Pad>& pads = s_relay.official[next];
+-  for (std::size_t port = 0; port < pads.size() && port < 4; ++port)
+-    ApplyPad(static_cast<int>(port), pads[port]);
++  if (s_relay.racers)
++    DriveRacers(pads, s_relay.camera);
++  else
++    for (std::size_t port = 0; port < pads.size() && port < 4; ++port)
++      ApplyPad(static_cast<int>(port), pads[port]);
+   s_relay.official.erase(s_relay.official.begin(), s_relay.official.upper_bound(next));
+ 
+   if (++s_relay.frames % 600 == 0)
+-- 
+2.34.1.windows.1
+
