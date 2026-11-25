@@ -1,0 +1,2872 @@
+From 2533249ff0babf73f61af1aab17db763ba79535c Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 23:44:16 +0100
+Subject: [PATCH] Launcher: Online/LAN play, a room with HOST and CONNECT (up
+ to 8 players)
+
+On the PLAY page, ONLINE / LAN beside PLAY: HOST or CONNECT, the player's tag, the host's address or
+the TCP port, the start state (a savestate made on Player Entry, the same file for everyone), "delay
+based" (rollback greyed out, later). The room fills the launcher: P1 to P8 with their state (host,
+ready, other start state, racing), the host's addresses to share, and the race the host sets (course,
+laps, racers from the players to 8 with the AI driving the others, input delay); READY, START THE
+RACE, LEAVE.
+
+The relay runs in the host's launcher (launcher_online.cpp): the room's lines (JOIN, LREADY, LRULES,
+LSTART, LGONE; WELCOME, MEMBERS, MATCH, ROOM), then the lockstep of tools/srnp/relais.py ported as
+it is, on the same TCP port; the race's rules are the room's (a game's own RULES are left aside).
+At START every launcher starts its game in the lobby through the game's menus (SRNP_LOBBY=2) with
+its seat, from a user folder of its own (<user>/Online: the player's settings, their pad on port 4
+for the relay, port 1 a keyless keyboard, their file mods turned on and copied there, the labels mod
+srnp_etiquettes turned on when installed: without it the relay's Start did not get past Player
+Entry). When every game has closed, the room is back.
+
+Tests without clicks: SRNP_ONLINE_AUTO, _READY, _START, _RULES, _STATE, _ADDRESS, _TAG, _BACKGROUND;
+SRNP_RUNNER for a launcher built apart from its runner.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |    1 +
+ tools/launcher_online.cpp      | 1679 ++++++++++++++++++++++++++++++++
+ tools/launcher_online.hpp      |  197 ++++
+ tools/launcher_online_ui.hpp   |  529 ++++++++++
+ tools/moderngekko_launcher.cpp |  298 +++++-
+ 5 files changed, 2700 insertions(+), 4 deletions(-)
+ create mode 100644 tools/launcher_online.cpp
+ create mode 100644 tools/launcher_online.hpp
+ create mode 100644 tools/launcher_online_ui.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9bb6bb2..3a51549 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -819,6 +819,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         tools/frontend_config.cpp
+         tools/dol_patch.cpp
+         tools/launcher_music.cpp
++        tools/launcher_online.cpp
+         tools/launcher_preview_video.cpp
+         tools/launcher_process.cpp
+         tools/launcher_update.cpp
+diff --git a/tools/launcher_online.cpp b/tools/launcher_online.cpp
+new file mode 100644
+index 0000000..d897da6
+--- /dev/null
++++ b/tools/launcher_online.cpp
+@@ -0,0 +1,1679 @@
++// SR-Source Net Plus: Online/LAN play from the launcher. See launcher_online.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#include <iphlpapi.h>
++#if defined(_MSC_VER)
++#pragma comment(lib, "ws2_32.lib")
++#pragma comment(lib, "iphlpapi.lib")
++#endif
++#else
++#include <arpa/inet.h>
++#include <cerrno>
++#include <fcntl.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++#include "launcher_online.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <random>
++#include <set>
++#include <sstream>
++#include <thread>
++
++namespace moderngekko::frontend::online
++{
++namespace fs = std::filesystem;
++
++namespace
++{
++#if defined(_WIN32)
++using Socket = SOCKET;
++constexpr Socket NO_SOCKET = INVALID_SOCKET;
++void CloseSocket(Socket s)
++{
++  closesocket(s);
++}
++bool WouldBlock()
++{
++  const int e = WSAGetLastError();
++  return e == WSAEWOULDBLOCK || e == WSAEINPROGRESS || e == WSAEALREADY;
++}
++void SetNonBlocking(Socket s)
++{
++  u_long one = 1;
++  ioctlsocket(s, FIONBIO, &one);
++}
++struct Network
++{
++  Network()
++  {
++    WSADATA data;
++    WSAStartup(MAKEWORD(2, 2), &data);
++  }
++  ~Network() { WSACleanup(); }
++};
++#else
++using Socket = int;
++constexpr Socket NO_SOCKET = -1;
++void CloseSocket(Socket s)
++{
++  close(s);
++}
++bool WouldBlock()
++{
++  return errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS;
++}
++void SetNonBlocking(Socket s)
++{
++  fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
++}
++struct Network
++{
++};
++#endif
++
++void UseNetwork()
++{
++  static Network network;
++}
++
++void NoDelay(Socket s)
++{
++  int one = 1;
++  setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
++}
++
++double Now()
++{
++  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++std::vector<std::string> Words(std::string_view line)
++{
++  std::vector<std::string> words;
++  std::size_t i = 0;
++  while (i < line.size())
++  {
++    while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r'))
++      ++i;
++    std::size_t j = i;
++    while (j < line.size() && line[j] != ' ' && line[j] != '\t' && line[j] != '\r')
++      ++j;
++    if (j > i)
++      words.emplace_back(line.substr(i, j - i));
++    i = j;
++  }
++  return words;
++}
++
++// A whole number, or `fallback` when the word is not one.
++long long Number(const std::vector<std::string>& words, std::size_t index, long long fallback = -1)
++{
++  if (index >= words.size())
++    return fallback;
++  char* end = nullptr;
++  const long long value = std::strtoll(words[index].c_str(), &end, 10);
++  return end && *end == '\0' && end != words[index].c_str() ? value : fallback;
++}
++
++// Sends what it can now; the rest waits in `out` (the loop sends it when the socket can take it).
++// False when the connection is gone.
++bool Flush(Socket s, std::string& out)
++{
++  while (!out.empty())
++  {
++    const int n = send(s, out.data(), static_cast<int>(std::min<std::size_t>(out.size(), 1 << 16)), 0);
++    if (n > 0)
++    {
++      out.erase(0, static_cast<std::size_t>(n));
++      continue;
++    }
++    return n < 0 && WouldBlock();
++  }
++  return true;
++}
++
++// Reads what has come; false when the connection closed.
++bool Receive(Socket s, std::string& in)
++{
++  char buffer[8192];
++  for (;;)
++  {
++    const int n = recv(s, buffer, sizeof(buffer), 0);
++    if (n > 0)
++    {
++      in.append(buffer, static_cast<std::size_t>(n));
++      if (n < static_cast<int>(sizeof(buffer)))
++        return true;
++      continue;
++    }
++    if (n == 0)
++      return false;
++    return WouldBlock();
++  }
++}
++
++std::optional<std::string> TakeLine(std::string& in)
++{
++  const std::size_t end = in.find('\n');
++  if (end == std::string::npos)
++    return std::nullopt;
++  std::string line = in.substr(0, end);
++  in.erase(0, end + 1);
++  if (!line.empty() && line.back() == '\r')
++    line.pop_back();
++  return line;
++}
++
++std::string RandomKey()
++{
++  std::random_device device;
++  std::mt19937_64 random(device() ^ static_cast<std::uint64_t>(Now() * 1e6));
++  char text[17];
++  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(random()));
++  return text;
++}
++}  // namespace
++
++Rules Clamped(Rules rules)
++{
++  rules.course = std::clamp(rules.course, 1, COURSES);
++  rules.laps = std::clamp(rules.laps, 1, MAX_LAPS);
++  rules.racers = std::clamp(rules.racers, 1, MAX_PLAYERS);
++  rules.delay = std::clamp(rules.delay, 0, MAX_DELAY);
++  return rules;
++}
++
++std::string CleanTag(std::string_view text)
++{
++  std::string tag;
++  for (const char c : text)
++  {
++    if (tag.size() >= 8)
++      break;
++    if (c >= 'a' && c <= 'z')
++      tag += static_cast<char>(c - 'a' + 'A');
++    else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
++      tag += c;
++  }
++  return tag;
++}
++
++std::string Fingerprint(const fs::path& file)
++{
++  std::ifstream stream(file, std::ios::binary);
++  if (!stream)
++    return "-";
++  std::uint64_t hash = 0xCBF29CE484222325ull;
++  std::vector<char> buffer(1 << 20);
++  while (stream)
++  {
++    stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
++    const std::streamsize n = stream.gcount();
++    for (std::streamsize i = 0; i < n; ++i)
++    {
++      hash ^= static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
++      hash *= 0x100000001B3ull;
++    }
++  }
++  char text[17];
++  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
++  return text;
++}
++
++std::vector<std::pair<AddressKind, std::string>> ThisComputersAddresses(std::uint16_t port)
++{
++  std::vector<std::pair<AddressKind, std::string>> found;
++  const auto add = [&](std::string_view interface_name, const std::string& ip) {
++    const AddressKind kind = ClassifyAddress(interface_name, ip);
++    const std::string address = ip + ":" + std::to_string(port);
++    if (kind != AddressKind::Ignore &&
++        std::ranges::find(found, address, &std::pair<AddressKind, std::string>::second) == found.end())
++      found.emplace_back(kind, address);
++  };
++#if defined(_WIN32)
++  ULONG size = 16 * 1024;
++  std::vector<unsigned char> buffer(size);
++  ULONG result = ERROR_BUFFER_OVERFLOW;
++  for (int tries = 0; tries < 3 && result == ERROR_BUFFER_OVERFLOW; ++tries)
++  {
++    buffer.resize(size);
++    result = GetAdaptersAddresses(AF_INET,
++                                  GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
++                                      GAA_FLAG_SKIP_DNS_SERVER,
++                                  nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()),
++                                  &size);
++  }
++  if (result == NO_ERROR)
++  {
++    for (auto* adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); adapter;
++         adapter = adapter->Next)
++    {
++      if (adapter->OperStatus != IfOperStatusUp)
++        continue;
++      // The adapter's name as Windows shows it ("Wi-Fi", "vEthernet (WSL)", "Tailscale"), in UTF-8.
++      std::string name;
++      if (adapter->FriendlyName)
++      {
++        const int n = WideCharToMultiByte(CP_UTF8, 0, adapter->FriendlyName, -1, nullptr, 0,
++                                          nullptr, nullptr);
++        if (n > 1)
++        {
++          name.resize(static_cast<std::size_t>(n - 1));
++          WideCharToMultiByte(CP_UTF8, 0, adapter->FriendlyName, -1, name.data(), n, nullptr,
++                              nullptr);
++        }
++      }
++      if (name.starts_with("vEthernet"))
++        continue;  // Hyper-V and WSL: only this computer reaches them
++      for (auto* unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next)
++      {
++        const auto* in = reinterpret_cast<const sockaddr_in*>(unicast->Address.lpSockaddr);
++        if (in->sin_family != AF_INET)
++          continue;
++        char ip[INET_ADDRSTRLEN] = {};
++        inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
++        add(name, ip);
++      }
++    }
++  }
++#else
++  ifaddrs* list = nullptr;
++  if (getifaddrs(&list) == 0)
++  {
++    for (ifaddrs* a = list; a; a = a->ifa_next)
++    {
++      if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || !(a->ifa_flags & IFF_UP))
++        continue;
++      char ip[INET_ADDRSTRLEN] = {};
++      inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(a->ifa_addr)->sin_addr, ip,
++                sizeof(ip));
++      add(a->ifa_name ? a->ifa_name : "", ip);
++    }
++    freeifaddrs(list);
++  }
++#endif
++  std::ranges::stable_sort(found, [](const auto& a, const auto& b) { return a.first < b.first; });
++  return found;
++}
++
++// ---------------------------------------------------------------------------------------------------
++// The relay
++
++namespace
++{
++constexpr const char* NEUTRAL = "0000000000000000";
++constexpr const char* AI = "8000000000000000";  // kSeatAI: the seat gives its racer to the AI
++// For a seat that left before the start: a character drawn here (0-10, 12-16: not Super Sonic), the
++// same on every machine; gear 0 (the runner changes it when the character can't ride it).
++constexpr std::array<int, 16> RANDOM_CHARACTERS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16};
++}  // namespace
++
++struct Relay::Impl
++{
++  struct Connection
++  {
++    Socket socket = NO_SOCKET;
++    std::string in;
++    std::string out;
++    enum class Kind
++    {
++      Unknown,
++      Launcher,
++      Runner,
++    };
++    Kind kind = Kind::Unknown;
++    bool closed = false;
++    std::vector<int> seats;  // a runner's seats (one, or two on one machine)
++  };
++  struct RoomMember
++  {
++    int connection = 0;
++    int seat = 0;
++    std::string tag;
++    bool ready = false;
++    bool host = false;
++    std::string state = "-";
++    bool playing = false;
++    int match_seat = -1;
++  };
++
++  Socket listener = NO_SOCKET;
++  std::map<int, Connection> connections;
++  int next_connection = 1;
++  std::string host_key = RandomKey();
++  std::FILE* journal = nullptr;
++  double started = Now();
++  std::atomic<bool> stop{false};
++  std::thread thread;
++  std::mt19937 random{std::random_device{}()};
++
++  // The room.
++  std::vector<RoomMember> members;
++  Rules rules;
++  bool in_match = false;
++
++  // The match: relais.py's state, for `seats` seats.
++  struct Match
++  {
++    int seats = 0;
++    double delay = 0.1;  // seconds a frame waits for a late seat (relais.py --delai-ms 100)
++    std::map<int, int> runners;  // seat -> connection
++    std::map<long long, std::map<int, std::string>> inputs;  // frame -> seat -> pad
++    std::map<long long, double> first;                      // frame -> when its first input came
++    std::vector<std::string> last;
++    std::optional<long long> next;  // the next frame to close
++    bool begun = false;
++    bool go = false;
++    std::string states;  // O expected, V there, X left before the start
++    std::set<int> seen;  // seats that sent an input
++    double last_wait = 0.0;
++    int input_delay = 0;
++    long long first_input_frame = 0;
++    std::vector<int> late;
++    std::vector<std::optional<long long>> last_received;
++    std::map<int, int> received;
++    long long closed = 0;
++    long long late_total = 0;
++    std::map<long long, std::map<int, std::string>> checks;
++    long long checks_same = 0;
++    long long checks_different = 0;
++    std::vector<std::string> tags;
++    std::vector<std::string> picks;
++    bool rules_ignored_said = false;
++  };
++  Match match;
++
++  ~Impl()
++  {
++    stop = true;
++    if (thread.joinable())
++      thread.join();
++    for (auto& [id, connection] : connections)
++      CloseSocket(connection.socket);
++    if (listener != NO_SOCKET)
++      CloseSocket(listener);
++    if (journal)
++      std::fclose(journal);
++  }
++
++  void Log(const std::string& text)
++  {
++    char stamp[32];
++    std::snprintf(stamp, sizeof(stamp), "%9.3f ", Now() - started);
++    std::printf("relay: %s%s\n", stamp, text.c_str());
++    std::fflush(stdout);
++    if (journal)
++    {
++      std::fprintf(journal, "%s%s\n", stamp, text.c_str());
++      std::fflush(journal);
++    }
++  }
++
++  void Send(int id, const std::string& line)
++  {
++    const auto found = connections.find(id);
++    if (found == connections.end() || found->second.closed)
++      return;
++    found->second.out += line;
++    found->second.out += '\n';
++    if (!Flush(found->second.socket, found->second.out))
++      found->second.closed = true;
++  }
++
++  void SendLaunchers(const std::string& line)
++  {
++    for (const RoomMember& member : members)
++      Send(member.connection, line);
++  }
++
++  // relais.py's diffuser: to every runner's connection, once each.
++  void SendRunners(const std::string& line)
++  {
++    std::set<int> sent;
++    for (const auto& [seat, id] : match.runners)
++    {
++      if (sent.insert(id).second)
++        Send(id, line);
++    }
++  }
++
++  std::string MembersLine() const
++  {
++    std::vector<const RoomMember*> sorted;
++    for (const RoomMember& member : members)
++      sorted.push_back(&member);
++    std::ranges::sort(sorted, [](const RoomMember* a, const RoomMember* b) { return a->seat < b->seat; });
++    std::string line = "MEMBERS ";
++    for (std::size_t i = 0; i < sorted.size(); ++i)
++    {
++      const RoomMember& m = *sorted[i];
++      line += (i ? "," : "") + std::to_string(m.seat) + ":" + (m.tag.empty() ? "-" : m.tag) + ":" +
++              (m.ready ? "1" : "0") + ":" + m.state + ":" + (m.playing ? "1" : "0");
++    }
++    return line;
++  }
++
++  std::string RulesLine() const
++  {
++    return "LRULES " + std::to_string(rules.course) + " " + std::to_string(rules.laps) + " " +
++           std::to_string(rules.racers) + " " + std::to_string(rules.delay);
++  }
++
++  RoomMember* MemberOf(int connection)
++  {
++    for (RoomMember& member : members)
++    {
++      if (member.connection == connection)
++        return &member;
++    }
++    return nullptr;
++  }
++
++  // --- The room ---------------------------------------------------------------------------------
++
++  void OnLauncherLine(int id, const std::vector<std::string>& words)
++  {
++    RoomMember* member = MemberOf(id);
++    const std::string& verb = words[0];
++    if (verb == "JOIN")
++    {
++      if (member)
++        return;
++      if (words.size() < 4 || words[1] != PROTOCOL)
++      {
++        Send(id, "REFUSED version");
++        connections[id].closed = true;
++        Log("a launcher of another version was turned away (" +
++            (words.size() > 1 ? words[1] : std::string("?")) + ")");
++        return;
++      }
++      const bool host = words.size() > 4 && words[4] == host_key &&
++                        std::ranges::none_of(members, &RoomMember::host);
++      if (in_match || (!host && static_cast<int>(members.size()) >= MAX_PLAYERS))
++      {
++        Send(id, in_match ? "REFUSED running" : "REFUSED full");
++        connections[id].closed = true;
++        return;
++      }
++      // The host is P1; the others take the first free seat after it.
++      int seat = 0;
++      if (!host)
++      {
++        seat = 1;
++        while (std::ranges::any_of(members, [&](const RoomMember& m) { return m.seat == seat; }))
++          ++seat;
++      }
++      RoomMember joined;
++      joined.connection = id;
++      joined.seat = seat;
++      joined.tag = CleanTag(words[2]);
++      if (joined.tag.empty())
++        joined.tag = "P" + std::to_string(seat + 1);
++      joined.state = words[3].size() == 16 ? words[3] : "-";
++      joined.host = host;
++      joined.ready = host;
++      members.push_back(joined);
++      Log("room: " + joined.tag + " joined as P" + std::to_string(seat + 1) + (host ? " (host)" : "") +
++          ", start state " + joined.state);
++      Send(id, "WELCOME " + std::to_string(seat) + " " + (host ? "1" : "0"));
++      SendLaunchers(MembersLine());
++      SendLaunchers(RulesLine());
++      return;
++    }
++    if (!member)
++      return;
++    if (verb == "LREADY" && !in_match && !member->host)
++    {
++      member->ready = Number(words, 1) == 1;
++      SendLaunchers(MembersLine());
++    }
++    else if (verb == "LRULES" && member->host && !in_match && words.size() >= 5)
++    {
++      const Rules wanted = Clamped({static_cast<int>(Number(words, 1)), static_cast<int>(Number(words, 2)),
++                                    static_cast<int>(Number(words, 3)), static_cast<int>(Number(words, 4))});
++      if (wanted != rules)
++      {
++        rules = wanted;
++        Log("room: the host's race: course " + std::to_string(rules.course) + ", " +
++            std::to_string(rules.laps) + " lap(s), " + std::to_string(rules.racers) + " racers, delay " +
++            std::to_string(rules.delay) + " frames");
++        SendLaunchers(RulesLine());
++      }
++    }
++    else if (verb == "LSTART" && member->host && !in_match)
++    {
++      StartMatch();
++    }
++    else if (verb == "LGONE")
++    {
++      GameClosed(*member);
++    }
++  }
++
++  void StartMatch()
++  {
++    const RoomMember* host = nullptr;
++    for (const RoomMember& m : members)
++      host = m.host ? &m : host;
++    if (!host)
++      return;
++    for (const RoomMember& m : members)
++    {
++      if (!m.ready || m.state != host->state)
++      {
++        Log("room: not started: " + m.tag + (m.ready ? " has another start state" : " is not ready"));
++        return;
++      }
++    }
++    std::vector<RoomMember*> sorted;
++    for (RoomMember& m : members)
++      sorted.push_back(&m);
++    std::ranges::sort(sorted, [](const RoomMember* a, const RoomMember* b) { return a->seat < b->seat; });
++    const int seats = static_cast<int>(sorted.size());
++    rules.racers = std::max(rules.racers, seats);
++    match = Match{};
++    match.seats = seats;
++    match.last.assign(static_cast<std::size_t>(seats), NEUTRAL);
++    match.states.assign(static_cast<std::size_t>(seats), 'O');
++    match.late.assign(static_cast<std::size_t>(seats), 0);
++    match.last_received.assign(static_cast<std::size_t>(seats), std::nullopt);
++    match.tags.assign(static_cast<std::size_t>(seats), "");
++    match.picks.assign(static_cast<std::size_t>(seats), "");
++    in_match = true;
++    std::string who;
++    for (int k = 0; k < seats; ++k)
++    {
++      sorted[static_cast<std::size_t>(k)]->match_seat = k;
++      sorted[static_cast<std::size_t>(k)]->playing = true;
++      who += " " + sorted[static_cast<std::size_t>(k)]->tag;
++    }
++    Log("match: " + std::to_string(seats) + " seat(s):" + who + "; course " + std::to_string(rules.course) +
++        ", " + std::to_string(rules.laps) + " lap(s), " + std::to_string(rules.racers) + " racers, delay " +
++        std::to_string(rules.delay) + " frames");
++    SendLaunchers(RulesLine());
++    for (const RoomMember* m : sorted)
++    {
++      Send(m->connection, "MATCH " + std::to_string(seats) + " " + std::to_string(m->match_seat) + " " +
++                              std::to_string(rules.delay));
++    }
++    SendLaunchers(MembersLine());
++  }
++
++  // A launcher's game closed (or its launcher left): before GO, its seat is the AI's when no runner
++  // holds it; once every game has closed, the room is back.
++  void GameClosed(RoomMember& member)
++  {
++    if (!in_match || !member.playing)
++      return;
++    member.playing = false;
++    const int seat = member.match_seat;
++    Log("match: " + member.tag + "'s game closed (seat " + std::to_string(seat) + ")");
++    if (!match.go && seat >= 0 && seat < match.seats && !match.runners.contains(seat) &&
++        match.states[static_cast<std::size_t>(seat)] != 'X')
++    {
++      match.states[static_cast<std::size_t>(seat)] = 'X';
++      Announce();
++    }
++    if (std::ranges::none_of(members, &RoomMember::playing))
++      EndMatch();
++    else
++      SendLaunchers(MembersLine());
++  }
++
++  void EndMatch()
++  {
++    Log("match over: " + std::to_string(match.closed) + " frames closed, " + std::to_string(match.late_total) +
++        " late inputs replaced; checksums: " + std::to_string(match.checks_same) + " identical, " +
++        std::to_string(match.checks_different) + " divergences");
++    for (const auto& [seat, id] : match.runners)
++      connections[id].closed = true;
++    in_match = false;
++    match = Match{};
++    for (RoomMember& m : members)
++    {
++      m.playing = false;
++      m.match_seat = -1;
++      m.ready = m.host;
++    }
++    SendLaunchers("ROOM");
++    SendLaunchers(MembersLine());
++  }
++
++  void OnLauncherClosed(int id)
++  {
++    RoomMember* member = MemberOf(id);
++    if (!member)
++      return;
++    Log("room: " + member->tag + " left");
++    GameClosed(*member);
++    std::erase_if(members, [&](const RoomMember& m) { return m.connection == id; });
++    if (in_match && std::ranges::none_of(members, &RoomMember::playing))
++      EndMatch();
++    SendLaunchers(MembersLine());
++  }
++
++  // --- The match (relais.py) ----------------------------------------------------------------------
++
++  std::size_t Active() const
++  {
++    return static_cast<std::size_t>(std::ranges::count_if(match.states, [](char s) { return s != 'X'; }));
++  }
++
++  std::string TagsLine() const
++  {
++    std::string line = "TAGS ";
++    for (std::size_t i = 0; i < match.tags.size(); ++i)
++      line += (i ? "," : "") + (match.tags[i].empty() ? std::string("-") : match.tags[i]);
++    return line;
++  }
++
++  std::string PicksLine() const
++  {
++    std::string line = "PICKS ";
++    for (std::size_t i = 0; i < match.picks.size(); ++i)
++      line += (i ? "," : "") + (match.picks[i].empty() ? std::string("-") : match.picks[i]);
++    return line;
++  }
++
++  std::string RunnersRulesLine() const
++  {
++    return "RULES " + std::to_string(rules.course) + " " + std::to_string(rules.laps) + " " +
++           std::to_string(rules.racers);
++  }
++
++  // WAIT <present> <seats> <states> to every runner, or GO once nobody is expected.
++  void Announce()
++  {
++    if (match.go)
++      return;
++    const int present = static_cast<int>(std::ranges::count(match.states, 'V'));
++    if (match.states.find('O') == std::string::npos && present > 0)
++    {
++      match.go = true;
++      std::string go = "GO";
++      std::string replaced;
++      for (int s = 0; s < match.seats; ++s)
++      {
++        if (match.states[static_cast<std::size_t>(s)] == 'X')
++        {
++          const int character =
++              RANDOM_CHARACTERS[std::uniform_int_distribution<std::size_t>(0, RANDOM_CHARACTERS.size() - 1)(random)];
++          go += " " + std::to_string(s) + ":" + std::to_string(character) + "/0";
++          replaced += " " + std::to_string(s) + ":" + std::to_string(character) + "/0";
++        }
++      }
++      Log("nobody is expected any more: GO" + (replaced.empty() ? std::string() : "; to the AI:" + replaced));
++      SendRunners(go);
++      CloseFrames();
++    }
++    else
++    {
++      match.last_wait = Now();
++      SendRunners("WAIT " + std::to_string(present) + " " + std::to_string(match.seats) + " " + match.states);
++    }
++  }
++
++  void CloseFrames()
++  {
++    if (!match.begun)
++    {
++      if (!match.go)
++        return;
++      match.begun = true;
++      for (auto& [frame, when] : match.first)
++        when = Now();
++      Log("every seat is there: the race starts");
++    }
++    while (match.next && (match.inputs.contains(*match.next) || *match.next < match.first_input_frame))
++    {
++      const long long f = *match.next;
++      std::map<int, std::string> received;
++      if (const auto found = match.inputs.find(f); found != match.inputs.end())
++        received = found->second;
++      for (int s = 0; s < match.seats; ++s)
++      {
++        if (match.states[static_cast<std::size_t>(s)] == 'X')
++          received[s] = AI;
++      }
++      bool complete = f < match.first_input_frame;
++      if (!complete)
++      {
++        complete = true;
++        for (int s = 0; s < match.seats; ++s)
++          complete = complete && received.contains(s);
++      }
++      // At the start, no waiting while a seat has sent nothing yet: it has just loaded.
++      if (!complete && (match.seen.size() < Active() || Now() - match.first[f] < match.delay))
++        return;
++      std::string line = "OF " + std::to_string(f);
++      for (int s = 0; s < match.seats; ++s)
++      {
++        if (const auto found = received.find(s); found != received.end())
++        {
++          match.last[static_cast<std::size_t>(s)] = found->second;
++        }
++        else if (f >= match.first_input_frame)
++        {
++          ++match.late_total;
++          if (++match.late[static_cast<std::size_t>(s)] <= 3)
++          {
++            const auto& last = match.last_received[static_cast<std::size_t>(s)];
++            Log("frame " + std::to_string(f) + " closed without seat " + std::to_string(s) +
++                " (its last input: frame " + (last ? std::to_string(*last) : std::string("none")) + ")");
++          }
++        }
++        line += " " + match.last[static_cast<std::size_t>(s)];
++      }
++      SendRunners(line);
++      match.inputs.erase(f);
++      match.first.erase(f);
++      match.next = f + 1;
++      if (++match.closed % 600 == 0)
++      {
++        Log("frame " + std::to_string(f) + " closed; " + std::to_string(match.closed) + " frames, " +
++            std::to_string(match.late_total) + " late inputs replaced; checksums: " +
++            std::to_string(match.checks_same) + " identical, " + std::to_string(match.checks_different) +
++            " divergences");
++      }
++    }
++  }
++
++  void Check(long long frame, int seat, const std::string& value)
++  {
++    auto& received = match.checks[frame];
++    received[seat] = value;
++    if (received.size() == Active())
++    {
++      bool same = true;
++      for (const auto& [s, v] : received)
++        same = same && v == received.begin()->second;
++      if (same)
++      {
++        ++match.checks_same;
++      }
++      else
++      {
++        ++match.checks_different;
++        std::string line = "DIVERGENCE frame " + std::to_string(frame) + ":";
++        for (const auto& [s, v] : received)
++          line += " " + std::to_string(s) + "=" + v;
++        Log(line);
++      }
++      match.checks.erase(frame);
++    }
++  }
++
++  void OnRunnerLine(int id, const std::vector<std::string>& words)
++  {
++    Connection& connection = connections[id];
++    const std::string& verb = words[0];
++    const auto seat_ok = [&](long long s) { return s >= 0 && s < match.seats; };
++    if (verb == "HELLO")
++    {
++      const long long seat = Number(words, 1);
++      if (!in_match || !seat_ok(seat))
++      {
++        Log("a game came for seat " + (words.size() > 1 ? words[1] : std::string("?")) +
++            (in_match ? ", which this match does not have" : " with no match on") + ": closed");
++        connection.closed = true;
++        return;
++      }
++      if (Number(words, 2) != match.seats)
++        Log("seat " + std::to_string(seat) + " says " + (words.size() > 2 ? words[2] : "?") +
++            " seats, the match has " + std::to_string(match.seats));
++      const int s = static_cast<int>(seat);
++      connection.seats.push_back(s);
++      if (words.size() > 3)
++        match.input_delay = std::max(match.input_delay, static_cast<int>(Number(words, 3, 0)));
++      match.runners[s] = id;
++      const bool lobby = words.size() > 4 && words[4] == "LOBBY";
++      if (!match.go)
++        match.states[static_cast<std::size_t>(s)] = lobby ? 'O' : 'V';
++      Log("seat " + std::to_string(s) + " connected (" + std::to_string(match.runners.size()) + "/" +
++          std::to_string(match.seats) + ")");
++      Announce();
++      if (std::ranges::any_of(match.tags, [](const std::string& t) { return !t.empty(); }))
++        SendRunners(TagsLine());
++      if (std::ranges::any_of(match.picks, [](const std::string& p) { return !p.empty(); }))
++        SendRunners(PicksLine());
++      SendRunners(RunnersRulesLine());
++      return;
++    }
++    if (verb == "IN" && words.size() >= 4)
++    {
++      const long long f = Number(words, 1);
++      const long long s = Number(words, 2);
++      if (!seat_ok(s) || f < 0)
++        return;
++      match.last_received[static_cast<std::size_t>(s)] = f;
++      if (match.seen.insert(static_cast<int>(s)).second && match.seen.size() == Active())
++        Log("every seat has sent an input: frames wait " + std::to_string(static_cast<int>(match.delay * 1000)) +
++            " ms for a late one");
++      if (++match.received[static_cast<int>(s)] <= 5)
++        Log("input of seat " + std::to_string(s) + " for frame " + std::to_string(f) + " (next to close: " +
++            (match.next ? std::to_string(*match.next) : std::string("none")) + ")");
++      if (!match.next)
++      {
++        match.next = f - match.input_delay;
++        match.first_input_frame = f;
++        Log("first frame: " + std::to_string(*match.next) + " (inputs from " + std::to_string(f) + ")");
++      }
++      if (f < *match.next)
++        return;  // closed without it already
++      match.inputs[f][static_cast<int>(s)] = words[3];
++      match.first.try_emplace(f, Now());
++      CloseFrames();
++    }
++    else if (verb == "CK" && words.size() >= 4)
++    {
++      const long long s = Number(words, 2);
++      if (seat_ok(s))
++        Check(Number(words, 1), static_cast<int>(s), words[3]);
++    }
++    else if (verb == "PICK" && words.size() >= 4)
++    {
++      const long long s = Number(words, 1), c = Number(words, 2), g = Number(words, 3);
++      if (seat_ok(s) && c >= 0 && c <= 16 && g >= 0 && g < 64 && !match.go)
++      {
++        match.picks[static_cast<std::size_t>(s)] = std::to_string(c) + "/" + std::to_string(g);
++        SendRunners(PicksLine());
++      }
++    }
++    else if (verb == "READY" || verb == "UNREADY")
++    {
++      const long long s = Number(words, 1);
++      if (seat_ok(s) && !match.go && match.states[static_cast<std::size_t>(s)] != 'X')
++      {
++        match.states[static_cast<std::size_t>(s)] = verb == "READY" ? 'V' : 'O';
++        const std::string& pick = match.picks[static_cast<std::size_t>(s)];
++        Log("seat " + std::to_string(s) + (verb == "READY" ? ": ready" : ": choosing again") + " (" +
++            (pick.empty() ? std::string("no choice") : pick) + ")");
++        Announce();
++      }
++    }
++    else if (verb == "TAG")
++    {
++      const long long s = Number(words, 1);
++      const std::string tag = words.size() > 2 ? CleanTag(words[2]) : std::string();
++      if (seat_ok(s) && !tag.empty() && tag != match.tags[static_cast<std::size_t>(s)])
++      {
++        match.tags[static_cast<std::size_t>(s)] = tag;
++        Log("tag of seat " + std::to_string(s) + ": " + tag);
++        SendRunners(TagsLine());
++      }
++    }
++    else if (verb == "RULES")
++    {
++      // The room set the race: a game's own choice (its Track Select, its Z) does not change it.
++      if (!match.rules_ignored_said)
++        Log("a game's rules (" + (words.size() > 2 ? words[2] : std::string("?")) +
++            "...) left aside: the race is the room's");
++      match.rules_ignored_said = true;
++    }
++  }
++
++  void OnRunnerClosed(int id)
++  {
++    Connection& connection = connections[id];
++    for (const int s : connection.seats)
++    {
++      if (const auto found = match.runners.find(s); found != match.runners.end() && found->second == id)
++        match.runners.erase(found);
++      if (in_match && !match.go && s < match.seats)
++        match.states[static_cast<std::size_t>(s)] = 'X';  // left before the start: the AI's
++    }
++    if (in_match && !match.go && !connection.seats.empty())
++      Announce();
++    std::string late;
++    for (std::size_t i = 0; i < match.late.size(); ++i)
++      late += (i ? "," : "") + std::to_string(match.late[i]);
++    std::string seats;
++    for (const int s : connection.seats)
++      seats += (seats.empty() ? "" : ",") + std::to_string(s);
++    Log("seat(s) " + seats + " gone; " + std::to_string(match.closed) + " frames closed, " +
++        std::to_string(match.late_total) + " late inputs (by seat: " + late + "), checksums: " +
++        std::to_string(match.checks_same) + " identical, " + std::to_string(match.checks_different) +
++        " divergences");
++  }
++
++  // --- The loop -----------------------------------------------------------------------------------
++
++  void OnLine(int id, const std::string& line)
++  {
++    const std::vector<std::string> words = Words(line);
++    if (words.empty())
++      return;
++    Connection& connection = connections[id];
++    if (connection.kind == Connection::Kind::Unknown)
++    {
++      if (words[0] == "HELLO")
++        connection.kind = Connection::Kind::Runner;
++      else if (words[0] == "JOIN")
++        connection.kind = Connection::Kind::Launcher;
++      else
++      {
++        connection.closed = true;
++        return;
++      }
++    }
++    if (connection.kind == Connection::Kind::Runner)
++      OnRunnerLine(id, words);
++    else
++      OnLauncherLine(id, words);
++  }
++
++  void Close(int id)
++  {
++    Connection& connection = connections[id];
++    if (connection.kind == Connection::Kind::Runner)
++      OnRunnerClosed(id);
++    else if (connection.kind == Connection::Kind::Launcher)
++      OnLauncherClosed(id);
++    CloseSocket(connection.socket);
++    connections.erase(id);
++  }
++
++  void Loop()
++  {
++    while (!stop)
++    {
++      fd_set readable, writable;
++      FD_ZERO(&readable);
++      FD_ZERO(&writable);
++      FD_SET(listener, &readable);
++      Socket highest = listener;
++      for (const auto& [id, connection] : connections)
++      {
++        FD_SET(connection.socket, &readable);
++        if (!connection.out.empty())
++          FD_SET(connection.socket, &writable);
++        highest = std::max(highest, connection.socket);
++      }
++      timeval wait{0, 5000};
++      const int ready = select(static_cast<int>(highest + 1), &readable, &writable, nullptr, &wait);
++      if (ready > 0 && FD_ISSET(listener, &readable))
++      {
++        sockaddr_storage from{};
++        socklen_t size = sizeof(from);
++        const Socket s = accept(listener, reinterpret_cast<sockaddr*>(&from), &size);
++        if (s != NO_SOCKET)
++        {
++          SetNonBlocking(s);
++          NoDelay(s);
++          connections[next_connection++].socket = s;
++        }
++      }
++      std::vector<int> ids;
++      for (const auto& [id, connection] : connections)
++        ids.push_back(id);
++      for (const int id : ids)
++      {
++        auto found = connections.find(id);
++        if (found == connections.end())
++          continue;
++        if (ready > 0 && FD_ISSET(found->second.socket, &readable))
++        {
++          if (!Receive(found->second.socket, found->second.in))
++            found->second.closed = true;
++          while (!found->second.closed)
++          {
++            const std::optional<std::string> line = TakeLine(found->second.in);
++            if (!line)
++              break;
++            OnLine(id, *line);
++            found = connections.find(id);
++            if (found == connections.end())
++              break;
++          }
++        }
++      }
++      for (auto& [id, connection] : connections)
++      {
++        if (!connection.out.empty() && !Flush(connection.socket, connection.out))
++          connection.closed = true;
++      }
++      for (const int id : ids)
++      {
++        const auto found = connections.find(id);
++        // A refused launcher gets its REFUSED line before it goes.
++        if (found != connections.end() && found->second.closed)
++        {
++          Flush(found->second.socket, found->second.out);
++          Close(id);
++        }
++      }
++      // relais.py's minuteur: WAIT every 2 s while a seat is expected, and the frames whose wait is over.
++      if (in_match)
++      {
++        if (!match.go && !match.runners.empty() && Now() - match.last_wait > 2.0)
++          Announce();
++        CloseFrames();
++      }
++    }
++  }
++};
++
++Relay::Relay() : m_impl(std::make_unique<Impl>()) {}
++
++Relay::~Relay() = default;
++
++bool Relay::Start(std::uint16_t port, const fs::path& journal, std::string* error)
++{
++  UseNetwork();
++  Impl& m = *m_impl;
++  m.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++  if (m.listener == NO_SOCKET)
++  {
++    if (error)
++      *error = "no socket";
++    return false;
++  }
++#if defined(_WIN32)
++  // Another program on the same port: refused, rather than shared.
++  int exclusive = 1;
++  setsockopt(m.listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
++             sizeof(exclusive));
++#else
++  int reuse = 1;
++  setsockopt(m.listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++#endif
++  sockaddr_in address{};
++  address.sin_family = AF_INET;
++  address.sin_addr.s_addr = htonl(INADDR_ANY);
++  address.sin_port = htons(port);
++  if (bind(m.listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
++      listen(m.listener, 16) != 0)
++  {
++    if (error)
++      *error = "port " + std::to_string(port) + " is taken";
++    CloseSocket(m.listener);
++    m.listener = NO_SOCKET;
++    return false;
++  }
++  SetNonBlocking(m.listener);
++  std::error_code ignored;
++  fs::create_directories(journal.parent_path(), ignored);
++#if defined(_WIN32)
++  m.journal = _wfopen(journal.c_str(), L"a");
++#else
++  m.journal = std::fopen(journal.c_str(), "a");
++#endif
++  m.Log("relay: TCP port " + std::to_string(port) + ", up to " + std::to_string(MAX_PLAYERS) + " players");
++  m.thread = std::thread([&m] { m.Loop(); });
++  return true;
++}
++
++const std::string& Relay::HostKey() const
++{
++  return m_impl->host_key;
++}
++
++// ---------------------------------------------------------------------------------------------------
++// The client
++
++struct Client::Impl
++{
++  std::string host;
++  std::uint16_t port = DEFAULT_PORT;
++  std::string tag;
++  std::string state;
++  std::string host_key;
++  std::atomic<bool> stop{false};
++  std::thread thread;
++  mutable std::mutex mutex;
++  RoomView view;
++  std::optional<MatchStart> match;
++  std::string out;  // lines to send
++
++  ~Impl()
++  {
++    stop = true;
++    if (thread.joinable())
++      thread.join();
++  }
++
++  void Fail(RoomView::Link link, std::string why)
++  {
++    std::lock_guard lock(mutex);
++    if (view.link == RoomView::Link::Refused)
++      return;
++    view.link = link;
++    view.error = std::move(why);
++  }
++
++  void OnLine(const std::string& line)
++  {
++    const std::vector<std::string> words = Words(line);
++    if (words.empty())
++      return;
++    std::lock_guard lock(mutex);
++    const std::string& verb = words[0];
++    if (verb == "WELCOME")
++    {
++      view.link = RoomView::Link::Joined;
++      view.seat = static_cast<int>(Number(words, 1));
++      view.host = Number(words, 2) == 1;
++    }
++    else if (verb == "REFUSED")
++    {
++      view.link = RoomView::Link::Refused;
++      view.error = words.size() > 1 ? words[1] : "refused";
++    }
++    else if (verb == "MEMBERS")
++    {
++      view.members.clear();
++      if (words.size() > 1)
++      {
++        std::stringstream entries(words[1]);
++        std::string entry;
++        while (std::getline(entries, entry, ','))
++        {
++          std::vector<std::string> fields;
++          std::stringstream parts(entry);
++          std::string field;
++          while (std::getline(parts, field, ':'))
++            fields.push_back(field);
++          if (fields.size() < 5)
++            continue;
++          Member member;
++          member.seat = std::atoi(fields[0].c_str());
++          member.tag = fields[1] == "-" ? std::string() : fields[1];
++          member.ready = fields[2] == "1";
++          member.state = fields[3];
++          member.playing = fields[4] == "1";
++          view.members.push_back(member);
++        }
++      }
++    }
++    else if (verb == "LRULES" && words.size() >= 5)
++    {
++      view.rules = Clamped({static_cast<int>(Number(words, 1)), static_cast<int>(Number(words, 2)),
++                            static_cast<int>(Number(words, 3)), static_cast<int>(Number(words, 4))});
++    }
++    else if (verb == "MATCH" && words.size() >= 4)
++    {
++      match = MatchStart{static_cast<int>(Number(words, 1)), static_cast<int>(Number(words, 2)),
++                         static_cast<int>(Number(words, 3))};
++      view.match = true;
++    }
++    else if (verb == "ROOM")
++    {
++      view.match = false;
++    }
++  }
++
++  void Run()
++  {
++    UseNetwork();
++    addrinfo hints{};
++    hints.ai_family = AF_INET;
++    hints.ai_socktype = SOCK_STREAM;
++    addrinfo* found = nullptr;
++    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found) != 0 || !found)
++      return Fail(RoomView::Link::Lost, "unknown address");
++    Socket s = socket(found->ai_family, found->ai_socktype, found->ai_protocol);
++    if (s == NO_SOCKET)
++    {
++      freeaddrinfo(found);
++      return Fail(RoomView::Link::Lost, "no socket");
++    }
++    SetNonBlocking(s);
++    NoDelay(s);
++    const int started = connect(s, found->ai_addr, static_cast<int>(found->ai_addrlen));
++    freeaddrinfo(found);
++    if (started != 0 && !WouldBlock())
++    {
++      CloseSocket(s);
++      return Fail(RoomView::Link::Lost, "no answer");
++    }
++    // Up to 10 s for the host to answer.
++    bool connected = started == 0;
++    for (int i = 0; i < 100 && !connected && !stop; ++i)
++    {
++      fd_set writable, failed;
++      FD_ZERO(&writable);
++      FD_ZERO(&failed);
++      FD_SET(s, &writable);
++      FD_SET(s, &failed);
++      timeval wait{0, 100000};
++      if (select(static_cast<int>(s + 1), nullptr, &writable, &failed, &wait) > 0)
++      {
++        int problem = 0;
++        socklen_t size = sizeof(problem);
++        getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&problem), &size);
++        if (problem != 0 || FD_ISSET(s, &failed))
++          break;
++        connected = true;
++      }
++    }
++    if (!connected)
++    {
++      CloseSocket(s);
++      return Fail(RoomView::Link::Lost, "no answer");
++    }
++    std::string in;
++    std::string pending = "JOIN " + std::string(PROTOCOL) + " " + (tag.empty() ? "-" : tag) + " " + state +
++                          (host_key.empty() ? "" : " " + host_key) + "\n";
++    while (!stop)
++    {
++      {
++        std::lock_guard lock(mutex);
++        pending += out;
++        out.clear();
++      }
++      if (!Flush(s, pending))
++        break;
++      fd_set readable;
++      FD_ZERO(&readable);
++      FD_SET(s, &readable);
++      timeval wait{0, 20000};
++      if (select(static_cast<int>(s + 1), &readable, nullptr, nullptr, &wait) > 0)
++      {
++        if (!Receive(s, in))
++          break;
++        while (const std::optional<std::string> line = TakeLine(in))
++          OnLine(*line);
++      }
++    }
++    CloseSocket(s);
++    if (!stop)
++      Fail(RoomView::Link::Lost, "connection closed");
++  }
++
++  void Queue(const std::string& line)
++  {
++    std::lock_guard lock(mutex);
++    out += line + "\n";
++  }
++};
++
++Client::Client(std::string host, std::uint16_t port, std::string tag, std::string state,
++               std::string host_key)
++    : m_impl(std::make_unique<Impl>())
++{
++  m_impl->host = std::move(host);
++  m_impl->port = port;
++  m_impl->tag = std::move(tag);
++  m_impl->state = std::move(state);
++  m_impl->host_key = std::move(host_key);
++  Impl* impl = m_impl.get();
++  m_impl->thread = std::thread([impl] { impl->Run(); });
++}
++
++Client::~Client() = default;
++
++RoomView Client::View() const
++{
++  std::lock_guard lock(m_impl->mutex);
++  return m_impl->view;
++}
++
++std::optional<MatchStart> Client::TakeMatch()
++{
++  std::lock_guard lock(m_impl->mutex);
++  return std::exchange(m_impl->match, std::nullopt);
++}
++
++void Client::SetReady(bool ready)
++{
++  m_impl->Queue(ready ? "LREADY 1" : "LREADY 0");
++}
++
++void Client::SetRules(const Rules& rules)
++{
++  const Rules r = Clamped(rules);
++  m_impl->Queue("LRULES " + std::to_string(r.course) + " " + std::to_string(r.laps) + " " +
++                std::to_string(r.racers) + " " + std::to_string(r.delay));
++}
++
++void Client::StartMatch()
++{
++  m_impl->Queue("LSTART");
++}
++
++void Client::GameClosed()
++{
++  m_impl->Queue("LGONE");
++}
++
++const std::string& Client::Host() const
++{
++  return m_impl->host;
++}
++
++std::uint16_t Client::Port() const
++{
++  return m_impl->port;
++}
++
++// ---------------------------------------------------------------------------------------------------
++// Settings, the game's folder, the runner's environment
++
++namespace
++{
++std::string ReadText(const fs::path& file)
++{
++  std::ifstream stream(file, std::ios::binary);
++  std::stringstream text;
++  text << stream.rdbuf();
++  return text.str();
++}
++
++bool WriteText(const fs::path& file, const std::string& text)
++{
++  std::ofstream stream(file, std::ios::binary | std::ios::trunc);
++  stream << text;
++  return static_cast<bool>(stream);
++}
++
++std::vector<std::string> Lines(const std::string& text)
++{
++  std::vector<std::string> lines;
++  std::stringstream stream(text);
++  std::string line;
++  while (std::getline(stream, line))
++  {
++    if (!line.empty() && line.back() == '\r')
++      line.pop_back();
++    lines.push_back(line);
++  }
++  return lines;
++}
++
++std::string Trimmed(std::string_view text)
++{
++  const std::size_t first = text.find_first_not_of(" \t");
++  if (first == std::string_view::npos)
++    return {};
++  const std::size_t last = text.find_last_not_of(" \t");
++  return std::string(text.substr(first, last - first + 1));
++}
++
++// Sets `key = value` in [section] of an INI text (Dolphin's style), adding the section or the key.
++void SetIni(std::vector<std::string>& lines, std::string_view section, std::string_view key,
++            std::string_view value)
++{
++  const std::string header = "[" + std::string(section) + "]";
++  std::size_t start = lines.size();
++  for (std::size_t i = 0; i < lines.size(); ++i)
++  {
++    if (Trimmed(lines[i]) == header)
++    {
++      start = i;
++      break;
++    }
++  }
++  const std::string entry = std::string(key) + " = " + std::string(value);
++  if (start == lines.size())
++  {
++    lines.push_back(header);
++    lines.push_back(entry);
++    return;
++  }
++  std::size_t i = start + 1;
++  for (; i < lines.size() && !Trimmed(lines[i]).starts_with("["); ++i)
++  {
++    const std::string line = Trimmed(lines[i]);
++    const std::size_t equals = line.find('=');
++    if (equals != std::string::npos && Trimmed(std::string_view(line).substr(0, equals)) == key)
++    {
++      lines[i] = entry;
++      return;
++    }
++  }
++  lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(i), entry);
++}
++
++// The lines of [section], without its header.
++std::vector<std::string> IniSection(const std::vector<std::string>& lines, std::string_view section)
++{
++  const std::string header = "[" + std::string(section) + "]";
++  std::vector<std::string> body;
++  bool inside = false;
++  for (const std::string& line : lines)
++  {
++    const std::string trimmed = Trimmed(line);
++    if (trimmed.starts_with("["))
++    {
++      if (inside)
++        break;
++      inside = trimmed == header;
++      continue;
++    }
++    if (inside && !trimmed.empty())
++      body.push_back(line);
++  }
++  return body;
++}
++
++std::string Joined(const std::vector<std::string>& lines)
++{
++  std::string text;
++  for (const std::string& line : lines)
++    text += line + "\n";
++  return text;
++}
++
++std::string PathUtf8(const fs::path& path)
++{
++  const std::u8string text = path.u8string();
++  return std::string(text.begin(), text.end());
++}
++
++fs::path Utf8Path(const std::string& text)
++{
++  return fs::path(std::u8string(text.begin(), text.end()));
++}
++}  // namespace
++
++Settings LoadSettings(const fs::path& user_directory, std::string_view nickname)
++{
++  Settings settings;
++  settings.tag = CleanTag(nickname);
++  for (const std::string& line : Lines(ReadText(user_directory / "online.ini")))
++  {
++    const std::size_t equals = line.find('=');
++    if (equals == std::string::npos || line.starts_with("#"))
++      continue;
++    const std::string key = Trimmed(std::string_view(line).substr(0, equals));
++    const std::string value = Trimmed(std::string_view(line).substr(equals + 1));
++    const int number = std::atoi(value.c_str());
++    if (key == "tag")
++      settings.tag = CleanTag(value);
++    else if (key == "address")
++      settings.address = value;
++    else if (key == "port" && number >= 1 && number <= 65535)
++      settings.port = static_cast<std::uint16_t>(number);
++    else if (key == "start_state")
++      settings.start_state = Utf8Path(value);
++    else if (key == "course")
++      settings.rules.course = number;
++    else if (key == "laps")
++      settings.rules.laps = number;
++    else if (key == "racers")
++      settings.rules.racers = number;
++    else if (key == "delay")
++      settings.rules.delay = number;
++  }
++  settings.rules = Clamped(settings.rules);
++  return settings;
++}
++
++bool SaveSettings(const fs::path& user_directory, const Settings& settings)
++{
++  std::error_code ignored;
++  fs::create_directories(user_directory, ignored);
++  std::string text = "# Online/LAN play (SR-Source Net Plus)\n";
++  text += "tag=" + settings.tag + "\n";
++  text += "address=" + settings.address + "\n";
++  text += "port=" + std::to_string(settings.port) + "\n";
++  text += "# The game state every match starts from (Player Entry): every player needs the same file\n";
++  text += "start_state=" + PathUtf8(settings.start_state) + "\n";
++  text += "course=" + std::to_string(settings.rules.course) + "\n";
++  text += "laps=" + std::to_string(settings.rules.laps) + "\n";
++  text += "racers=" + std::to_string(settings.rules.racers) + "\n";
++  text += "delay=" + std::to_string(settings.rules.delay) + "\n";
++  return WriteText(user_directory / "online.ini", text);
++}
++
++fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view keyboard_device,
++                           const std::vector<fs::path>& mod_folders, std::string* error)
++{
++  const fs::path folder = user_directory / "Online";
++  std::error_code ec;
++  fs::create_directories(folder / "Config", ec);
++  fs::create_directories(folder / "Logs", ec);
++  if (ec)
++  {
++    if (error)
++      *error = "can't make " + PathUtf8(folder) + ": " + ec.message();
++    return {};
++  }
++  // Dolphin.ini: the player's, with the online changes.
++  std::vector<std::string> dolphin = Lines(ReadText(user_directory / "Config" / "Dolphin.ini"));
++  SetIni(dolphin, "Core", "SIDevice1", "0");  // ports 2-4: no controller in the game
++  SetIni(dolphin, "Core", "SIDevice2", "0");
++  SetIni(dolphin, "Core", "SIDevice3", "0");
++  SetIni(dolphin, "Core", "EmulationSpeed", "1.0");
++  // Background input stays the player's choice (off by default), as in the test scripts' runs: on, a
++  // pad also opened the menu of a game in the background (two games on one computer, 2026-11-25).
++  // SRNP_ONLINE_BACKGROUND=0|1 (tests) sets it.
++  if (const char* background = std::getenv("SRNP_ONLINE_BACKGROUND"); background && *background)
++    SetIni(dolphin, "Input", "BackgroundInput", *background == '1' ? "True" : "False");
++  SetIni(dolphin, "Interface", "UsePanicHandlers", "False");
++  if (fs::is_directory(user_directory / "Load", ec))
++    SetIni(dolphin, "General", "LoadPath", PathUtf8(user_directory / "Load") + "/");
++  // GCPadNew.ini: port 1 a keyboard with no key (a device, so that the relay's presses reach the
++  // menus, but nothing of its own); port 4 the player's controller as they set it up, read by the
++  // runner (SRNP_INPUT=manette) and sent to the relay.
++  const std::vector<std::string> pads = Lines(ReadText(user_directory / "Config" / "GCPadNew.ini"));
++  std::vector<std::string> own = IniSection(pads, "GCPad1");
++  std::string profile = "[GCPad1]\nDevice = " + std::string(keyboard_device) +
++                        "\nOptions/Always Connected = True\n[GCPad4]\n";
++  if (own.empty())
++    profile += "Device = " + std::string(keyboard_device) + "\n";
++  else
++    profile += Joined(own);
++  bool written = WriteText(folder / "Config" / "Dolphin.ini", Joined(dolphin)) &&
++                 WriteText(folder / "Config" / "GCPadNew.ini", profile);
++  // The rest as the player has it.
++  for (const char* name : {"GFX.ini", "GCKeyNew.ini", "Hotkeys.ini"})
++  {
++    if (fs::is_regular_file(user_directory / "Config" / name, ec))
++      fs::copy_file(user_directory / "Config" / name, folder / "Config" / name,
++                    fs::copy_options::overwrite_existing, ec);
++  }
++  // config.ini: the player's; the labels of SR-Source Net Plus (players 5P-8P, the tags: the mod
++  // srnp_etiquettes) on when it is installed. Measured on 2026-11-25: without it, the relay's Start
++  // did not get past the game's Player Entry (0 of 2 games, 2 of 2 with it).
++  std::vector<std::string> frontend = Lines(ReadText(user_directory / "config.ini"));
++  bool labels_on = false;
++  for (const std::string& line : frontend)
++    labels_on = labels_on || Trimmed(line) == "mod=srnp_etiquettes";
++  bool labels_there = false;
++  for (const fs::path& mods : mod_folders)
++    labels_there = labels_there || fs::is_directory(mods / "srnp_etiquettes", ec);
++  if (labels_there && !labels_on)
++  {
++    bool added = false;
++    for (std::size_t i = 0; i < frontend.size() && !added; ++i)
++    {
++      if (Trimmed(frontend[i]) == "[Mods]")
++      {
++        frontend.insert(frontend.begin() + static_cast<std::ptrdiff_t>(i + 1), "mod=srnp_etiquettes");
++        added = true;
++      }
++    }
++    if (!added)
++    {
++      frontend.push_back("[Mods]");
++      frontend.push_back("mod=srnp_etiquettes");
++    }
++  }
++  if (!frontend.empty() || labels_there)
++    written = written && WriteText(folder / "config.ini", Joined(frontend));
++  // The file mods turned on: the runner looks for them beside itself and in the game's user folder's
++  // Mods only, so the player's are copied there (again only when a file changed).
++  for (const std::string& line : frontend)
++  {
++    const std::string entry = Trimmed(line);
++    if (!entry.starts_with("mod="))
++      continue;
++    const std::string name = Trimmed(std::string_view(entry).substr(4));
++    const fs::path source = user_directory / "Mods" / Utf8Path(name);
++    if (name.empty() || !fs::is_directory(source, ec))
++      continue;
++    // Folders reached through links and junctions too (fs::status follows them).
++    const auto copy_tree = [&ec](const auto& self, const fs::path& from, const fs::path& to) -> void {
++      fs::create_directories(to, ec);
++      for (fs::directory_iterator it(from, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
++      {
++        const fs::file_status status = fs::status(it->path(), ec);
++        if (fs::is_directory(status))
++          self(self, it->path(), to / it->path().filename());
++        else if (fs::is_regular_file(status))
++          fs::copy_file(it->path(), to / it->path().filename(), fs::copy_options::update_existing, ec);
++      }
++    };
++    copy_tree(copy_tree, source, folder / "Mods" / Utf8Path(name));
++    if (ec)
++    {
++      if (error)
++        *error = "can't copy the mod " + name + ": " + ec.message();
++      return {};
++    }
++  }
++  if (!written || ec)
++  {
++    if (error)
++      *error = "can't write the settings in " + PathUtf8(folder) + (ec ? ": " + ec.message() : "");
++    return {};
++  }
++  return folder;
++}
++
++RunnerEnvironment MatchEnvironment(const MatchStart& match, const std::string& relay_address,
++                                   const std::string& tag)
++{
++  RunnerEnvironment environment;
++  environment.set = {
++      {"SRNP_RELAY", relay_address},
++      {"SRNP_SEAT", std::to_string(match.seat)},
++      {"SRNP_SEATS", std::to_string(match.seats)},
++      {"SRNP_RACERS", "1"},
++      {"SRNP_LOBBY", "2"},
++      {"SRNP_DELAY", std::to_string(match.delay)},
++      {"SRNP_TAG", tag},
++  };
++  environment.kept = {
++      {"SRNP_INPUT", "manette"},
++      {"SRNP_CHECK", "60"},
++      {"MODERNGEKKO_STATICRECOMP", "1"},
++  };
++  return environment;
++}
++}  // namespace moderngekko::frontend::online
+diff --git a/tools/launcher_online.hpp b/tools/launcher_online.hpp
+new file mode 100644
+index 0000000..829689c
+--- /dev/null
++++ b/tools/launcher_online.hpp
+@@ -0,0 +1,197 @@
++#pragma once
++
++// SR-Source Net Plus: Online/LAN play from the launcher (PLAY > ONLINE / LAN).
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// HOST runs the relay inside the launcher (Relay: the lockstep of tools/srnp/relais.py, the same lines
++// for the runners, plus a room before the match); CONNECT joins the room of a host. Every launcher, the
++// host's too, is a client of that room (Client): its player gets a seat (P1 is the host), says ready;
++// the host sets the race (course, laps, racers, input delay) and starts it. Each launcher then starts
++// its game with the relay's address and its seat in the match, in the lobby through the game's own
++// menus (SRNP_LOBBY=2): every player chooses character and gear in the game's Player Entry and presses
++// Start, the waiting screen shows everyone, then the race runs in lockstep from the same start state.
++// When every game has closed, the room is back for the next race.
++//
++// Room lines (text, LF), on the relay's port, from a launcher:
++//   JOIN <protocol> <tag> <state> [<host key>]   first line; <state>: the start state's fingerprint
++//   LREADY <0|1>                                 ready or not (the host is always ready)
++//   LRULES <course> <laps> <racers> <delay>      the host's race
++//   LSTART                                       the host starts the match
++//   LGONE                                        this launcher's game has closed (or did not start)
++// to the launchers:
++//   WELCOME <seat> <host 0|1>  |  REFUSED <why>  (version, full, running)
++//   MEMBERS <seat>:<tag>:<ready>:<state>:<playing>,...   at every change
++//   LRULES <course> <laps> <racers> <delay>
++//   MATCH <seats> <seat> <delay>                 start the game: this seat of that many
++//   ROOM                                         every game has closed: the room again
++// A connection whose first line is HELLO is a runner's: from there on, relais.py's protocol (see its
++// docstring and srnp_relay.cpp), the race's rules being the room's (the runners' RULES are ignored).
++
++#include "netplay_address.hpp"
++
++#include <array>
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace moderngekko::frontend::online
++{
++inline constexpr const char* PROTOCOL = "SRNP-ONLINE-1";
++inline constexpr std::uint16_t DEFAULT_PORT = 7845;
++inline constexpr int MAX_PLAYERS = 8;
++inline constexpr int COURSES = 16;
++inline constexpr int MAX_LAPS = 9;
++inline constexpr int MAX_DELAY = 10;
++
++// The courses by the game's number (1-16), as the game's title cards name them (the runner's waiting
++// screen has the same list).
++inline constexpr std::array<const char*, 17> COURSE_NAMES = {
++    "",           "Metal City",     "Splash Canyon",     "Egg Factory",   "Green Cave",
++    "Sand Ruins", "Babylon Garden", "Digital Dimension", "SEGA Carnival", "Night Chase",
++    "Red Canyon", "Ice Factory",    "White Cave",        "Dark Desert",   "Sky Road",
++    "Babylon Guardian", "SEGA Illusion"};
++
++// The race the host sets: the course (1-16), laps (1-9), racers (the players to 8: the AI drives the
++// others) and the input delay in frames ("delay based": a press reaches every machine that many frames
++// later).
++struct Rules
++{
++  int course = 1;
++  int laps = 3;
++  int racers = 8;
++  int delay = 2;
++
++  bool operator==(const Rules&) const = default;
++};
++
++Rules Clamped(Rules rules);
++
++// A player in the room.
++struct Member
++{
++  int seat = -1;       // 0 = P1, the host
++  std::string tag;     // up to 8 of A-Z 0-9
++  bool ready = false;  // the host always is
++  std::string state;   // the start state's fingerprint, "-" without one
++  bool playing = false;  // its game is open (a match is on)
++};
++
++// What a launcher knows of the room, read each frame by the lobby.
++struct RoomView
++{
++  enum class Link
++  {
++    Connecting,
++    Joined,
++    Refused,  // the host said no: error says why
++    Lost,     // could not connect, or the connection closed: error says why
++  };
++  Link link = Link::Connecting;
++  std::string error;
++  int seat = -1;
++  bool host = false;
++  std::vector<Member> members;
++  Rules rules;
++  bool match = false;  // a match is on
++};
++
++// MATCH: this launcher starts its game, as that seat of that many.
++struct MatchStart
++{
++  int seats = 1;
++  int seat = 0;
++  int delay = 2;
++};
++
++// The host's relay, on its own thread: the room, then the lockstep of the match.
++class Relay
++{
++public:
++  Relay();
++  ~Relay();
++  Relay(const Relay&) = delete;
++  Relay& operator=(const Relay&) = delete;
++
++  // Listens on every IPv4 address of this computer. The journal says who came, the rules, the
++  // frames closed and the checksums ("identical" or "DIVERGENCE"). False, with why, when the port
++  // can't be had.
++  bool Start(std::uint16_t port, const std::filesystem::path& journal, std::string* error);
++  // The key the host's own launcher joins with, to be P1.
++  const std::string& HostKey() const;
++
++private:
++  struct Impl;
++  std::unique_ptr<Impl> m_impl;
++};
++
++// A launcher in a room, on its own thread.
++class Client
++{
++public:
++  Client(std::string host, std::uint16_t port, std::string tag, std::string state,
++         std::string host_key = {});
++  ~Client();
++  Client(const Client&) = delete;
++  Client& operator=(const Client&) = delete;
++
++  RoomView View() const;
++  // The match to start, once.
++  std::optional<MatchStart> TakeMatch();
++  void SetReady(bool ready);
++  void SetRules(const Rules& rules);
++  void StartMatch();
++  void GameClosed();
++  const std::string& Host() const;
++  std::uint16_t Port() const;
++
++private:
++  struct Impl;
++  std::unique_ptr<Impl> m_impl;
++};
++
++// Up to 8 characters, A-Z and 0-9, upper case (the runner's tag).
++std::string CleanTag(std::string_view text);
++// FNV-1a 64 of the file, 16 hex digits; "-" when it can't be read.
++std::string Fingerprint(const std::filesystem::path& file);
++
++// This computer's IPv4 addresses that others may reach, with the kind of network each is on (home
++// first), as "ip:port".
++std::vector<std::pair<AddressKind, std::string>> ThisComputersAddresses(std::uint16_t port);
++
++// The choices of Online/LAN play, in <user folder>/online.ini.
++struct Settings
++{
++  std::string tag;
++  std::string address = "127.0.0.1";
++  std::uint16_t port = DEFAULT_PORT;
++  std::filesystem::path start_state;
++  Rules rules;
++};
++Settings LoadSettings(const std::filesystem::path& user_directory, std::string_view nickname);
++bool SaveSettings(const std::filesystem::path& user_directory, const Settings& settings);
++
++// The game's own user folder for online play, <user folder>/Online, made again before each match
++// from the player's: Dolphin.ini and config.ini as theirs, with the online changes (the pad on port 4,
++// which the game does not see, read by the runner and sent to the relay; port 1 a keyboard with no
++// key, so that only the relay's presses reach the game), the textures of their Load folder, and
++// the labels mod (srnp_etiquettes) on when one of `mod_folders` has it. Empty, with why, on failure.
++std::filesystem::path PrepareGameFolder(const std::filesystem::path& user_directory,
++                                        std::string_view keyboard_device,
++                                        const std::vector<std::filesystem::path>& mod_folders,
++                                        std::string* error);
++
++// The runner's environment for the match (SRNP_*): set ones replace the launcher's, kept ones only
++// when the launcher's environment has none (tests set their own).
++struct RunnerEnvironment
++{
++  std::vector<std::pair<std::string, std::string>> set;
++  std::vector<std::pair<std::string, std::string>> kept;
++};
++RunnerEnvironment MatchEnvironment(const MatchStart& match, const std::string& relay_address,
++                                   const std::string& tag);
++}  // namespace moderngekko::frontend::online
+diff --git a/tools/launcher_online_ui.hpp b/tools/launcher_online_ui.hpp
+new file mode 100644
+index 0000000..fc6112f
+--- /dev/null
++++ b/tools/launcher_online_ui.hpp
+@@ -0,0 +1,529 @@
++#pragma once
++
++// SR-Source Net Plus: the windows of Online/LAN play in the launcher (launcher_online.hpp): the one
++// that asks HOST or CONNECT, and the room (the lobby) where the players gather and the host sets the
++// race. Drawn from plain data, with the launcher's look and the Netplay lobby's pieces
++// (netplay_lobby_ui.hpp).
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "launcher_online.hpp"
++#include "launcher_text.hpp"
++#include "launcher_ui.hpp"
++#include "netplay_lobby_ui.hpp"
++#include "windows_firewall.hpp"
++
++#include <imgui.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <filesystem>
++#include <optional>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace moderngekko::frontend::ui
++{
++// What the Online/LAN play window shows and edits.
++struct OnlineDialog
++{
++  bool hosting = true;
++  std::array<char, 16> tag{};
++  std::array<char, 256> address{};
++  int port = online::DEFAULT_PORT;
++  std::array<char, 1024> start_state{};
++  bool show_address = false;
++};
++
++enum class OnlineChoice
++{
++  None,
++  Host,
++  Connect,
++  Cancel,
++};
++
++inline void OnlineDialogFrom(OnlineDialog& dialog, const online::Settings& settings)
++{
++  std::snprintf(dialog.tag.data(), dialog.tag.size(), "%s", settings.tag.c_str());
++  std::snprintf(dialog.address.data(), dialog.address.size(), "%s", settings.address.c_str());
++  dialog.port = settings.port;
++  std::snprintf(dialog.start_state.data(), dialog.start_state.size(), "%s",
++                text::PathText(settings.start_state).c_str());
++}
++
++inline void OnlineDialogTo(const OnlineDialog& dialog, online::Settings& settings)
++{
++  settings.tag = online::CleanTag(dialog.tag.data());
++  settings.address = dialog.address.data();
++  settings.port = static_cast<std::uint16_t>(std::clamp(dialog.port, 1, 65535));
++  settings.start_state = text::TextPath(dialog.start_state.data());
++}
++
++// The "Online/LAN play" window (a modal popup the caller opened as "Online/LAN play##online"):
++// HOST or CONNECT, the player's tag, the host's address (CONNECT), the TCP port, and the start state
++// (the game state every match starts from: the same file for everyone). `savestates`: the user's,
++// offered in a list. `firewall` (Windows): the host can let the launcher through.
++inline OnlineChoice DrawOnlineDialog(OnlineDialog& dialog, std::span<const fs::path> savestates,
++                                     FirewallRule& firewall, const fs::path& launcher, ImFont* bold,
++                                     float scale, bool cancel)
++{
++  OnlineChoice choice = OnlineChoice::None;
++  ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
++  ImGui::SetNextWindowSize(ImVec2(600 * scale, 0.0f));
++  if (!ImGui::BeginPopupModal("Online/LAN play##online", nullptr, ImGuiWindowFlags_NoResize))
++    return choice;
++  ImGui::PushFont(bold, 0.0f);
++  ImGui::TextUnformatted(Tr("Online / LAN play"));
++  ImGui::PopFont();
++  ImGui::Spacing();
++  const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
++  if (DrawChoiceButton(Tr("HOST"), dialog.hosting, ImVec2(half, 34 * scale), bold, scale))
++    dialog.hosting = true;
++  ImGui::SameLine();
++  if (DrawChoiceButton(Tr("CONNECT"), !dialog.hosting, ImVec2(half, 34 * scale), bold, scale))
++    dialog.hosting = false;
++  ImGui::Spacing();
++  ImGui::PushTextWrapPos(0.0f);
++  ImGui::TextDisabled("%s", dialog.hosting
++                                ? Tr("Up to 8 players, one per computer. Your friends connect to this "
++                                     "computer's address; you set the race and start it.")
++                                : Tr("Type the address the host gives you (its TCP port after a colon)."));
++  ImGui::TextDisabled("%s", Tr("Everyone chooses a character and a gear in the game's Player Entry, "
++                               "then the race starts for everyone at once."));
++  ImGui::PopTextWrapPos();
++  ImGui::Spacing();
++
++  float label_width = 0.0f;
++  for (const char* label : {Tr("Player tag"), Tr("Host address"), Tr("TCP port"), Tr("Start state")})
++    label_width = std::max(label_width, ImGui::CalcTextSize(label).x);
++  label_width += ImGui::GetStyle().ItemInnerSpacing.x;
++
++  ImGui::SetNextItemWidth(160 * scale);
++  ImGui::InputText(Tr("Player tag"), dialog.tag.data(), 9, ImGuiInputTextFlags_CharsUppercase |
++                                                              ImGuiInputTextFlags_CharsNoBlank);
++  ImGui::SameLine();
++  ImGui::TextDisabled("%s", Tr("(3 to 8 letters or digits)"));
++  if (!dialog.hosting)
++  {
++    // Hidden until Show, as the Netplay window does: an address identifies a connection.
++    const char* toggle = dialog.show_address ? Tr("Hide") : Tr("Show");
++    const float toggle_width =
++        ImGui::CalcTextSize(toggle).x + ImGui::GetStyle().FramePadding.x * 2.0f;
++    ImGui::SetNextItemWidth(-label_width - toggle_width - ImGui::GetStyle().ItemSpacing.x);
++    ImGui::InputText("##online_address", dialog.address.data(), dialog.address.size(),
++                     dialog.show_address ? 0 : ImGuiInputTextFlags_Password);
++    ImGui::SameLine();
++    if (ImGui::Button(toggle))
++      dialog.show_address = !dialog.show_address;
++    ImGui::SameLine();
++    ImGui::TextUnformatted(Tr("Host address"));
++  }
++  else
++  {
++    ImGui::SetNextItemWidth(150 * scale);
++    ImGui::InputInt(Tr("TCP port"), &dialog.port);
++    dialog.port = std::clamp(dialog.port, 1, 65535);
++  }
++
++  // The start state: one of the user's savestates, or any file.
++  ImGui::SetNextItemWidth(-label_width);
++  const std::string chosen = text::PathText(text::TextPath(dialog.start_state.data()).filename());
++  if (ImGui::BeginCombo(Tr("Start state"), chosen.empty() ? Tr("(none)") : chosen.c_str()))
++  {
++    for (const fs::path& state : savestates)
++    {
++      const std::string name = text::PathText(state.filename());
++      const bool selected = text::PathText(state) == dialog.start_state.data();
++      if (ImGui::Selectable(name.c_str(), selected))
++        std::snprintf(dialog.start_state.data(), dialog.start_state.size(), "%s",
++                      text::PathText(state).c_str());
++    }
++    if (savestates.empty())
++      ImGui::TextDisabled("%s", Tr("No savestate in StateSaves: type the file's path below."));
++    ImGui::EndCombo();
++  }
++  ImGui::SetNextItemWidth(-label_width);
++  ImGui::InputText("##online_state_path", dialog.start_state.data(), dialog.start_state.size());
++  ImGui::PushTextWrapPos(0.0f);
++  std::error_code ec;
++  const bool state_there =
++      dialog.start_state[0] != '\0' && fs::is_regular_file(text::TextPath(dialog.start_state.data()), ec);
++  if (!state_there)
++    ImGui::TextColored(LOBBY_AMBER, "%s",
++                       Tr("A match starts from a savestate made on Player Entry. Every player needs "
++                          "the same file."));
++  else
++    ImGui::TextDisabled("%s", Tr("Every player needs this same file: the lobby checks it."));
++  ImGui::PopTextWrapPos();
++
++  // Delay based now; rollback later.
++  ImGui::Spacing();
++  ImGui::TextDisabled("%s", Tr("NETCODE"));
++  DrawChoiceButton(Tr("DELAY BASED"), true, ImVec2(half, 30 * scale), bold, scale);
++  ImGui::SameLine();
++  ImGui::BeginDisabled();
++  DrawChoiceButton(Tr("ROLLBACK (LATER)"), false, ImVec2(half, 30 * scale), bold, scale);
++  ImGui::EndDisabled();
++
++#if defined(_WIN32)
++  if (dialog.hosting)
++  {
++    const FirewallResult result = firewall.Result();
++    ImGui::Spacing();
++    ImGui::PushTextWrapPos(0.0f);
++    ImGui::TextDisabled("%s", Tr("If your friends can't connect, the Windows firewall may be "
++                                 "blocking the launcher. Windows asks for permission to change it."));
++    ImGui::BeginDisabled(result == FirewallResult::Working);
++    ImGui::PushStyleColor(ImGuiCol_Text, LAUNCHER_ACCENT);
++    const bool allow = ImGui::Button(Tr("Allow the launcher in the Windows firewall"));
++    ImGui::PopStyleColor();
++    ImGui::EndDisabled();
++    if (allow)
++      firewall.Allow(launcher, "SR-Source Net Plus Online");
++    if (result == FirewallResult::Allowed)
++      ImGui::TextColored(LAUNCHER_ACCENT, "%s", Tr("Done: Windows lets online players in."));
++    else if (result == FirewallResult::Declined || result == FirewallResult::Failed)
++      ImGui::TextColored(LOBBY_AMBER, "%s", Tr("Windows did not change its firewall."));
++    ImGui::PopTextWrapPos();
++  }
++#else
++  (void)firewall;
++  (void)launcher;
++#endif
++
++  const std::string tag = online::CleanTag(dialog.tag.data());
++  const bool address_missing = !dialog.hosting && dialog.address[0] == '\0';
++  const bool can_go = tag.size() >= 3 && state_there && !address_missing;
++  ImGui::Spacing();
++  ImGui::Separator();
++  ImGui::Spacing();
++  ImGui::BeginDisabled(!can_go);
++  if (DrawLobbyButton(dialog.hosting ? Tr("HOST") : Tr("CONNECT"), ImVec2(half, 38 * scale),
++                      LobbyButtonLook::Primary, bold))
++    choice = dialog.hosting ? OnlineChoice::Host : OnlineChoice::Connect;
++  ImGui::EndDisabled();
++  ImGui::SameLine();
++  if (ImGui::Button(Tr("Cancel"), ImVec2(half, 38 * scale)) || cancel)
++    choice = OnlineChoice::Cancel;
++  if (choice != OnlineChoice::None)
++    ImGui::CloseCurrentPopup();
++  ImGui::EndPopup();
++  return choice;
++}
++
++// What the room shows besides the room itself.
++struct OnlineLobbyInfo
++{
++  bool hosting = false;
++  std::string host_address;  // the address this launcher connected to
++  std::vector<std::pair<AddressKind, std::string>> addresses;  // the host's, for its friends
++  std::string own_state;     // this player's start state fingerprint
++  std::string state_name;    // its file name
++  std::string status;        // the last thing that happened (a game that did not start...)
++};
++
++struct OnlineLobbyActions
++{
++  bool leave = false;
++  bool toggle_ready = false;
++  bool start = false;
++  bool rules_changed = false;
++};
++
++// The room, filling the launcher's window (a modal popup the caller opened as "##online_lobby").
++// `rules`: the host edits them here (rules_changed says when); the others see the room's.
++inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const OnlineLobbyInfo& info,
++                                          online::Rules& rules, LobbyState& state, ImFont* bold,
++                                          float scale)
++{
++  OnlineLobbyActions actions;
++  const ImGuiViewport* viewport = ImGui::GetMainViewport();
++  ImGui::SetNextWindowPos(viewport->WorkPos);
++  ImGui::SetNextWindowSize(viewport->WorkSize);
++  ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.55f));
++  const bool open = ImGui::BeginPopupModal(
++      "##online_lobby", nullptr,
++      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
++  ImGui::PopStyleColor();
++  if (!open)
++    return actions;
++  const ImGuiStyle& style = ImGui::GetStyle();
++  // The card in the middle, not wider than it needs.
++  const float width = std::min(ImGui::GetContentRegionAvail().x, 860.0f * scale);
++  ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - width) * 0.5f);
++  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.067f, 0.067f, 0.075f, 0.92f));
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22.0f * scale, 16.0f * scale));
++  ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14.0f * scale);
++  ImGui::BeginChild("##online_card", ImVec2(width, ImGui::GetContentRegionAvail().y),
++                    ImGuiChildFlags_NavFlattened | ImGuiChildFlags_AlwaysUseWindowPadding);
++  ImGui::PopStyleVar(2);
++  ImGui::PopStyleColor();
++
++  // Title line: what this is, this computer's part, the netcode.
++  ImGui::PushFont(bold, style.FontSizeBase * 1.5f);
++  ImGui::AlignTextToFramePadding();
++  ImGui::TextUnformatted(Tr("ONLINE / LAN"));
++  ImGui::PopFont();
++  ImGui::SameLine(0.0f, 14.0f * scale);
++  DrawStatusPill(info.hosting ? Tr("HOST") : Tr("CONNECTED"), LAUNCHER_ACCENT, scale, false);
++  ImGui::SameLine();
++  DrawStatusPill(Tr("DELAY BASED"), LOBBY_FREE_SEAT, scale, false);
++  ImGui::PushTextWrapPos(0.0f);
++  ImGui::TextDisabled("%s", Format(Tr("Input delay: %d frames  \xC2\xB7  start state: %s"),
++                                   room.rules.delay, info.state_name.c_str())
++                                .c_str());
++  ImGui::PopTextWrapPos();
++  ImGui::Spacing();
++
++  using Link = online::RoomView::Link;
++  if (room.link != Link::Joined)
++  {
++    BeginSection("##online_link", info.hosting ? Tr("OPENING THE ROOM") : Tr("HOST"));
++    ImGui::PushTextWrapPos(0.0f);
++    if (room.link == Link::Connecting)
++    {
++      ImGui::TextUnformatted(Format(Tr("Connecting to %s..."), info.host_address.c_str()).c_str());
++    }
++    else
++    {
++      std::string why = room.error;
++      if (why == "version")
++        why = Tr("the host runs another version of SR-Source Net Plus");
++      else if (why == "full")
++        why = Tr("the room is full (8 players)");
++      else if (why == "running")
++        why = Tr("a race is on: try again when it is over");
++      else if (why == "no answer" || why == "unknown address")
++        why = Tr("nobody answered at this address. Check the address and the port, and that the "
++                 "host's firewall lets the launcher in");
++      ImGui::TextColored(LOBBY_RED, "%s",
++                         Format(Tr("Could not join %s: %s."), info.host_address.c_str(), why.c_str())
++                             .c_str());
++    }
++    ImGui::PopTextWrapPos();
++    EndSection();
++    if (DrawLobbyButton(Tr("BACK"), ImVec2(-1.0f, 42.0f * scale), LobbyButtonLook::Plain, bold))
++      actions.leave = true;
++    ImGui::EndChild();
++    if (actions.leave)
++      ImGui::CloseCurrentPopup();
++    ImGui::EndPopup();
++    return actions;
++  }
++
++  // Two columns: the players on the left; where friends connect and the race on the right.
++  const bool columns = BeginPageColumns("##online_columns", 0.48f);
++
++  // The players, P1 to P8.
++  const online::Member* host_member = nullptr;
++  for (const online::Member& member : room.members)
++    host_member = member.seat == 0 ? &member : host_member;
++  const std::string host_state = host_member ? host_member->state : info.own_state;
++  BeginSection("##online_players",
++               Format(Tr("PLAYERS  \xC2\xB7  %d / 8"), static_cast<int>(room.members.size())).c_str());
++  if (ImGui::BeginTable("##online_players_table", 3, ImGuiTableFlags_None))
++  {
++    ImGui::TableSetupColumn("seat", ImGuiTableColumnFlags_WidthFixed);
++    ImGui::TableSetupColumn("tag", ImGuiTableColumnFlags_WidthStretch);
++    ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed);
++    const float text_offset = 3.0f * scale;
++    for (int seat = 0; seat < online::MAX_PLAYERS; ++seat)
++    {
++      const online::Member* member = nullptr;
++      for (const online::Member& m : room.members)
++        member = m.seat == seat ? &m : member;
++      ImGui::PushID(seat);
++      ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetFrameHeight());
++      ImGui::TableNextColumn();
++      DrawStatusPill(Format("P%d", seat + 1).c_str(), member ? LAUNCHER_ACCENT : LOBBY_FREE_SEAT, scale,
++                     false);
++      ImGui::TableNextColumn();
++      ImGui::SetCursorPosY(ImGui::GetCursorPosY() + text_offset);
++      if (!member)
++      {
++        ImGui::TextDisabled("%s", Tr("Free"));
++      }
++      else
++      {
++        ImGui::PushFont(bold, 0.0f);
++        ImGui::TextUnformatted(member->tag.empty() ? "-" : member->tag.c_str());
++        ImGui::PopFont();
++        const char* tag = seat == room.seat ? Tr("(you)") : seat == 0 ? Tr("(host)") : nullptr;
++        if (tag)
++        {
++          ImGui::SameLine();
++          ImGui::TextDisabled("%s", tag);
++        }
++      }
++      ImGui::TableNextColumn();
++      if (member)
++      {
++        if (member->state != host_state)
++          DrawStatusPill(Tr("OTHER START STATE"), LOBBY_RED, scale, false);
++        else if (member->playing)
++          DrawStatusPill(Tr("RACING"), LAUNCHER_ACCENT, scale, false);
++        else if (seat == 0)
++          DrawStatusPill(Tr("HOST"), LAUNCHER_ACCENT, scale, false);
++        else
++          DrawStatusPill(member->ready ? Tr("READY") : Tr("NOT READY"),
++                         member->ready ? LAUNCHER_ACCENT : LOBBY_AMBER, scale, false);
++      }
++      ImGui::PopID();
++    }
++    ImGui::EndTable();
++  }
++  ImGui::PushTextWrapPos(0.0f);
++  ImGui::TextDisabled("%s", Tr("A free place is the AI's when the host sets more racers than players."));
++  ImGui::PopTextWrapPos();
++  EndSection();
++
++  if (columns)
++    NextPageColumn();
++  // Where friends connect.
++  if (info.hosting)
++  {
++    BeginSection("##online_invite", Tr("INVITE YOUR FRIENDS"));
++    if (!info.addresses.empty())
++      DrawShowAddressesSwitch(state);
++    float label_width = 0.0f;
++    for (const auto& [kind, address] : info.addresses)
++      label_width = std::max(label_width, ImGui::CalcTextSize(LobbyAddressLabel(kind)).x);
++    label_width += 24.0f * scale;
++    for (const auto& [kind, address] : info.addresses)
++      DrawAddressRow(LobbyAddressLabel(kind), address, label_width, state);
++    ImGui::PushTextWrapPos(0.0f);
++    ImGui::TextDisabled("%s", info.addresses.empty()
++                                  ? Tr("No network found. Connect this computer to your network or "
++                                       "to Tailscale.")
++                                  : Tr("Your friends choose ONLINE / LAN, then CONNECT, and type this "
++                                       "address. Over the internet: Tailscale, or this TCP port opened "
++                                       "on your router."));
++    ImGui::PopTextWrapPos();
++    EndSection();
++  }
++  else
++  {
++    BeginSection("##online_host", Tr("HOST"));
++    DrawShowAddressesSwitch(state);
++    ImGui::TextUnformatted(LobbyShownAddress(state, info.host_address).c_str());
++    EndSection();
++  }
++
++  // The race: the host sets it, the others see it.
++  const int players = std::max(1, static_cast<int>(room.members.size()));
++  BeginSection("##online_race", Tr("THE RACE"));
++  if (info.hosting && !room.match)
++  {
++    const float field = std::min(320.0f * scale, ImGui::GetContentRegionAvail().x * 0.5f);
++    online::Rules edited = rules;
++    ImGui::SetNextItemWidth(field);
++    if (ImGui::BeginCombo(Tr("Course"), online::COURSE_NAMES[static_cast<std::size_t>(edited.course)]))
++    {
++      for (int course = 1; course <= online::COURSES; ++course)
++      {
++        const bool selected = course == edited.course;
++        if (ImGui::Selectable(online::COURSE_NAMES[static_cast<std::size_t>(course)], selected))
++          edited.course = course;
++        if (selected)
++          ImGui::SetItemDefaultFocus();
++      }
++      ImGui::EndCombo();
++    }
++    ImGui::SetNextItemWidth(field);
++    ImGui::SliderInt(Tr("Laps"), &edited.laps, 1, online::MAX_LAPS);
++    ImGui::SetNextItemWidth(field);
++    edited.racers = std::max(edited.racers, players);
++    ImGui::SliderInt(Tr("Racers"), &edited.racers, players, online::MAX_PLAYERS);
++    ImGui::SameLine();
++    ImGui::TextDisabled("%s", edited.racers > players
++                                  ? Format(Tr("(the AI drives %d)"), edited.racers - players).c_str()
++                                  : Tr("(no AI)"));
++    ImGui::SetNextItemWidth(field);
++    ImGui::SliderInt(Tr("Input delay (frames)"), &edited.delay, 0, online::MAX_DELAY);
++    edited = online::Clamped(edited);
++    if (edited != rules)
++    {
++      rules = edited;
++      actions.rules_changed = true;
++    }
++  }
++  else
++  {
++    const online::Rules& r = room.rules;
++    const int ai = std::max(0, r.racers - players);
++    ImGui::TextUnformatted(online::COURSE_NAMES[static_cast<std::size_t>(r.course)]);
++    ImGui::SameLine();
++    ImGui::TextDisabled("%s", Format(Tr("\xC2\xB7  %d lap(s)  \xC2\xB7  %d racers%s"), r.laps,
++                                     std::max(r.racers, players),
++                                     ai ? Format(Tr(" (the AI drives %d)"), ai).c_str() : "")
++                                  .c_str());
++  }
++  ImGui::PushTextWrapPos(0.0f);
++  ImGui::TextDisabled("%s", Tr("Once the host starts: choose your character and gear in the game's "
++                               "Player Entry and press Start. The race begins when everyone has."));
++  ImGui::PopTextWrapPos();
++  EndSection();
++  if (columns)
++    EndPageColumns();
++
++  // Bottom: Ready or Start, and Leave.
++  const bool everyone_ready = std::ranges::all_of(room.members, [&](const online::Member& m) {
++    return (m.ready || m.seat == 0) && m.state == host_state;
++  });
++  const float buttons_height = 46.0f * scale;
++  std::string note = info.status;
++  const char* missing = nullptr;
++  if (room.match)
++    missing = Tr("A race is on.");
++  else if (info.hosting && !everyone_ready)
++    missing = Tr("Everyone must be ready, with the same start state, before the race can start.");
++  else if (!info.hosting)
++    missing = Tr("Press I'M READY, then wait for the host to start.");
++  if (missing)
++    note += (note.empty() ? "" : "  \xC2\xB7  ") + std::string(missing);
++  const float note_height =
++      ImGui::CalcTextSize(note.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y;
++  ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - 16.0f * scale -
++                                                            buttons_height - style.ItemSpacing.y -
++                                                            note_height));
++  const float third = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x) / 3.0f;
++  const online::Member* me = nullptr;
++  for (const online::Member& m : room.members)
++    me = m.seat == room.seat ? &m : me;
++  if (info.hosting)
++  {
++    ImGui::BeginDisabled(!everyone_ready || room.match);
++    if (DrawLobbyButton(Tr("START THE RACE"), ImVec2(third * 2.0f, buttons_height),
++                        everyone_ready && !room.match ? LobbyButtonLook::Primary : LobbyButtonLook::Plain,
++                        bold))
++      actions.start = true;
++    ImGui::EndDisabled();
++  }
++  else
++  {
++    const bool ready = me && me->ready;
++    ImGui::BeginDisabled(room.match);
++    if (DrawLobbyButton(ready ? Tr("READY  \xC2\xB7  CANCEL") : Tr("I'M READY"),
++                        ImVec2(third * 2.0f, buttons_height),
++                        ready ? LobbyButtonLook::Ready : LobbyButtonLook::Primary, bold))
++      actions.toggle_ready = true;
++    ImGui::EndDisabled();
++  }
++  ImGui::SameLine();
++  if (DrawLobbyButton(info.hosting ? Tr("CLOSE THE ROOM") : Tr("LEAVE"), ImVec2(-1.0f, buttons_height),
++                      LobbyButtonLook::Plain, bold))
++    actions.leave = true;
++  ImGui::PushTextWrapPos(0.0f);
++  if (!note.empty())
++    ImGui::TextDisabled("%s", note.c_str());
++  ImGui::PopTextWrapPos();
++
++  ImGui::EndChild();
++  if (actions.leave)
++    ImGui::CloseCurrentPopup();
++  ImGui::EndPopup();
++  return actions;
++}
++}  // namespace moderngekko::frontend::ui
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index fd6c131..8347d53 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -14,6 +14,7 @@
+ #include "launcher_line_break.hpp"
+ #include "launcher_handoff.hpp"
+ #include "launcher_loading.hpp"
++#include "launcher_online_ui.hpp"
+ #include "launcher_process.hpp"
+ #include "launcher_transition.hpp"
+ #include "launcher_user_folder.hpp"
+@@ -588,6 +589,10 @@ void SDLCALL FileDialogCallback(void* userdata, const char* const* filelist, int
+ 
+ fs::path SiblingRunner(const char* argv0)
+ {
++  // SR-Source Net Plus (development): SRNP_RUNNER=<runner> starts that one instead, for a launcher
++  // built apart from the runner it tests.
++  if (const auto runner = EnvironmentPath("SRNP_RUNNER"); runner && fs::is_regular_file(*runner))
++    return *runner;
+   const fs::path self = ExecutableFile(argv0);
+   fs::path runner = MODERNGEKKO_RUNNER_FILENAME;
+ #if defined(_WIN32)
+@@ -3312,6 +3317,7 @@ int main(int argc, char** argv)
+     Solo,
+     Host,
+     Join,
++    Online,  // SR-Source Net Plus: a match of Online/LAN play (launcher_online.hpp)
+   };
+   bool done = false;
+   LaunchMode launch_mode = LaunchMode::None;
+@@ -3371,6 +3377,73 @@ int main(int argc, char** argv)
+   LaunchMode netplay_dialog_mode = LaunchMode::Host;
+   // Host Netplay's "Allow in the Windows firewall" (Windows only).
+   moderngekko::frontend::FirewallRule firewall_rule;
++  // SR-Source Net Plus: Online/LAN play (launcher_online.hpp). Its window (HOST or CONNECT), the
++  // host's relay, this launcher's place in a room (the room is shown while it is there), and the
++  // match its game joins.
++  namespace online = moderngekko::frontend::online;
++  online::Settings online_settings = online::LoadSettings(user_directory, config.netplay_nickname);
++  moderngekko::frontend::ui::OnlineDialog online_dialog;
++  std::unique_ptr<online::Relay> online_relay;
++  std::unique_ptr<online::Client> online_client;
++  online::MatchStart online_match;
++  online::Rules online_rules = online_settings.rules;
++  bool online_rules_sent = false;
++  moderngekko::frontend::ui::LobbyState online_lobby_state;
++  moderngekko::frontend::ui::OnlineLobbyInfo online_info;
++  moderngekko::frontend::FirewallRule online_firewall;
++  double online_addresses_at = -1.0e9;
++  std::vector<fs::path> online_savestates;
++  // Tests (SRNP_ONLINE_AUTO=host|connect, SRNP_ONLINE_READY=1, SRNP_ONLINE_START=<players>): the
++  // room without clicks; done once each per room.
++  bool online_auto_opened = false;
++  bool online_auto_ready = false;
++  bool online_auto_started = false;
++  // HOST: the relay on the chosen port, and this launcher in its room as P1; CONNECT: this launcher
++  // in the room at the address typed ("host:port", or the port of the window).
++  const auto open_online_room = [&](bool host) {
++    if (!ensure_controller())
++      return;
++    online_settings.tag = online::CleanTag(online_settings.tag);
++    online::SaveSettings(user_directory, online_settings);
++    const std::string state = online::Fingerprint(online_settings.start_state);
++    online_client.reset();
++    online_relay.reset();
++    online_info = {};
++    online_info.hosting = host;
++    online_info.own_state = state;
++    online_info.state_name = PathText(online_settings.start_state.filename());
++    online_rules = online_settings.rules;
++    online_rules_sent = false;
++    online_auto_ready = false;
++    online_auto_started = false;
++    if (host)
++    {
++      online_relay = std::make_unique<online::Relay>();
++      std::string error;
++      if (!online_relay->Start(online_settings.port, user_directory / "Logs" / "relay.log", &error))
++      {
++        online_relay.reset();
++        std::lock_guard lock(dialog.mutex);
++        dialog.error = Format(Tr("Could not open the room: %s."), error.c_str());
++        return;
++      }
++      online_info.host_address = "127.0.0.1:" + std::to_string(online_settings.port);
++      online_client = std::make_unique<online::Client>("127.0.0.1", online_settings.port,
++                                                       online_settings.tag, state,
++                                                       online_relay->HostKey());
++      online_addresses_at = -1.0e9;
++      return;
++    }
++    std::string address = online_settings.address;
++    std::uint16_t port = online_settings.port;
++    if (const auto split = moderngekko::frontend::SplitHostAndPort(address))
++    {
++      address = split->host;
++      port = split->port;
++    }
++    online_info.host_address = address + ":" + std::to_string(port);
++    online_client = std::make_unique<online::Client>(address, port, online_settings.tag, state);
++  };
+   // PLAY page summary, read again whenever the page is opened: the time
+   // played changes while the game runs and mods are added by hand.
+   std::uint64_t summary_time_played = 0;
+@@ -3457,11 +3530,58 @@ int main(int argc, char** argv)
+       transition.Back(now);
+       return false;
+     }
++    // SR-Source Net Plus, Online/LAN play: the game gets a user folder of its own for the match
++    // (online::PrepareGameFolder: the player's settings, the pad read for the relay), the start
++    // state, and the relay's settings in its environment (below).
++    fs::path game_user_directory = user_directory;
++    if (mode == LaunchMode::Online)
++    {
++#ifdef MODERNGEKKO_GAMECUBE_CONTROLLERS
++      const std::string online_keyboard(moderngekko::frontend::KeyboardDevice());
++#else
++      const std::string online_keyboard = "DInput/0/Keyboard Mouse";
++#endif
++      std::string online_error;
++      game_user_directory =
++          online::PrepareGameFolder(user_directory, online_keyboard, mod_folders, &online_error);
++      if (game_user_directory.empty())
++      {
++        session_error_title = Tr("Launch failed");
++        session_error = online_error;
++        session_error_log.clear();
++        transition.Back(now);
++        return false;
++      }
++    }
+     // UTF-8, as SDL_CreateProcess takes them (the runner reads them back as
+     // UTF-8 too, text_paths.hpp).
+     std::vector<std::string> argument_storage = {PathText(SiblingRunner(argv[0])), "--game",
+                                                  PathText(current_game), "--user-dir",
+-                                                 PathText(user_directory)};
++                                                 PathText(game_user_directory)};
++    SDL_Environment* environment = nullptr;
++    if (mode == LaunchMode::Online)
++    {
++      argument_storage.emplace_back("--load-state");
++      argument_storage.emplace_back(PathText(online_settings.start_state));
++      // The player's mods, as in a game started by PLAY (config.ini says which are on).
++      argument_storage.emplace_back("--mods");
++      argument_storage.emplace_back(PathText(user_directory / "Mods"));
++      const std::string relay_address =
++          online_info.hosting ? "127.0.0.1:" + std::to_string(online_settings.port)
++                              : online_client->Host() + ":" + std::to_string(online_client->Port());
++      const online::RunnerEnvironment wanted =
++          online::MatchEnvironment(online_match, relay_address, online_settings.tag);
++      environment = SDL_CreateEnvironment(true);
++      if (environment)
++      {
++        for (const auto& [name, value] : wanted.set)
++          SDL_SetEnvironmentVariable(environment, name.c_str(), value.c_str(), true);
++        for (const auto& [name, value] : wanted.kept)
++          SDL_SetEnvironmentVariable(environment, name.c_str(), value.c_str(), false);
++      }
++      std::cout << "launcher: online match, seat " << online_match.seat << " of " << online_match.seats
++                << ", relay " << relay_address << ", delay " << online_match.delay << " frames\n";
++    }
+     // With more than one game, the window takes the name of the one chosen.
+     if (moderngekko::frontend::PlaysSeveralGames() && current_metadata)
+     {
+@@ -3571,6 +3691,9 @@ int main(int argc, char** argv)
+         SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_STDOUT_POINTER, log_stream);
+         SDL_SetBooleanProperty(properties, SDL_PROP_PROCESS_CREATE_STDERR_TO_STDOUT_BOOLEAN,
+                                true);
++        if (environment)
++          SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_ENVIRONMENT_POINTER,
++                                 environment);
+         process = SDL_CreateProcessWithProperties(properties);
+         SDL_DestroyProperties(properties);
+       }
+@@ -3578,12 +3701,29 @@ int main(int argc, char** argv)
+         process_error = SDL_GetError();
+       SDL_CloseIO(log_stream);
+     }
++    else if (environment)
++    {
++      const SDL_PropertiesID properties = SDL_CreateProperties();
++      if (properties)
++      {
++        SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_ARGS_POINTER,
++                               arguments.data());
++        SDL_SetPointerProperty(properties, SDL_PROP_PROCESS_CREATE_ENVIRONMENT_POINTER,
++                               environment);
++        process = SDL_CreateProcessWithProperties(properties);
++        SDL_DestroyProperties(properties);
++      }
++      if (!process)
++        process_error = SDL_GetError();
++    }
+     else
+     {
+       process = SDL_CreateProcess(arguments.data(), false);
+       if (!process)
+         process_error = SDL_GetError();
+     }
++    if (environment)
++      SDL_DestroyEnvironment(environment);
+     if (!process)
+     {
+       session_error_title = Tr("Launch failed");
+@@ -3622,6 +3762,10 @@ int main(int argc, char** argv)
+       fs::remove(session.progress_file, ignored);
+     const GameSession ended = session;
+     session = {};
++    // Online/LAN play: the room hears that this game has closed (the match ends once every game
++    // has).
++    if (ended.mode == LaunchMode::Online && online_client)
++      online_client->GameClosed();
+     if (waited && exit_code == moderngekko::frontend::RUNNER_EXIT_QUIT)
+     {
+       quit_from_game = true;
+@@ -4306,9 +4450,22 @@ int main(int argc, char** argv)
+           ImGui::Spacing();
+           // With more than one game the button opens the game selection
+           // screen, so it says LAUNCH; the page keeps its PLAY name.
+-          if (DrawPrimaryButton(moderngekko::frontend::PlaysSeveralGames() ? Tr("LAUNCH") :
+-                                                                            Tr("PLAY"),
+-                                fonts.bold, 42 * scale, column_width))
++          // SR-Source Net Plus: beside PLAY (free play), ONLINE / LAN (launcher_online.hpp).
++          const float online_width = std::floor(column_width * 0.4f);
++          const float play_width = column_width - online_width - ImGui::GetStyle().ItemSpacing.x;
++          const bool play_clicked =
++              DrawPrimaryButton(moderngekko::frontend::PlaysSeveralGames() ? Tr("LAUNCH") : Tr("PLAY"),
++                                fonts.bold, 42 * scale, play_width);
++          ImGui::SameLine();
++          if (DrawPrimaryButton(Tr("ONLINE / LAN"), fonts.bold, 42 * scale, online_width))
++          {
++            moderngekko::frontend::ui::OnlineDialogFrom(online_dialog, online_settings);
++            online_savestates = PlaySavestates(user_directory);
++            ImGui::OpenPopup("Online/LAN play##online");
++          }
++          ImGui::SetItemTooltip("%s", Tr("Up to 8 players, one per computer: host a room or connect "
++                                         "to one."));
++          if (play_clicked)
+           {
+             // With more than one game, PLAY asks which one first.
+             if (moderngekko::frontend::PlaysSeveralGames())
+@@ -4671,6 +4828,21 @@ int main(int argc, char** argv)
+             ImGui::EndPopup();
+           }
+ 
++          // SR-Source Net Plus: the Online/LAN play window. HOST starts the relay here and joins
++          // its room; CONNECT joins the host's. The room shows over the launcher from then on.
++          {
++            const moderngekko::frontend::ui::OnlineChoice choice =
++                moderngekko::frontend::ui::DrawOnlineDialog(
++                    online_dialog, online_savestates, online_firewall, ExecutableFile(argv[0]),
++                    fonts.bold, scale, popup_cancel);
++            if (choice == moderngekko::frontend::ui::OnlineChoice::Host ||
++                choice == moderngekko::frontend::ui::OnlineChoice::Connect)
++            {
++              moderngekko::frontend::ui::OnlineDialogTo(online_dialog, online_settings);
++              open_online_room(choice == moderngekko::frontend::ui::OnlineChoice::Host);
++            }
++          }
++
+           if (show_patch_notes)
+           {
+             // The cards go under whichever column ends lower.
+@@ -6106,6 +6278,119 @@ int main(int argc, char** argv)
+       }
+     }
+ 
++    // SR-Source Net Plus, tests: SRNP_ONLINE_AUTO=host|connect opens the room as the Online/LAN play
++    // window would, with online.ini's choices (SRNP_ONLINE_STATE, SRNP_ONLINE_ADDRESS and
++    // SRNP_ONLINE_TAG change them); SRNP_ONLINE_RULES=<course>/<laps>/<racers>/<delay> sets the
++    // host's race.
++    if (!online_auto_opened && !fading)
++    {
++      online_auto_opened = true;
++      if (const char* automatic = std::getenv("SRNP_ONLINE_AUTO");
++          automatic && (std::string_view(automatic) == "host" || std::string_view(automatic) == "connect"))
++      {
++        if (const auto state = EnvironmentPath("SRNP_ONLINE_STATE"))
++          online_settings.start_state = *state;
++        if (const char* address = std::getenv("SRNP_ONLINE_ADDRESS"))
++          online_settings.address = address;
++        if (const char* tag = std::getenv("SRNP_ONLINE_TAG"))
++          online_settings.tag = tag;
++        if (const char* rules = std::getenv("SRNP_ONLINE_RULES"))
++        {
++          online::Rules r = online_settings.rules;
++          if (std::sscanf(rules, "%d/%d/%d/%d", &r.course, &r.laps, &r.racers, &r.delay) >= 2)
++            online_settings.rules = online::Clamped(r);
++        }
++        open_online_room(std::string_view(automatic) == "host");
++      }
++    }
++    // SR-Source Net Plus: the Online/LAN room, over the launcher while this launcher is in one and no
++    // game runs; its match starts this launcher's game.
++    if (online_client && !session.process && session_error.empty() && !fading)
++    {
++      const online::RoomView room = online_client->View();
++      const double now = static_cast<double>(SDL_GetTicksNS()) / 1e9;
++      if (online_info.hosting && now - online_addresses_at > 5.0)
++      {
++        online_info.addresses = online::ThisComputersAddresses(online_settings.port);
++        online_addresses_at = now;
++      }
++      if (room.link == online::RoomView::Link::Joined && room.host && !online_rules_sent)
++      {
++        online_client->SetRules(online_rules);
++        online_rules_sent = true;
++      }
++      const online::Member* me = nullptr;
++      for (const online::Member& member : room.members)
++        me = member.seat == room.seat ? &member : me;
++      // Tests: ready, and the host starts once that many players are ready.
++      if (room.link == online::RoomView::Link::Joined && !room.match && me)
++      {
++        const char* ready = std::getenv("SRNP_ONLINE_READY");
++        if (!room.host && ready && *ready == '1' && !me->ready && !online_auto_ready)
++        {
++          online_client->SetReady(true);
++          online_auto_ready = true;
++        }
++        // SRNP_ONLINE_START=<players>[:<seconds>]: that many seconds after they are all there and
++        // ready (pictures of the room).
++        const char* start = std::getenv("SRNP_ONLINE_START");
++        const bool all_ready = std::ranges::all_of(room.members, [&](const online::Member& m) {
++          return (m.ready || m.seat == 0) && m.state == me->state;
++        });
++        static double start_when = -1.0;
++        int start_players = 0;
++        double start_after = 0.0;
++        if (start)
++          std::sscanf(start, "%d:%lf", &start_players, &start_after);
++        const bool start_wanted = room.host && start_players > 0 &&
++                                  static_cast<int>(room.members.size()) >= start_players && all_ready;
++        if (!start_wanted)
++          start_when = -1.0;
++        else if (start_when < 0.0)
++          start_when = now + start_after;
++        if (start_wanted && now >= start_when && !online_auto_started)
++        {
++          online_client->StartMatch();
++          online_auto_started = true;
++        }
++      }
++      if (!ImGui::IsPopupOpen("##online_lobby"))
++        ImGui::OpenPopup("##online_lobby");
++      const moderngekko::frontend::ui::OnlineLobbyActions actions =
++          moderngekko::frontend::ui::DrawOnlineLobby(room, online_info, online_rules, online_lobby_state,
++                                                     fonts.bold, scale);
++      if (actions.rules_changed)
++      {
++        online_client->SetRules(online_rules);
++        online_settings.rules = online_rules;
++        online::SaveSettings(user_directory, online_settings);
++      }
++      if (actions.toggle_ready && me)
++        online_client->SetReady(!me->ready);
++      if (actions.start)
++        online_client->StartMatch();
++      if (const std::optional<online::MatchStart> match = online_client->TakeMatch())
++      {
++        online_match = *match;
++        online_info.status.clear();
++        if (launch_mode == LaunchMode::None && ensure_controller())
++        {
++          launch_mode = LaunchMode::Online;
++          done = true;
++        }
++        else
++        {
++          online_client->GameClosed();
++        }
++      }
++      if (actions.leave)
++      {
++        online_client.reset();
++        online_relay.reset();
++        pad_waits_for_release = true;
++      }
++    }
++
+     // Why the game failed, once the launcher is back: a window of the
+     // launcher's, as narrow as its other questions, over everything else.
+     if (!session.process && !session_error.empty() && !fading &&
+@@ -6188,7 +6473,12 @@ int main(int argc, char** argv)
+                                            ImGui::GetMainViewport()->Size.y);
+       }
+       if (!start_game(launch_mode, launch_from_black))
++      {
+         result = 1;
++        // Online/LAN play: a game that did not start leaves its seat to the AI.
++        if (launch_mode == LaunchMode::Online && online_client)
++          online_client->GameClosed();
++      }
+       launch_mode = LaunchMode::None;
+       launch_from_black = false;
+       done = false;
+-- 
+2.34.1.windows.1
+
