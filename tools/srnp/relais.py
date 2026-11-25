@@ -27,6 +27,8 @@ They are only shown (labels, results, waiting screen): nothing of the race depen
 Lobby (experimental): HELLO <seat> <seats> <delay> LOBBY says the seat will choose: it stays O until
 READY <seat> (UNREADY <seat>: back to choosing). PICK <seat> <character> <gear> at each change; the relay
 sends PICKS <c0>/<g0>,<c1>/<g1>,... ("-": none yet) to everyone; the runners set up the race with them.
+The host (seat 0) sends RULES 0 <course> <laps> (course 1-16, laps 1-9); the relay sends RULES <course>
+<laps> to everyone (and to each new connection); the runners write them into the game at GO.
 """
 import argparse
 import asyncio
@@ -70,6 +72,7 @@ class Relais:
         self.ck_ko = 0
         self.tags = [""] * sieges     # le tag de chaque siège (TAG), seulement affiché
         self.choix = [""] * sieges    # lobby : « perso/planche » de chaque siège (PICK)
+        self.regles = None            # lobby : (course, tours) de l'hôte (RULES)
         self.debut = time.monotonic()
 
     def log(self, texte):
@@ -211,11 +214,19 @@ class Relais:
                         await self.diffuser(self.ligne_tags())
                     if any(self.choix):
                         await self.diffuser(self.ligne_choix())
+                    if self.regles:
+                        await self.diffuser("RULES %d %d" % self.regles)
                 elif mots[0] == "PICK":
                     s_, c, g = int(mots[1]), int(mots[2]), int(mots[3])
                     if 0 <= s_ < self.sieges and 0 <= c <= 16 and 0 <= g < 64 and not self.go:
                         self.choix[s_] = f"{c}/{g}"
                         await self.diffuser(self.ligne_choix())
+                elif mots[0] == "RULES" and len(mots) == 4:
+                    s_, c, t = int(mots[1]), int(mots[2]), int(mots[3])
+                    if s_ == 0 and 1 <= c <= 16 and 1 <= t <= 9 and not self.go and (c, t) != self.regles:
+                        self.regles = (c, t)
+                        self.log(f"règles de l'hôte : course {c}, {t} tour(s)")
+                        await self.diffuser(f"RULES {c} {t}")
                 elif mots[0] in ("READY", "UNREADY"):
                     s_ = int(mots[1])
                     if 0 <= s_ < self.sieges and not self.go and self.etat[s_] != "X":

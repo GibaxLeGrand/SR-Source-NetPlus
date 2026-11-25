@@ -1,0 +1,231 @@
+From 801b41d5c00859958553e402213c4425527d5703 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:54:53 +0100
+Subject: [PATCH] Runner: the host's rules in the lobby (course and laps)
+
+The race's rules live in the game's memory (measured through the menus): the course at 0x806129AB
+(1 Metal City .. 16 SEGA Illusion, read when the race loads after Player Entry) and the laps at
+0x805D507B (the rule kept once Rule Settings is left; 0x803E2978 is only the menu's copy). In the
+lobby the host (seat 0) starts from the save state's rules and changes them while choosing: X/Y the
+course, R/L the laps (1-9); it sends RULES 0 <course> <laps>, the relay passes RULES <course> <laps>
+to everyone, and every runner writes them at GO, before the menu's Start. The waiting screen shows the
+course and laps under the counts, and the host's controls above the others.
+Measured with 2 runners: X, +, + gives SPLASH CANYON 3 LAPS on both screens; the race runs on Splash
+Canyon with LAP 1/3; 39 identical checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp          | 71 ++++++++++++++++++++++++++++-
+ src/runtime/srnp_relay.hpp          |  2 +
+ src/runtime/srnp_waiting_screen.cpp | 30 ++++++++++++
+ 3 files changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index e7b8ceb..dd76f3d 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -498,6 +498,48 @@ bool LobbyOn()
+   return on;
+ }
+ 
++// The race's rules in the game's memory (measured on 2026-11-25 through the menus): the course (1 Metal
++// City .. 16 SEGA Illusion), read when the race loads after Player Entry, and the laps (the rule the game
++// keeps once Rule Settings is left; 0x803E2978 is only the menu's copy). The host (seat 0) sets them in
++// the lobby; the relay passes them on (RULES <course> <laps>); every runner writes them at GO, before
++// the menu's Start, so the race loads the host's course.
++constexpr std::uint32_t kRuleCourse = 0x806129ABu, kRuleLaps = 0x805D507Bu;
++constexpr int kCourses = 16, kMaxLaps = 9;
++std::atomic<int> s_rule_course{-1}, s_rule_laps{-1};
++
++std::uint8_t* GuestByte(std::uint32_t address)
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  std::uint8_t* ram = memory.GetRAM();
++  const std::uint32_t offset = address - 0x80000000u;
++  return ram && offset < memory.GetRamSizeReal() ? ram + offset : nullptr;
++}
++
++bool TakeRules(const std::string& line)
++{
++  int course = 0, laps = 0;
++  if (std::sscanf(line.c_str(), "RULES %d %d", &course, &laps) != 2)
++    return false;
++  if (course >= 1 && course <= kCourses && laps >= 1 && laps <= kMaxLaps)
++    s_rule_course = course, s_rule_laps = laps;
++  return true;
++}
++
++void ApplyRules()
++{
++  const int course = s_rule_course, laps = s_rule_laps;
++  if (course < 1)
++    return;
++  std::uint8_t* c = GuestByte(kRuleCourse);
++  std::uint8_t* l = GuestByte(kRuleLaps);
++  if (!c || !l)
++    return;
++  std::fprintf(stderr, "[srnp relay] the host's rules: course %d (was %d), %d laps (was %d)\n", course, *c,
++               laps, *l);
++  *c = static_cast<std::uint8_t>(course);
++  *l = static_cast<std::uint8_t>(laps);
++}
++
+ // PICKS <c0>/<g0>,<c1>/<g1>,... ("-": none yet): every seat's choice, for the waiting screen and the race.
+ bool TakePicks(const std::string& line)
+ {
+@@ -522,6 +564,7 @@ bool TakePicks(const std::string& line)
+ // Tests: SRNP_LOBBY_AUTO=<c>/<g>/<seconds>[/<back>]: that choice, then ready, after that many seconds;
+ // with <back>, B that many seconds later (back to choosing), then A again after as many.
+ // SRNP_LOBBY_KEYS=<L R U D A B...>: those presses in place of the pad's, one every 0.5 s after 3 s.
++// The host (seat 0) also sets the rules while choosing: X/Y the course, R/L the laps (keys X Y + -).
+ struct LobbyLocal
+ {
+   int character = 0, gear = 0;
+@@ -546,6 +589,11 @@ bool LobbyStep(LobbyLocal* l)
+     l->since = std::chrono::steady_clock::now();
+     l->character = std::max(0, SeatCharacter(seat));
+     LobbySend(seat, *l);
++    // The host starts from the save state's rules.
++    const std::uint8_t* c = GuestByte(kRuleCourse);
++    const std::uint8_t* laps = GuestByte(kRuleLaps);
++    if (seat == 0 && c && laps && *c >= 1 && *c <= kCourses && *laps >= 1 && *laps <= kMaxLaps)
++      SendLine("RULES 0 " + std::to_string(*c) + " " + std::to_string(*laps));
+   }
+   const auto set_ready = [&](bool ready) {
+     l->ready = ready;
+@@ -579,7 +627,7 @@ bool LobbyStep(LobbyLocal* l)
+     {
+       const char k = keys[i];
+       bits = k == 'L' ? 0x100u : k == 'R' ? 0x200u : k == 'U' ? 0x40u : k == 'D' ? 0x80u : k == 'A' ? 0x1u :
+-             k == 'B' ? 0x2u : 0u;
++             k == 'B' ? 0x2u : k == 'X' ? 0x4u : k == 'Y' ? 0x8u : k == '+' ? 0x800u : k == '-' ? 0x400u : 0u;
+     }
+   }
+   else
+@@ -635,6 +683,21 @@ bool LobbyStep(LobbyLocal* l)
+     l->gear = next_gear(l->gear, -1, l->character), changed = true;
+   if (changed)
+     LobbySend(seat, *l);
++  // The host's rules: X/Y the course, R/L the laps.
++  if (seat == 0 && s_rule_course >= 1 && (pressed & (0x4u | 0x8u | 0x400u | 0x800u)))
++  {
++    int course = s_rule_course, laps = s_rule_laps;
++    if (pressed & 0x4u)
++      course = course % kCourses + 1;
++    if (pressed & 0x8u)
++      course = (course + kCourses - 2) % kCourses + 1;
++    if (pressed & 0x800u)
++      laps = std::min(kMaxLaps, laps + 1);
++    if (pressed & 0x400u)
++      laps = std::max(1, laps - 1);
++    SendLine("RULES 0 " + std::to_string(course) + " " + std::to_string(laps));
++    changed = true;
++  }
+   if (pressed & 0x1u)
+   {
+     set_ready(true);
+@@ -674,7 +737,7 @@ void WaitForGo()
+       s_waiting = false;
+       return Off("relay lost while waiting for the other seats");
+     }
+-    if (TakeTags(line) || TakePicks(line))
++    if (TakeTags(line) || TakePicks(line) || TakeRules(line))
+     {
+       RedrawWhileWaiting();
+       continue;
+@@ -690,6 +753,7 @@ void WaitForGo()
+         const std::size_t next = line.find(' ', p);
+         p = next == std::string::npos ? line.size() : next + 1;
+       }
++      ApplyRules();
+       break;
+     }
+     int present = 0, seats = 0;
+@@ -732,6 +796,9 @@ WaitView RelayWaitView()
+   }
+   view.local = s_relay.local;
+   view.lobby = LobbyOn();
++  view.host = view.lobby && std::find(view.local.begin(), view.local.end(), 0) != view.local.end();
++  view.course = s_rule_course;
++  view.laps = s_rule_laps;
+   for (int k = 0; k < view.seats && k < 8; ++k)
+   {
+     view.characters[static_cast<std::size_t>(k)] = SeatCharacter(k);
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 2bc22d7..9c5b896 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -38,6 +38,8 @@ struct WaitView
+ {
+   bool waiting = false;
+   bool lobby = false;
++  bool host = false;  // this machine has seat 0: it sets the rules
++  int course = -1, laps = -1;  // the host's rules (-1: the save state's)
+   int seats = 0;
+   std::string states;
+   std::vector<int> local;
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index b5da4a5..1651920 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -48,6 +48,13 @@ constexpr const char* kGearNames[] = {
+     "GRINDER",      "ADVANTAGE S", "ADVANTAGE F", "ADVANTAGE P",   "CANNONBALL"};
+ static_assert(std::size(kGearNames) == 41);
+ 
++// The courses by the game's number (1-16: measured on 2026-11-25, the race's title for 1, 2, 9, 13, 16).
++constexpr const char* kCourseNames[] = {
++    "",           "METAL CITY",  "SPLASH CANYON", "EGG FACTORY", "GREEN CAVE",        "SAND RUINS",
++    "BABYLON GARDEN", "DIGITAL DIMENSION", "SEGA CARNIVAL", "NIGHT CHASE", "RED CANYON", "ICE FACTORY",
++    "WHITE CAVE", "DARK DESERT", "SKY ROAD",      "BABYLON GUARDIAN", "SEGA ILLUSION"};
++static_assert(std::size(kCourseNames) == 17);
++
+ std::atomic<bool> s_redraw_queued{false};
+ 
+ ImU32 Rgba(int r, int g, int b, float a = 1.0f)
+@@ -160,6 +167,27 @@ void LobbyHint(const WaitView& view, ImDrawList* list, ImFont* font, ImVec2 disp
+   const ImVec2 at(display.x * 0.5f, display.y * 0.93f);
+   if (!(name_font && NameTextCentred(list, hint, at, unit * 0.75f, Rgba(255, 214, 64), display.x * 0.9f)))
+     TextCentred(list, font, unit * 0.55f, at, Rgba(255, 214, 64), hint);
++  // the host's rules, while it chooses
++  if (view.host && s == 'O' && view.course >= 1)
++  {
++    const char* rules = "X/Y  TRACK      L/R  LAPS";
++    const ImVec2 above(display.x * 0.5f, display.y * 0.865f);
++    if (!(name_font && NameTextCentred(list, rules, above, unit * 0.75f, Rgba(120, 220, 255), display.x * 0.9f)))
++      TextCentred(list, font, unit * 0.55f, above, Rgba(120, 220, 255), rules);
++  }
++}
++
++// The host's rules (the course and the laps), under the counts.
++void RulesLine(const WaitView& view, ImDrawList* list, ImFont* font, ImVec2 display, float unit, bool name_font,
++               float y)
++{
++  if (view.course < 1 || view.course >= static_cast<int>(std::size(kCourseNames)) || view.laps < 1)
++    return;
++  char text[48];
++  std::snprintf(text, sizeof(text), "%s   %d LAP%s", kCourseNames[view.course], view.laps, view.laps > 1 ? "S" : "");
++  const ImVec2 at(display.x * 0.5f, display.y * y);
++  if (!(name_font && NameTextCentred(list, text, at, unit * 0.75f, Rgba(120, 220, 255), display.x * 0.9f)))
++    TextCentred(list, font, unit * 0.6f, at, Rgba(120, 220, 255), text);
+ }
+ 
+ // Gibax's mockup in the game's look: the blue of the menus (Player Entry), the game's "ARE YOU READY?",
+@@ -315,6 +343,7 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+       TextCentred(list, font, unit * 0.5f, ImVec2(x, below), Rgba(255, 214, 64), "YOU");
+   }
+   LobbyHint(view, list, font, display, unit, name_font);
++  RulesLine(view, list, font, display, unit, name_font, 0.255f);
+ }
+ 
+ void Draw(const WaitView& view)
+@@ -394,6 +423,7 @@ void Draw(const WaitView& view)
+       TextCentred(list, font, unit * 0.5f, ImVec2(x, display.y * 0.86f), Rgba(255, 214, 64), "YOU");
+   }
+   LobbyHint(view, list, font, display, unit, false);
++  RulesLine(view, list, font, display, unit, false, 0.37f);
+ }
+ }  // namespace
+ 
+-- 
+2.34.1.windows.1
+
