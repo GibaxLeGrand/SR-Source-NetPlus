@@ -1,0 +1,574 @@
+From c031d529f4799ab45bf112cb952eff960306957e Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:04:57 +0100
+Subject: [PATCH] Runner: the waiting screen in the game's look, from the
+ player's game files
+
+srnp_game_textures: the runner reads pictures from the player's game
+(<game root>/files), never from this repository: the game's LZSS is
+undone, the N-th GVR texture found, its CI4/CI8 texels decoded with
+their RGB5A3 palette and made into a texture of the video backend for
+ImGui (cached; on the video thread). The labels mod's own texture
+("5P".."8P" after the SRNPLBL1 block of its GTSE) is read from the mod
+folders when the mod is there.
+
+The waiting screen now uses them (Gibax's choices): the menus' blue,
+the game's "ARE YOU READY?" (menus, picture 38), one card a seat on the
+menus' panel (116) tinted, the game's labels (1P..4P and COM from the
+HUD atlas, as the game's table at 0x805D3DB4 has them; 5P..8P from the
+labels mod, drawn without it), the characters' heads from the HUD atlas
+(entries 5 + character of the same table), the menus' "?" for a seat
+the AI takes over. The counts keep ImGui's font: the game has no
+complete alphabet (pre-drawn words, and text fonts holding only their
+messages' glyphs).
+
+Measured: 6 seats, one leaves, photographed in the real window; the
+race behind it 28 checksums equal, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |   1 +
+ src/runtime/dolphin_runtime.cpp     |   4 +
+ src/runtime/srnp_game_textures.cpp  | 278 ++++++++++++++++++++++++++++
+ src/runtime/srnp_game_textures.hpp  |  37 ++++
+ src/runtime/srnp_waiting_screen.cpp | 147 +++++++++++++++
+ 5 files changed, 467 insertions(+)
+ create mode 100644 src/runtime/srnp_game_textures.cpp
+ create mode 100644 src/runtime/srnp_game_textures.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4dfc9f4..9bb6bb2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -439,6 +439,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/srnp_racers.cpp
+         src/runtime/srnp_labels.cpp
+         src/runtime/srnp_waiting_screen.cpp
++        src/runtime/srnp_game_textures.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 885aef9..77282cf 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -14,6 +14,7 @@
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/CPU.h"
++#include "srnp_game_textures.hpp"
+ #include "srnp_labels.hpp"
+ #include "srnp_racers.hpp"
+ #include "srnp_relay.hpp"
+@@ -1097,6 +1098,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+       "ModernGekko - " + impl->metadata.game_name + " [" +
+       impl->metadata.disc_id + "]");
+   impl->mods = std::make_unique<ModManager>();
++  // SR-Source Net Plus: the game's own pictures for the runner's screens (srnp_game_textures.hpp).
++  srnp::SetGameRoot(impl->config.game_root);
++  srnp::SetModDirectories(impl->config.mod_directories);
+   const ModLoadReport mod_report = impl->mods->LoadDirectories(
+       impl->config.mod_directories, impl->metadata.disc_id);
+   for (const ModLoadIssue &issue : mod_report.issues)
+diff --git a/src/runtime/srnp_game_textures.cpp b/src/runtime/srnp_game_textures.cpp
+new file mode 100644
+index 0000000..e35bc7d
+--- /dev/null
++++ b/src/runtime/srnp_game_textures.cpp
+@@ -0,0 +1,278 @@
++// SR-Source Net Plus: pictures of the game's own files. See srnp_game_textures.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "srnp_game_textures.hpp"
++
++#include "VideoCommon/AbstractGfx.h"
++#include "VideoCommon/AbstractTexture.h"
++#include "VideoCommon/Present.h"
++#include "VideoCommon/TextureConfig.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <map>
++#include <memory>
++#include <utility>
++#include <vector>
++
++namespace srnp
++{
++namespace
++{
++std::filesystem::path s_root;
++
++std::uint32_t Be32(const std::vector<std::uint8_t>& d, std::size_t at)
++{
++  return at + 4 <= d.size() ?
++             static_cast<std::uint32_t>(d[at]) << 24 | static_cast<std::uint32_t>(d[at + 1]) << 16 |
++                 static_cast<std::uint32_t>(d[at + 2]) << 8 | d[at + 3] :
++             0;
++}
++std::uint16_t Be16(const std::vector<std::uint8_t>& d, std::size_t at)
++{
++  return at + 2 <= d.size() ? static_cast<std::uint16_t>(d[at] << 8 | d[at + 1]) : 0;
++}
++
++// The game's LZSS: a header of 0x20 bytes (0x80000001, the size), then bits, most significant first:
++// 0 and a raw byte, or 1, a distance and a length (8 bits each), copied back from the output.
++std::vector<std::uint8_t> Decompress(const std::vector<std::uint8_t>& src)
++{
++  if (Be32(src, 0) != 0x80000001u)
++    return src;
++  const std::uint32_t size = Be32(src, 4);
++  std::vector<std::uint8_t> out;
++  out.reserve(size);
++  std::size_t bit = 0x20 * 8;
++  const std::size_t end = src.size() * 8;
++  const auto read = [&](int n) {
++    std::uint32_t v = 0;
++    for (int i = 0; i < n && bit < end; ++i, ++bit)
++      v = v << 1 | ((src[bit >> 3] >> (7 - (bit & 7))) & 1u);
++    return v;
++  };
++  while (out.size() < size && bit < end)
++  {
++    if (read(1))
++    {
++      const std::uint32_t distance = read(8), length = read(8);
++      if (distance == 0 || distance > out.size())
++        break;
++      const std::size_t from = out.size() - distance;
++      for (std::uint32_t i = 0; i < length; ++i)
++        out.push_back(out[from + i]);
++    }
++    else
++    {
++      out.push_back(static_cast<std::uint8_t>(read(8)));
++    }
++  }
++  return out;
++}
++
++std::uint32_t Rgb5a3(std::uint16_t v)  // to RGBA8 (bytes r, g, b, a in memory order)
++{
++  std::uint32_t r, g, b, a;
++  if (v & 0x8000)
++  {
++    r = (v >> 10 & 31) * 255 / 31, g = (v >> 5 & 31) * 255 / 31, b = (v & 31) * 255 / 31, a = 255;
++  }
++  else
++  {
++    r = (v >> 8 & 15) * 17, g = (v >> 4 & 15) * 17, b = (v & 15) * 17, a = (v >> 12 & 7) * 255 / 7;
++  }
++  return r | g << 8 | b << 16 | a << 24;
++}
++
++struct Decoded
++{
++  int width = 0, height = 0;
++  std::vector<std::uint32_t> rgba;
++};
++
++// The index-th GVR texture of the file (CI4 or CI8 with an RGB5A3 palette, as the game's menus have).
++Decoded Decode(const std::vector<std::uint8_t>& d, int index)
++{
++  Decoded out;
++  std::size_t at = 0;
++  int k = -1;
++  for (;;)
++  {
++    std::size_t found = std::string::npos;
++    for (std::size_t i = at; i + 4 <= d.size(); ++i)
++      if (d[i] == 'G' && d[i + 1] == 'C' && d[i + 2] == 'I' && d[i + 3] == 'X')
++      {
++        found = i;
++        break;
++      }
++    if (found == std::string::npos)
++      return out;
++    if (++k == index)
++    {
++      at = found;
++      break;
++    }
++    at = found + 4;
++  }
++  const std::size_t g = at + 0x10;
++  if (Be32(d, g) != 0x47565254u)  // "GVRT"
++    return out;
++  const int format = d[g + 0xB];
++  const int w = Be16(d, g + 0xC), h = Be16(d, g + 0xE);
++  if ((format != 8 && format != 9) || w <= 0 || h <= 0 || w > 1024 || h > 1024)
++    return out;
++  const int colours = format == 9 ? 256 : 16;
++  std::size_t p = g + 0x10;
++  std::vector<std::uint32_t> palette(static_cast<std::size_t>(colours));
++  for (int c = 0; c < colours; ++c)
++    palette[static_cast<std::size_t>(c)] = Rgb5a3(Be16(d, p + 2u * static_cast<std::size_t>(c)));
++  p += 2u * static_cast<std::size_t>(colours);
++  out.width = w, out.height = h;
++  out.rgba.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
++  // Tiles: 8x4 texels for CI8, 8x8 for CI4 (two texels a byte, high nibble first).
++  const int tw = 8, th = format == 9 ? 4 : 8;
++  std::size_t n = 0;
++  for (int ty = 0; ty < h; ty += th)
++    for (int tx = 0; tx < w; tx += tw)
++      for (int y = 0; y < th; ++y)
++        for (int x = 0; x < tw; ++x, ++n)
++        {
++          const std::size_t byte = p + (format == 9 ? n : n / 2);
++          if (byte >= d.size())
++            return out;
++          const int v = format == 9 ? d[byte] : (n % 2 == 0 ? d[byte] >> 4 : d[byte] & 15);
++          if (tx + x < w && ty + y < h)
++            out.rgba[static_cast<std::size_t>(ty + y) * static_cast<std::size_t>(w) +
++                     static_cast<std::size_t>(tx + x)] = palette[static_cast<std::size_t>(v)];
++        }
++  return out;
++}
++
++struct Loaded
++{
++  std::unique_ptr<AbstractTexture> texture;
++  float width = 0.0f, height = 0.0f;
++  bool failed = false;
++  const void* presenter = nullptr;
++};
++std::map<std::string, std::vector<std::uint8_t>> s_files;  // decompressed, by path
++std::map<std::pair<std::string, int>, Loaded> s_textures;
++std::vector<std::filesystem::path> s_mod_directories;
++
++const std::vector<std::uint8_t>& File(const std::filesystem::path& path)
++{
++  const std::string key = path.string();
++  auto found = s_files.find(key);
++  if (found == s_files.end())
++  {
++    std::ifstream in(path, std::ios::binary);
++    std::vector<std::uint8_t> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    found = s_files.emplace(key, Decompress(raw)).first;
++    std::fprintf(stderr, "[srnp screens] %s: %zu bytes read\n", key.c_str(), found->second.size());
++  }
++  return found->second;
++}
++
++// The cached texture of a picture, made from `decode` the first time (or after the video backend
++// changed); a picture that can't be had is not tried again.
++template <typename F>
++GamePicture Cached(const std::string& file, int index, F decode)
++{
++  GamePicture result;
++  if (!g_gfx || !g_presenter)
++    return result;
++  Loaded& t = s_textures[{file, index}];
++  if (!(t.texture && t.presenter == g_presenter.get()))
++  {
++    if (t.failed)
++      return result;
++    if (t.texture)
++      (void)t.texture.release();  // a texture of a video backend that is gone can't be destroyed
++    const Decoded picture = decode();
++    if (picture.rgba.empty())
++    {
++      std::fprintf(stderr, "[srnp screens] %s: no picture %d\n", file.c_str(), index);
++      t.failed = true;
++      return result;
++    }
++    const TextureConfig config(static_cast<u32>(picture.width), static_cast<u32>(picture.height), 1, 1, 1,
++                               AbstractTextureFormat::RGBA8, 0, AbstractTextureType::Texture_2DArray);
++    t.texture = g_gfx->CreateTexture(config, "SR-Source Net Plus screen");
++    if (!t.texture)
++    {
++      t.failed = true;
++      return result;
++    }
++    t.texture->Load(0, static_cast<u32>(picture.width), static_cast<u32>(picture.height),
++                    static_cast<u32>(picture.width), reinterpret_cast<const u8*>(picture.rgba.data()),
++                    picture.rgba.size() * 4);
++    t.width = static_cast<float>(picture.width), t.height = static_cast<float>(picture.height);
++    t.presenter = g_presenter.get();
++  }
++  result.texture = *t.texture;
++  result.width = t.width, result.height = t.height, result.ok = true;
++  return result;
++}
++
++// C8 texels (tiles of 8x4) with a palette of 256 RGB5A3 colours.
++Decoded DecodeC8(const std::vector<std::uint8_t>& d, std::size_t palette, std::size_t texels, int w, int h)
++{
++  Decoded out;
++  if (w <= 0 || h <= 0 || texels + static_cast<std::size_t>(w) * static_cast<std::size_t>(h) > d.size())
++    return out;
++  out.width = w, out.height = h;
++  out.rgba.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
++  std::size_t n = texels;
++  for (int ty = 0; ty < h; ty += 4)
++    for (int tx = 0; tx < w; tx += 8)
++      for (int y = 0; y < 4; ++y)
++        for (int x = 0; x < 8; ++x, ++n)
++          if (tx + x < w && ty + y < h)
++            out.rgba[static_cast<std::size_t>(ty + y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(tx + x)] =
++                Rgb5a3(Be16(d, palette + 2u * d[n]));
++  return out;
++}
++}  // namespace
++
++void SetGameRoot(const std::filesystem::path& root)
++{
++  s_root = root;
++}
++
++void SetModDirectories(const std::vector<std::filesystem::path>& directories)
++{
++  s_mod_directories = directories;
++}
++
++GamePicture GameTexture(const std::string& file, int index)
++{
++  return Cached(file, index, [&] { return Decode(File(s_root / "files" / file), index); });
++}
++
++GamePicture LabelsTexture()
++{
++  return Cached("srnp_etiquettes", 0, [] {
++    for (const std::filesystem::path& dir : s_mod_directories)
++    {
++      std::error_code ec;
++      const std::filesystem::path gtse = dir / "srnp_etiquettes" / "files" / "GTSE";
++      if (!std::filesystem::exists(gtse, ec))
++        continue;
++      const std::vector<std::uint8_t>& d = File(gtse);
++      static constexpr char kMark[] = "SRNPLBL1";
++      for (std::size_t i = 0; i + 0x20 <= d.size(); i += 4)
++      {
++        if (std::memcmp(d.data() + i, kMark, 8) != 0)
++          continue;
++        const int w = Be16(d, i + 8), h = Be16(d, i + 10);
++        if (Be32(d, i + 12) != 9)
++          break;
++        return DecodeC8(d, i + Be32(d, i + 16), i + Be32(d, i + 20), w, h);
++      }
++    }
++    return Decoded{};
++  });
++}
++}  // namespace srnp
+diff --git a/src/runtime/srnp_game_textures.hpp b/src/runtime/srnp_game_textures.hpp
+new file mode 100644
+index 0000000..5ef4518
+--- /dev/null
++++ b/src/runtime/srnp_game_textures.hpp
+@@ -0,0 +1,37 @@
++// SR-Source Net Plus: pictures of the game's own files, for the runner's screens (srnp_waiting_screen.cpp).
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// The pictures are read from the player's game (<game root>/files/<name>), never from this repository:
++// the file is decompressed (the game's LZSS: 0x80000001, the size, then a bit stream), its N-th GVR
++// texture ("GCIX"/"GVRT") is found, its CI4 or CI8 texels decoded with their RGB5A3 palette, and the
++// picture made into a texture of the video backend that ImGui can draw. All on the video thread.
++#pragma once
++
++#include <filesystem>
++#include <string>
++#include <vector>
++
++#include <imgui.h>
++
++namespace srnp
++{
++// Where the game's files are (the runtime's game root); set before the first screen is drawn.
++void SetGameRoot(const std::filesystem::path& root);
++
++// The index-th texture of a file of the game, ready for ImGui (nullptr if it can't be had), and its size.
++struct GamePicture
++{
++  ImTextureRef texture;
++  float width = 0.0f, height = 0.0f;
++  bool ok = false;
++};
++GamePicture GameTexture(const std::string& file, int index);
++
++// The mods' folders (the runtime's mod directories): for the labels mod's own texture.
++void SetModDirectories(const std::vector<std::filesystem::path>& directories);
++
++// "5P".."8P", 36x30 side by side, from the labels mod (srnp_etiquettes: its GTSE ends with a block
++// "SRNPLBL1": u16 width, u16 height, u32 GX format 9, u32 palette offset, u32 texels offset; 256
++// RGB5A3 colours, then C8 texels). Not ok without the mod.
++GamePicture LabelsTexture();
++}  // namespace srnp
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 4e11196..51170bf 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -12,6 +12,7 @@
+ // over a paused game, the last frame is presented again, on the video thread, with the screen over it.
+ 
+ #include "srnp_relay.hpp"
++#include "srnp_game_textures.hpp"
+ 
+ #include <imgui.h>
+ 
+@@ -65,6 +66,150 @@ void Label(ImDrawList* list, ImFont* font, ImVec2 centre, float unit, const char
+   TextCentred(list, font, unit * 0.85f, centre, Rgba(255, 255, 255), text);
+ }
+ 
++// The game's pictures (srnp_game_textures.hpp): TSGME, the menus ("?" 110, the panel 116, "ARE YOU
++// READY?" 38), GTSE, the race HUD (the atlas 5: the labels and the characters' heads).
++constexpr const char* kMenus = "TSGME";
++constexpr const char* kHud = "GTSE";
++// Each character's head in the HUD atlas, 38x30, as the game's table at 0x805D3DB4 has them (entries
++// 5 + character): Sonic, Tails, Knuckles, Amy, Jet, Storm, Wave, Eggman, Cream, Rouge, Shadow, Super
++// Sonic (Sonic's), NiGHTS, AiAi, Ulala, E-10000G, E-10000R.
++constexpr ImVec2 kHeads[17] = {{0, 120},   {38, 120},  {76, 120}, {114, 120}, {0, 150},   {38, 150},
++                               {76, 150},  {114, 150}, {152, 120}, {152, 150}, {190, 120}, {0, 120},
++                               {190, 150}, {0, 180},   {0, 210},  {38, 180},  {38, 210}};
++
++void Picture(ImDrawList* list, const GamePicture& p, ImVec2 a, ImVec2 b, ImVec2 uv0 = ImVec2(0, 0),
++             ImVec2 uv1 = ImVec2(1, 1), ImU32 tint = IM_COL32_WHITE)
++{
++  if (p.ok)
++    list->AddImage(p.texture, a, b, uv0, uv1, tint);
++}
++
++// The game's label ("1P".."4P", "COM": the HUD atlas, 36x30 at (76 + 36 k, 60), as the game's table at
++// 0x805D3DB4 has them); "5P".."8P" from the labels mod (srnp_etiquettes: 36x30 side by side), or drawn
++// in the game's colours without it.
++void GameLabel(ImDrawList* list, ImFont* font, ImVec2 centre, float unit, int seat, bool com)
++{
++  const float w = unit * 2.4f, h = w * 30.0f / 36.0f;
++  const ImVec2 a(centre.x - w * 0.5f, centre.y - h * 0.5f), b(centre.x + w * 0.5f, centre.y + h * 0.5f);
++  const GamePicture atlas = GameTexture(kHud, 5);
++  if (atlas.ok && (com || seat < 4))
++  {
++    const float u = com ? 220.0f : 76.0f + 36.0f * static_cast<float>(seat);
++    Picture(list, atlas, a, b, ImVec2(u / atlas.width, 60.0f / atlas.height),
++            ImVec2((u + 36.0f) / atlas.width, 90.0f / atlas.height));
++    return;
++  }
++  const GamePicture ours = LabelsTexture();
++  if (ours.ok && !com && seat >= 4 && seat < 8)
++  {
++    const float u = 36.0f * static_cast<float>(seat - 4);
++    Picture(list, ours, a, b, ImVec2(u / ours.width, 0.0f), ImVec2((u + 36.0f) / ours.width, 30.0f / ours.height));
++    return;
++  }
++  char text[8];
++  std::snprintf(text, sizeof(text), com ? "COM" : "%dP", seat + 1);
++  Label(list, font, centre, unit, text, com);
++}
++
++// Gibax's mockup in the game's look: the blue of the menus (Player Entry), the game's "ARE YOU READY?",
++// one card a seat on the menus' rounded panel, with the game's label and the character's select icon
++// (its head and name), faded and bluish while the player is on the way.
++void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font, ImVec2 display)
++{
++  const int seats = std::min(view.seats, 8);
++  const auto state = [&](int k) {
++    return k < static_cast<int>(view.states.size()) ? view.states[static_cast<std::size_t>(k)] : 'O';
++  };
++  int left = 0, ready = 0;
++  for (int k = 0; k < seats; ++k)
++  {
++    left += state(k) == 'X';
++    ready += state(k) == 'V';
++  }
++  const int players = seats - left;
++
++  // The menus' blue, darker at the top, and light bands across, as Player Entry has.
++  list->AddRectFilledMultiColor(ImVec2(0, 0), display, Rgba(10, 28, 92), Rgba(10, 28, 92), Rgba(36, 104, 196),
++                                Rgba(36, 104, 196));
++  for (int i = 0; i < 6; ++i)
++  {
++    const float y = display.y * (0.18f + 0.13f * static_cast<float>(i));
++    list->AddRectFilled(ImVec2(0, y), ImVec2(display.x, y + display.y * 0.012f), Rgba(160, 200, 255, 0.07f));
++  }
++  const float unit = std::min(display.y / 15.0f, display.x / (seats * 3.4f + 1.0f));
++
++  // The game's "ARE YOU READY?" (the top of the menus' picture 38), then the counts.
++  const GamePicture ready_picture = GameTexture(kMenus, 38);
++  if (ready_picture.ok)
++  {
++    const float w = display.x * 0.42f, h = w * 40.0f / 256.0f;
++    Picture(list, ready_picture, ImVec2(display.x * 0.5f - w * 0.5f, display.y * 0.04f),
++            ImVec2(display.x * 0.5f + w * 0.5f, display.y * 0.04f + h), ImVec2(0, 0), ImVec2(1, 40.0f / 256.0f));
++  }
++  char line[64];
++  std::snprintf(line, sizeof(line), "%d Players    %d Racers    %d/%d Ready", players, seats, ready, players);
++  TextCentred(list, font, unit * 0.95f, ImVec2(display.x * 0.5f, display.y * 0.19f), Rgba(255, 255, 255), line);
++
++  const GamePicture panel = GameTexture(kMenus, 116);
++  const float column = display.x / static_cast<float>(seats + 1);
++  const float card_w = std::min(column * 0.92f, unit * 3.3f), card_h = card_w * 1.75f;
++  const double now = ImGui::GetTime();
++  for (int k = 0; k < seats; ++k)
++  {
++    const char s = state(k);
++    const bool mine = std::find(view.local.begin(), view.local.end(), k) != view.local.end();
++    const float x = column * static_cast<float>(k + 1);
++    const float top = display.y * 0.30f;
++    const ImVec2 a(x - card_w * 0.5f, top), b(x + card_w * 0.5f, top + card_h);
++    // The card: the menus' panel, tinted as the game tints it (lighter for this machine's seat).
++    if (panel.ok)
++      Picture(list, panel, a, b, ImVec2(0, 0), ImVec2(1, 1), mine ? Rgba(190, 225, 255, 0.95f) : Rgba(150, 190, 245, 0.75f));
++    else
++      list->AddRectFilled(a, b, Rgba(60, 120, 210, 0.8f), unit * 0.3f);
++    GameLabel(list, font, ImVec2(x, top + card_h * 0.14f), unit, k, s == 'X');
++    // The character's head from the HUD atlas (Gibax's choice), or the menus' "?" for a seat the AI
++    // takes over (its character is drawn at GO) or a character not known.
++    const int character = view.characters[static_cast<std::size_t>(k)];
++    const ImU32 tint = s == 'O' ? Rgba(120, 170, 255, 0.5f) : IM_COL32_WHITE;  // on the way: faded, bluish
++    const GamePicture atlas = GameTexture(kHud, 5);
++    const float side_w = card_w * 0.86f, side_h = side_w * 30.0f / 38.0f;
++    const ImVec2 i0(x - side_w * 0.5f, top + card_h * 0.30f), i1(x + side_w * 0.5f, top + card_h * 0.30f + side_h);
++    if (s != 'X' && character >= 0 && character <= 16 && atlas.ok)
++    {
++      const ImVec2 head = kHeads[character];
++      Picture(list, atlas, i0, i1, ImVec2(head.x / atlas.width, head.y / atlas.height),
++              ImVec2((head.x + 38.0f) / atlas.width, (head.y + 30.0f) / atlas.height), tint);
++    }
++    else
++    {
++      const GamePicture unknown = GameTexture(kMenus, 110);
++      const float q = side_h;
++      Picture(list, unknown, ImVec2(x - q * 0.5f, i0.y), ImVec2(x + q * 0.5f, i0.y + q), ImVec2(0, 0), ImVec2(1, 1), tint);
++    }
++    // The state: blue circle (on the way, pulsing), green tick (there), red cross (left).
++    const ImVec2 mark(x, top + card_h * 0.88f);
++    const float r = unit * 0.42f;
++    if (s == 'V')
++    {
++      list->AddPolyline(std::array<ImVec2, 3>{ImVec2(mark.x - r, mark.y), ImVec2(mark.x - r * 0.3f, mark.y + r * 0.7f),
++                                              ImVec2(mark.x + r, mark.y - r * 0.8f)}.data(),
++                        3, Rgba(40, 210, 80), 0, unit * 0.22f);
++    }
++    else if (s == 'X')
++    {
++      list->AddLine(ImVec2(mark.x - r, mark.y - r), ImVec2(mark.x + r, mark.y + r), Rgba(235, 40, 40), unit * 0.22f);
++      list->AddLine(ImVec2(mark.x - r, mark.y + r), ImVec2(mark.x + r, mark.y - r), Rgba(235, 40, 40), unit * 0.22f);
++    }
++    else
++    {
++      const float pulse = 0.6f + 0.4f * static_cast<float>(std::sin(now * 4.0));
++      list->AddCircle(mark, r, Rgba(40, 170, 255, pulse), 0, unit * 0.2f);
++    }
++    if (mine)
++      TextCentred(list, font, unit * 0.5f, ImVec2(x, b.y + unit * 0.5f), Rgba(255, 214, 64), "YOU");
++  }
++}
++
+ void Draw(const WaitView& view)
+ {
+   ImDrawList* list = ImGui::GetForegroundDrawList();
+@@ -72,6 +217,8 @@ void Draw(const WaitView& view)
+   const ImVec2 display = ImGui::GetIO().DisplaySize;
+   if (!list || !font || display.x <= 0.0f || display.y <= 0.0f || view.seats <= 0)
+     return;
++  if (GameTexture(kMenus, 132).ok)
++    return DrawWithGamePictures(view, list, font, display);
+   const int seats = std::min(view.seats, 8);
+   const auto state = [&](int k) {
+     return k < static_cast<int>(view.states.size()) ? view.states[static_cast<std::size_t>(k)] : 'O';
+-- 
+2.34.1.windows.1
+
