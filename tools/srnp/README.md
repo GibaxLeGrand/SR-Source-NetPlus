@@ -109,6 +109,13 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   runners, 147 checksums equal over 8848 frames, racer 0 at the same place on both. Not yet: the menu's
   Start from the pad (with no device on GCPad1 the relay's Start does not reach the menu). Patch 0028:
   the runner logs what the pad gives.
+- Patches 0029-0032 (2026-11-25 evening): "1P" over racer 0 on the other machines (the label loop's own
+  "racer 0" test, 0x8042F5B4); the relay's Start reaches the menus without an automation folder (a
+  player's runner); the players' tags through the relay (`TAG <seat> <tag>` after HELLO, the relay sends
+  `TAGS` to everyone; `SRNP_TAG` for a runner's own, `SRNP_TAGS` as before; textures drawn again when they
+  change); offline 2-4 players: a GameCube port whose controller profile names a pad gets a controller
+  (not with a relay, nor when Dolphin.ini sets the port). `demo_8.sh`: `TAGS_RELAIS=T0,T1,...` gives each
+  runner its own tag only.
 - `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (leftovers of an earlier demo
   are stopped, other sessions' runners waited for; `N=<seats>`, `TOUS_CPU`): the waiting screen fills up, then the race, photos of the 8 windows at
   three frames of the game, and contact sheets.

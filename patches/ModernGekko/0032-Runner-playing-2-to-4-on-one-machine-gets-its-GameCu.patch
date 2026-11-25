@@ -1,0 +1,102 @@
+From a97aad3439ad4fe7965b073b3850fe4ca0c3fd5b Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:11:13 +0100
+Subject: [PATCH 32/32] Runner: playing 2 to 4 on one machine gets its GameCube
+ ports
+
+The launcher names each player's pad in the profile (GCPad2..GCPad4), but Dolphin leaves ports 2-4 with
+no device unless Dolphin.ini says so: the game never saw a second player. A port whose profile names a
+device now gets a standard controller, unless a layer of Dolphin's settings sets that port itself or a
+relay is configured (online: one player per machine). Measured: a profile with GCPad2 on a pad, the
+runner gives port 2 a controller. The real test with two pads and the game's 2P menu waits for Gibax.
+
+Also: the 1P labels' cave moves to the last of the six (the index reads may take five); a note that
+redirecting 0x804874FC did not make the tricks' "RANK"/"LEVEL UP!!" follow the seat.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp | 26 ++++++++++++++++++++++++++
+ src/runtime/srnp_racers.cpp     | 12 +++++++-----
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 3d91616..c661028 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -20,6 +20,7 @@
+ #include "srnp_relay.hpp"
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GCPad.h"
++#include "Core/HW/SI/SI_Device.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/Host.h"
+ #include "Core/NetPlay/NetPlayClient.h"
+@@ -1152,6 +1153,31 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   impl->controllers_initialized = true;
+   if (!impl->config.headless)
+     impl->pad_devices = std::make_unique<PadDeviceWatch>();
++  // SR-Source Net Plus: playing 2 to 4 on one machine (offline). The launcher names each player's pad
++  // in the profile (GCPad2..GCPad4), but Dolphin leaves ports 2-4 with no device unless Dolphin.ini
++  // says so: the game never saw a second player. A port whose profile names a device gets a standard
++  // controller, unless a layer of Dolphin's settings sets that port itself (the test scripts do) or a
++  // relay is configured (online: one player per machine, the pads go through the relay).
++  if (!srnp::RelayConfigured())
++  {
++    Common::IniFile profile;
++    if (profile.Load(GameCubeProfilePath()))
++    {
++      for (int port = 1; port < GAMECUBE_PORTS; ++port)
++      {
++        std::string device;
++        if (const Common::IniFile::Section *section =
++                std::as_const(profile).GetSection(GameCubeSection(port)))
++          section->Get("Device", &device);
++        const auto &info = Config::GetInfoForSIDevice(port);
++        if (device.empty() || Config::GetAsString(info.GetLocation()).has_value())
++          continue;
++        Config::SetCurrent(info, SerialInterface::SIDEVICE_GC_CONTROLLER);
++        std::cout << "input: GameCube port " << port + 1 << " gets a controller (" << device << ")"
++                  << std::endl;
++      }
++    }
++  }
+   EnsureAutomationDirectories(impl->config.automation.directory);
+   // SR-Source Net Plus: the relay applies its official pads through the same overriders (the menus'
+   // Start, srnp_relay.cpp ApplyPad): without them, a runner started with no automation folder (a
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 0b7c151..d79db2b 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -203,10 +203,12 @@ constexpr IndexRead kIndexReads[] = {
+     // 0x805735EC: two bytes of the player's view camera (0x80601D28 + index x 0x25C: +0x24A, +0x24B).
+     {0x80574608, 0x889C1029, true},  // lbz r4, 0x1029(r28)
+     // Left as the game has them until understood: 0x80484A3C (0x804874FC: the player's task
+-    // 0x80604784[index], state 5 to 4) and 0x8054E644 (0x8054E714, 0x8054E820: an effect drawn from the
+-    // player's camera, then [0x80604428] + index x 0x30).
++    // 0x80604784[index], state 5 to 4; redirected on 2026-11-25, the tricks' "RANK"/"LEVEL UP!!" still
++    // showed one racer's on every screen: not it, or not alone) and 0x8054E644 (0x8054E714, 0x8054E820:
++    // an effect drawn from the player's camera, then [0x80604428] + index x 0x30).
+ };
+-constexpr std::uint32_t kIndexCaves = 0x80002D80;  // 12 bytes each, up to 0x80002DC8
++constexpr std::uint32_t kIndexCaves = 0x80002D80;  // 12 bytes each, up to 0x80002DC8 (5 for these
++                                                    // reads, the 6th for the 1P labels, PatchHud)
+ int s_hud_seat = 0;
+ 
+ void PatchIndexReads(int seat)
+@@ -285,11 +287,11 @@ void PatchHud(int seat)
+   // The 1P labels also leave out racer 0 at the head of their loop: 0x8042F5B4 cntlzw r0, r31, then
+   // srwi r8, r0, 5 = "racer 0", whose label is skipped unless [0x806129A0] is 400 or 500. Gibax: the
+   // other machines must show "1P" over racer 0 as they do "2P" over racer 1. It becomes "the seat's
+-  // racer": bl to three words after the index caves: xori r0, r31, seat; cntlzw r0, r0; blr (the
++  // racer": bl to three words, the last index cave: xori r0, r31, seat; cntlzw r0, r0; blr (the
+   // function saved LR). Seat 0: the game's word.
+   {
+     constexpr std::uint32_t kSkipSite = 0x8042F5B4, kSkipOriginal = 0x7FE00034;  // cntlzw r0, r31
+-    constexpr std::uint32_t kSkipCave = kIndexCaves + 3u * 12u;                   // 0x80002DA4
++    constexpr std::uint32_t kSkipCave = kIndexCaves + 5u * 12u;                   // 0x80002DBC
+     const std::uint32_t call = 0x48000001u | ((kSkipCave - kSkipSite) & 0x03FFFFFCu);
+     std::uint8_t* p = Guest(kSkipSite, 4);
+     std::uint8_t* c = Guest(kSkipCave, 12);
+-- 
+2.34.1.windows.1
+

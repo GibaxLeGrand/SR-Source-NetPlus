@@ -1,0 +1,253 @@
+From b5912e9deeb3a291e348fc779cb78a2d03a97e68 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:11:13 +0100
+Subject: [PATCH 31/32] Runner: the players' tags through the relay
+
+Each runner announces its seats' tags after HELLO (TAG <seat> <tag>: SRNP_TAG for its first seat, else
+SRNP_TAGS' entry); the relay keeps them and sends TAGS <tag 0>,<tag 1>,... to every connection at each
+new one and to each newcomer; the runner takes them (SetSeatTag) over SRNP_TAGS'. The tags change while
+the runner runs: they are a versioned array, and the textures (labels, results) are drawn again at each
+new version; the waiting screen reads them as they come. Only shown: measured with 3 runners each
+knowing only its own tag, every tag on every screen (waiting screen, labels, results), 98 checksums
+equal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 60 +++++++++++++++++++++++++++++--------
+ src/runtime/srnp_labels.hpp |  6 ++--
+ src/runtime/srnp_relay.cpp  | 40 ++++++++++++++++++++++++-
+ 3 files changed, 90 insertions(+), 16 deletions(-)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index c6de212..7dbe4df 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cctype>
+ #include <cstdint>
+ #include <cstdio>
+@@ -11,6 +12,7 @@
+ #include <cstring>
+ #include <deque>
+ #include <map>
++#include <mutex>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -284,10 +286,15 @@ void WriteTagEntry(std::uint32_t atlas, std::uint32_t texels, std::uint32_t entr
+   Put32(out + 0x30, texels - 0x20);                       // the palette
+ }
+ 
+-// SRNP_TAGS: one tag per seat (racer k), upper case, up to 8 characters; '?' for one the font lacks.
+-const std::array<std::string, 8>& Tags()
++// The players' tags, one per seat (racer k), upper case, up to 8 characters ('?' for one the font
++// lacks): first SRNP_TAGS=TAG0,TAG1,..., then each seat's own as the relay passes it on (SetSeatTag).
++// They change while the runner runs, so the textures are drawn again at each new version.
++std::mutex s_tags_mutex;
++std::atomic<unsigned> s_tags_version{0};
++
++std::array<std::string, 8>& TagsLocked()
+ {
+-  static const std::array<std::string, 8> tags = [] {
++  static std::array<std::string, 8> tags = [] {
+     std::array<std::string, 8> out{};
+     const char* v = std::getenv("SRNP_TAGS");
+     for (std::size_t k = 0; v && *v && k < 8; ++k)
+@@ -304,6 +311,12 @@ const std::array<std::string, 8>& Tags()
+   return tags;
+ }
+ 
++std::array<std::string, 8> Tags()
++{
++  std::lock_guard lock(s_tags_mutex);
++  return TagsLocked();
++}
++
+ const Glyph& GlyphOf(char c)
+ {
+   for (const Glyph& g : kFont)
+@@ -322,7 +335,7 @@ void RenderTags(std::array<std::uint8_t, kTagSize * kTagSize / 2>* texels, std::
+   texels->fill(0);
+   for (std::size_t k = 0; k < 8; ++k)
+   {
+-    const std::string& tag = Tags()[k];
++    const std::string tag = Tags()[k];
+     (*widths)[k] = 0;
+     if (tag.empty())
+       continue;
+@@ -728,7 +741,7 @@ bool BuildResults(std::uint32_t gtse, std::array<std::uint8_t, kTagSize * kTagSi
+   for (std::size_t k = 0; k < 8; ++k)
+   {
+     (*flags)[k] = 0;
+-    const std::string& tag = Tags()[k];
++    const std::string tag = Tags()[k];
+     if (tag.empty())
+       continue;
+     for (const auto& [p, v] : LayOut(font, tag))
+@@ -855,10 +868,28 @@ std::vector<std::uint8_t> NameFontText(const std::vector<std::uint8_t>& names, c
+   return out;
+ }
+ 
+-const std::string& PlayerTag(int seat)
++std::string PlayerTag(int seat)
+ {
+-  static const std::string none;
+-  return seat >= 0 && seat < 8 ? Tags()[static_cast<std::size_t>(seat)] : none;
++  return seat >= 0 && seat < 8 ? Tags()[static_cast<std::size_t>(seat)] : std::string{};
++}
++
++void SetSeatTag(int seat, const std::string& text)
++{
++  if (seat < 0 || seat >= 8)
++    return;
++  std::string tag;
++  for (const char c : text)
++    if (tag.size() < 8 && c != ',' && static_cast<unsigned char>(c) > ' ')
++      tag += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++  {
++    std::lock_guard lock(s_tags_mutex);
++    std::string& now = TagsLocked()[static_cast<std::size_t>(seat)];
++    if (now == tag || tag.empty())
++      return;
++    now = tag;
++  }
++  s_tags_version.fetch_add(1, std::memory_order_relaxed);
++  std::fprintf(stderr, "[srnp labels] seat %d's tag: %s (from the relay)\n", seat, tag.c_str());
+ }
+ 
+ void LabelsOnFrame()
+@@ -898,11 +929,15 @@ void LabelsOnFrame()
+   // The tags: their texels in the file's block (zero as loaded), their entry, their table.
+   static std::array<std::uint8_t, kTagSize * kTagSize / 2> tag_texels{};
+   static std::array<int, 8> tag_widths{};
+-  static const bool tags_rendered = [] {
++  static unsigned tags_drawn = ~0u;
++  static bool res_built = false;
++  const unsigned tags_version = s_tags_version.load(std::memory_order_relaxed);
++  if (tags_version != tags_drawn)
++  {
+     RenderTags(&tag_texels, &tag_widths);
+-    return true;
+-  }();
+-  (void)tags_rendered;
++    tags_drawn = tags_version;
++    res_built = false;  // the results' tags too
++  }
+   const std::uint32_t tags = texels - 0x220 + kTagTexels;
+   if (std::uint8_t* p = Guest(tags, static_cast<std::uint32_t>(tag_texels.size())))
+   {
+@@ -924,7 +959,6 @@ void LabelsOnFrame()
+   static std::array<std::uint8_t, kTagSize * kTagSize / 2> res_texels{};
+   static std::array<std::uint16_t, 16> res_palette{};
+   static std::array<int, 8> res_flags{};
+-  static bool res_built = false;
+   const std::uint32_t gtse = texels - 0x220 - kGtseSize;
+   if (!res_built)
+   {
+diff --git a/src/runtime/srnp_labels.hpp b/src/runtime/srnp_labels.hpp
+index fb755ab..b0d11d4 100644
+--- a/src/runtime/srnp_labels.hpp
++++ b/src/runtime/srnp_labels.hpp
+@@ -49,6 +49,8 @@ void LabelsOnFrame();
+ std::vector<std::uint8_t> NameFontText(const std::vector<std::uint8_t>& names, const std::string& text,
+                                        int* width);
+ 
+-// A seat's tag (SRNP_TAGS), "" without one.
+-const std::string& PlayerTag(int seat);
++// A seat's tag (SRNP_TAGS, or as the relay passed it on), "" without one.
++std::string PlayerTag(int seat);
++// A seat's tag from the relay (TAGS): replaces SRNP_TAGS' for that seat; the textures follow.
++void SetSeatTag(int seat, const std::string& tag);
+ }  // namespace srnp
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 3716c3e..25bcd3e 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -5,12 +5,15 @@
+ //   HELLO <seat> <seats> <delay>     delay: the first <delay> frames have no inputs (neutral)
+ //   IN <frame> <seat> <pad>          pad: 16 hex digits (below)
+ //   CK <frame> <seat> <hash>         hash: 16 hex digits (FNV-1a 64 of the game's state)
++//   TAG <seat> <tag>                 the seat's player tag (up to 8 characters, no space or comma)
+ // relay -> client
+ //   WAIT <present> <seats> <states>  at each arrival and every 2 s until no seat is expected; one
+ //                                    letter a seat: O expected, V there, X left before the start
+ //   GO [<seat>:<character>/<gear>]   the runners leave their first frame; each seat that left is the
+ //                                    AI's, with a character the relay drew at random
+ //   OF <frame> <pad seat 0> <pad seat 1> ...
++//   TAGS <tag 0>,<tag 1>,...         the tags the relay knows ("-": none), at each new one and to
++//                                    each newcomer; only shown (labels, results, waiting screen)
+ // A pad is 8 bytes: buttons (16 bits: A B X Y Z Start Up Down Left Right L R), main stick X, Y,
+ // C-stick X, Y (signed, -127..127), L, R (0..255).
+ #if defined(_WIN32)
+@@ -25,6 +28,7 @@
+ #endif
+ 
+ #include "srnp_relay.hpp"
++#include "srnp_labels.hpp"
+ #include "srnp_racers.hpp"
+ 
+ #include <algorithm>
+@@ -437,6 +441,35 @@ bool Connect()
+     if (!SendLine("HELLO " + std::to_string(seat) + " " + std::to_string(s_relay.seats) + " " +
+                   std::to_string(s_relay.delay)))
+       return false;
++  // Each local seat's tag (SRNP_TAG for the first, else SRNP_TAGS' entry): the relay passes them on.
++  const char* own = std::getenv("SRNP_TAG");
++  for (std::size_t i = 0; i < s_relay.local.size(); ++i)
++  {
++    const int seat = s_relay.local[i];
++    std::string tag = i == 0 && own && *own ? std::string(own) : PlayerTag(seat);
++    std::erase_if(tag, [](char c) { return static_cast<unsigned char>(c) <= ' ' || c == ','; });
++    if (!tag.empty() && !SendLine("TAG " + std::to_string(seat) + " " + tag.substr(0, 8)))
++      return false;
++  }
++  return true;
++}
++
++// TAGS <tag seat 0>,<tag seat 1>,... ("-": none): the players' tags as the relay knows them.
++bool TakeTags(const std::string& line)
++{
++  if (line.rfind("TAGS ", 0) != 0)
++    return false;
++  std::size_t p = 5;
++  for (int seat = 0; seat < 8 && p <= line.size(); ++seat)
++  {
++    const std::size_t q = line.find(',', p);
++    const std::string tag = line.substr(p, q == std::string::npos ? std::string::npos : q - p);
++    if (!tag.empty() && tag != "-")
++      SetSeatTag(seat, tag);
++    if (q == std::string::npos)
++      break;
++    p = q + 1;
++  }
+   return true;
+ }
+ 
+@@ -463,6 +496,11 @@ void WaitForGo()
+       s_waiting = false;
+       return Off("relay lost while waiting for the other seats");
+     }
++    if (TakeTags(line))
++    {
++      RedrawWhileWaiting();
++      continue;
++    }
+     if (line == "GO" || line.rfind("GO ", 0) == 0)
+     {
+       // Each seat that left before the start: the AI's, with the relay's character.
+@@ -707,7 +745,7 @@ void RelayStep(std::uint64_t frame)
+     std::string line;
+     if (!ReadLine(&line))
+       return Off("no official frame from the relay (time limit or connection lost)");
+-    if (line.rfind("OF ", 0) != 0)
++    if (TakeTags(line) || line.rfind("OF ", 0) != 0)
+       continue;
+     std::vector<std::string> parts;
+     for (std::size_t p = 0; p < line.size();)
+-- 
+2.34.1.windows.1
+

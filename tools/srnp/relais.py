@@ -19,6 +19,10 @@ that left: the AI takes it over, with a character drawn at random here (the same
 the relay gives it the AI flag as its input for the whole race. Until every seat has sent its first input, no
 frame is closed without it (a runner that has just loaded is slow for a while): no input of the start
 is replaced.
+
+Tags: a runner may send TAG <seat> <tag> (its player's tag, up to 8 characters); the relay keeps them and
+sends TAGS <tag 0>,<tag 1>,... ("-": none) to every connection at each new one and when a seat connects.
+They are only shown (labels, results, waiting screen): nothing of the race depends on them.
 """
 import argparse
 import asyncio
@@ -60,6 +64,7 @@ class Relais:
         self.ck = {}                  # frame -> {siège: hash}
         self.ck_ok = 0
         self.ck_ko = 0
+        self.tags = [""] * sieges     # le tag de chaque siège (TAG), seulement affiché
         self.debut = time.monotonic()
 
     def log(self, texte):
@@ -130,6 +135,9 @@ class Relais:
                 self.log(f"frame {f} fermée ; {self.fermees} frames, {self.en_retard} entrées en retard "
                          f"remplacées ; sommes de contrôle : {self.ck_ok} identiques, {self.ck_ko} divergences")
 
+    def ligne_tags(self):
+        return "TAGS " + ",".join(t or "-" for t in self.tags)
+
     def actifs(self):
         return [s for s in range(self.sieges) if self.etat[s] != "X"]
 
@@ -190,6 +198,15 @@ class Relais:
                         self.etat[siege] = "V"
                     self.log(f"siège {siege} connecté ({len(self.clients)}/{self.sieges})")
                     await self.annoncer()
+                    if any(self.tags):
+                        await self.diffuser(self.ligne_tags())
+                elif mots[0] == "TAG":
+                    s = int(mots[1])
+                    tag = "".join(c for c in (mots[2] if len(mots) > 2 else "") if c != ",")[:8].upper()
+                    if 0 <= s < self.sieges and tag and tag != self.tags[s]:
+                        self.tags[s] = tag
+                        self.log(f"tag du siège {s} : {tag}")
+                        await self.diffuser(self.ligne_tags())
                 elif mots[0] == "IN":
                     f, s, pad = int(mots[1]), int(mots[2]), mots[3]
                     self.derniere_recue[s] = f
