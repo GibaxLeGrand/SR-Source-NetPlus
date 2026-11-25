@@ -23,6 +23,10 @@ is replaced.
 Tags: a runner may send TAG <seat> <tag> (its player's tag, up to 8 characters); the relay keeps them and
 sends TAGS <tag 0>,<tag 1>,... ("-": none) to every connection at each new one and when a seat connects.
 They are only shown (labels, results, waiting screen): nothing of the race depends on them.
+
+Lobby (experimental): HELLO <seat> <seats> <delay> LOBBY says the seat will choose: it stays O until
+READY <seat> (UNREADY <seat>: back to choosing). PICK <seat> <character> <gear> at each change; the relay
+sends PICKS <c0>/<g0>,<c1>/<g1>,... ("-": none yet) to everyone; the runners set up the race with them.
 """
 import argparse
 import asyncio
@@ -65,6 +69,7 @@ class Relais:
         self.ck_ok = 0
         self.ck_ko = 0
         self.tags = [""] * sieges     # le tag de chaque siège (TAG), seulement affiché
+        self.choix = [""] * sieges    # lobby : « perso/planche » de chaque siège (PICK)
         self.debut = time.monotonic()
 
     def log(self, texte):
@@ -135,6 +140,9 @@ class Relais:
                 self.log(f"frame {f} fermée ; {self.fermees} frames, {self.en_retard} entrées en retard "
                          f"remplacées ; sommes de contrôle : {self.ck_ok} identiques, {self.ck_ko} divergences")
 
+    def ligne_choix(self):
+        return "PICKS " + ",".join(c or "-" for c in self.choix)
+
     def ligne_tags(self):
         return "TAGS " + ",".join(t or "-" for t in self.tags)
 
@@ -194,12 +202,27 @@ class Relais:
                     if len(mots) > 3:
                         self.delai_entree = max(self.delai_entree, int(mots[3]))
                     self.clients[siege] = writer
+                    lobby = len(mots) > 4 and mots[4] == "LOBBY"
                     if not self.go:
-                        self.etat[siege] = "V"
+                        self.etat[siege] = "O" if lobby else "V"
                     self.log(f"siège {siege} connecté ({len(self.clients)}/{self.sieges})")
                     await self.annoncer()
                     if any(self.tags):
                         await self.diffuser(self.ligne_tags())
+                    if any(self.choix):
+                        await self.diffuser(self.ligne_choix())
+                elif mots[0] == "PICK":
+                    s_, c, g = int(mots[1]), int(mots[2]), int(mots[3])
+                    if 0 <= s_ < self.sieges and 0 <= c <= 16 and 0 <= g < 64 and not self.go:
+                        self.choix[s_] = f"{c}/{g}"
+                        await self.diffuser(self.ligne_choix())
+                elif mots[0] in ("READY", "UNREADY"):
+                    s_ = int(mots[1])
+                    if 0 <= s_ < self.sieges and not self.go and self.etat[s_] != "X":
+                        self.etat[s_] = "V" if mots[0] == "READY" else "O"
+                        self.log(f"siège {s_} : {'prêt' if mots[0] == 'READY' else 'choisit encore'} "
+                                 f"({self.choix[s_] or 'sans choix'})")
+                        await self.annoncer()
                 elif mots[0] == "TAG":
                     s = int(mots[1])
                     tag = "".join(c for c in (mots[2] if len(mots) > 2 else "") if c != ",")[:8].upper()

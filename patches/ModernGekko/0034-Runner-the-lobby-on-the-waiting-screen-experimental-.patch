@@ -1,0 +1,207 @@
+From b93362ceb877587a39e5b259661c751da1a7ec78 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:21:33 +0100
+Subject: [PATCH] Runner: the lobby on the waiting screen, experimental
+ (SRNP_LOBBY=1)
+
+HELLO ... LOBBY: the seat chooses before it is ready. On the waiting screen the local pad (manette mode)
+picks the character (left/right, Super Sonic left out) and the gear (up/down), A is ready; PICK and
+READY go to the relay, whose PICKS set every seat's choice (heads on the waiting screen, the race's
+characters). SRNP_LOBBY_AUTO=<c>/<g>/<s> chooses alone (tests). The relay is read every 16 ms between
+the choices (LineReady). Measured: 3 runners choosing Knuckles, Rouge and NiGHTS alone, GO once all
+were ready, the race with those characters, 26 checksums equal. Not yet: B back to choosing, the
+gear's name, the host's settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp | 131 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 129 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 25bcd3e..7668877 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -48,6 +48,7 @@
+ #include "Core/HW/Memmap.h"
+ #include "Core/System.h"
+ #include "Core/HW/GCPad.h"
++#include "InputCommon/ControllerInterface/ControllerInterface.h"
+ #include "InputCommon/ControllerInterface/Touch/InputOverrider.h"
+ #include "InputCommon/GCPadStatus.h"
+ 
+@@ -137,6 +138,18 @@ bool ReadLine(std::string* line)
+   }
+ }
+ 
++// Whether a line can be read now, waiting up to `ms` for the relay to send something.
++bool LineReady(int ms)
++{
++  if (s_relay.buffer.find('\n') != std::string::npos)
++    return true;
++  fd_set set;
++  FD_ZERO(&set);
++  FD_SET(s_relay.socket, &set);
++  timeval tv{0, ms * 1000};
++  return select(static_cast<int>(s_relay.socket) + 1, &set, nullptr, nullptr, &tv) > 0;
++}
++
+ std::string Hex(const std::uint8_t* bytes, std::size_t size)
+ {
+   static const char digits[] = "0123456789abcdef";
+@@ -342,6 +355,8 @@ std::uint64_t StateHash()
+   return hash;
+ }
+ 
++bool LobbyOn();
++
+ bool Connect()
+ {
+   const char* address = std::getenv("SRNP_RELAY");
+@@ -439,7 +454,7 @@ bool Connect()
+              sizeof(one));
+   for (const int seat : s_relay.local)
+     if (!SendLine("HELLO " + std::to_string(seat) + " " + std::to_string(s_relay.seats) + " " +
+-                  std::to_string(s_relay.delay)))
++                  std::to_string(s_relay.delay) + (LobbyOn() ? " LOBBY" : "")))
+       return false;
+   // Each local seat's tag (SRNP_TAG for the first, else SRNP_TAGS' entry): the relay passes them on.
+   const char* own = std::getenv("SRNP_TAG");
+@@ -473,6 +488,110 @@ bool TakeTags(const std::string& line)
+   return true;
+ }
+ 
++// Lobby (experimental, SRNP_LOBBY=1): the seats choose their character and gear on the waiting screen.
++bool LobbyOn()
++{
++  static const bool on = [] {
++    const char* v = std::getenv("SRNP_LOBBY");
++    return v && *v == '1';
++  }();
++  return on;
++}
++
++// PICKS <c0>/<g0>,<c1>/<g1>,... ("-": none yet): every seat's choice, for the waiting screen and the race.
++bool TakePicks(const std::string& line)
++{
++  if (line.rfind("PICKS ", 0) != 0)
++    return false;
++  std::size_t p = 6;
++  for (int seat = 0; seat < 8 && p <= line.size(); ++seat)
++  {
++    int character = -1, gear = 0;
++    if (std::sscanf(line.c_str() + p, "%d/%d", &character, &gear) == 2 && character >= 0)
++      SetSeatChoice(seat, character, gear);
++    const std::size_t q = line.find(',', p);
++    if (q == std::string::npos)
++      break;
++    p = q + 1;
++  }
++  return true;
++}
++
++// The local seat's choice on the waiting screen: left/right (D-pad or stick) the character (0-16 but
++// Super Sonic), up/down the gear, A ready, B back to choosing. SRNP_LOBBY_AUTO=<c>/<g>/<seconds> (tests):
++// that choice, then ready, after that many seconds.
++struct LobbyLocal
++{
++  int character = 0, gear = 0;
++  bool ready = false, started = false;
++  unsigned previous = 0;
++  std::chrono::steady_clock::time_point since;
++};
++
++void LobbySend(int seat, const LobbyLocal& l)
++{
++  SendLine("PICK " + std::to_string(seat) + " " + std::to_string(l.character) + " " +
++           std::to_string(l.gear));
++}
++
++bool LobbyStep(LobbyLocal* l)
++{
++  const int seat = s_relay.local.front();
++  if (!l->started)
++  {
++    l->started = true;
++    l->since = std::chrono::steady_clock::now();
++    l->character = std::max(0, SeatCharacter(seat));
++    LobbySend(seat, *l);
++  }
++  if (l->ready)
++    return false;
++  static const char* autopick = std::getenv("SRNP_LOBBY_AUTO");
++  if (autopick && *autopick)
++  {
++    int c = 0, g = 0, seconds = 3;
++    std::sscanf(autopick, "%d/%d/%d", &c, &g, &seconds);
++    if (std::chrono::steady_clock::now() - l->since < std::chrono::seconds(seconds))
++      return false;
++    l->character = c, l->gear = g, l->ready = true;
++    LobbySend(seat, *l);
++    SendLine("READY " + std::to_string(seat));
++    return true;
++  }
++  g_controller_interface.UpdateInput();  // the game stands still: nothing else reads the pads now
++  const Pad pad = s_relay.input_mode == "manette" ? RealPad() : Pad{};
++  unsigned bits = (static_cast<unsigned>(pad[0]) << 8) | pad[1];
++  const int x = static_cast<std::int8_t>(pad[2]), y = static_cast<std::int8_t>(pad[3]);
++  bits |= (x < -40 ? 0x100u : 0u) | (x > 40 ? 0x200u : 0u) | (y > 40 ? 0x40u : 0u) |
++          (y < -40 ? 0x80u : 0u);
++  const unsigned pressed = bits & ~l->previous;
++  l->previous = bits;
++  bool changed = false;
++  const auto next = [](int c, int step) {
++    do
++      c = (c + step + 17) % 17;
++    while (c == 11);  // not Super Sonic
++    return c;
++  };
++  if (pressed & 0x100u)
++    l->character = next(l->character, -1), changed = true;
++  if (pressed & 0x200u)
++    l->character = next(l->character, 1), changed = true;
++  if (pressed & 0x40u)
++    l->gear = (l->gear + 1) % 40, changed = true;
++  if (pressed & 0x80u)
++    l->gear = (l->gear + 39) % 40, changed = true;
++  if (changed)
++    LobbySend(seat, *l);
++  if (pressed & 0x1u)
++  {
++    l->ready = true;
++    SendLine("READY " + std::to_string(seat));
++    changed = true;
++  }
++  return changed;
++}
++
+ // The start together: after HELLO, the runner waits at its first frame until every seat is there. The
+ // relay says WAIT <present> <seats> <states> at each arrival and every 2 s (which keeps the connection
+ // alive past the receive time limit), then GO, with the characters of the seats the AI takes over.
+@@ -488,15 +607,23 @@ void WaitForGo()
+   RedrawWhileWaiting();
+   const auto t0 = std::chrono::steady_clock::now();
+   std::string shown;
++  LobbyLocal lobby;
+   for (;;)
+   {
++    // Lobby: the local choice between the relay's lines, every 16 ms.
++    if (LobbyOn() && !s_relay.local.empty() && !LineReady(16))
++    {
++      if (LobbyStep(&lobby))
++        RedrawWhileWaiting();
++      continue;
++    }
+     std::string line;
+     if (!ReadLine(&line))
+     {
+       s_waiting = false;
+       return Off("relay lost while waiting for the other seats");
+     }
+-    if (TakeTags(line))
++    if (TakeTags(line) || TakePicks(line))
+     {
+       RedrawWhileWaiting();
+       continue;
+-- 
+2.34.1.windows.1
+

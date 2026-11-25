@@ -40,6 +40,9 @@ sleep 2
 sleep 1
 # TAGS_RELAIS="T0,T1,..." : chaque runner n'a que son tag (SRNP_TAG) ; ceux des autres viennent du relais.
 tag_de() { [[ -n "${TAGS_RELAIS:-}" ]] && echo "$TAGS_RELAIS" | cut -d, -f$(($1 + 1)) || true; }
+# LOBBY=1 : le lobby à l'essai (choix du perso sur l'écran d'attente) ; LOBBY_AUTO="c/g/s;..." : le choix
+# automatique de chaque runner (perso/planche/secondes avant d'être prêt).
+auto_de() { [[ -n "${LOBBY_AUTO:-}" ]] && echo "$LOBBY_AUTO" | cut -d';' -f$(($1 + 1)) || true; }
 lance() {  # lance <siège>
   local r=$1 D="$RUN/runner$1"
   mkdir -p "$D/auto/commands" "$D/ck"
@@ -54,7 +57,7 @@ lance() {  # lance <siège>
   fi
   local SON=--mute; [[ "$r" == "${SON_RUNNER:-0}" ]] && SON=
   (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU="${TOUS_CPU:-1}" \
-     SRNP_PERSOS="$PERSOS" SRNP_INPUT=ia SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_TAG="$(tag_de "$r")" SRNP_CKDUMP="$(w "$D/ck")" \
+     SRNP_PERSOS="$PERSOS" SRNP_INPUT=ia SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_TAG="$(tag_de "$r")" SRNP_LOBBY="${LOBBY:-0}" SRNP_LOBBY_AUTO="$(auto_de "$r")" SRNP_CKDUMP="$(w "$D/ck")" \
      MODERNGEKKO_STATICRECOMP=1 ./moderngekko-run.exe --game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" \
      --automation-dir "$(w "$D/auto")" $SON --load-state "$(w "$STATE")" \
      --module "$(w "$CHASSIS/gGXEE8P_recomp.dll")" > "$D/runner.log" 2>&1) &
