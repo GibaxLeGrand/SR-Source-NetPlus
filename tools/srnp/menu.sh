@@ -6,6 +6,7 @@
 #   menu.sh shot <nom>            photo de la fenêtre (<run>/<nom>.png)
 #   menu.sh dump <nom>            MEM1 dans <run>/<nom>_lo.bin et _hi.bin
 #   menu.sh poke <adresse> <hex>  écrit des octets
+#   menu.sh peek <adresse> [n]    lit n octets (défaut 4)
 #   menu.sh save <nom>            save state <run>/<nom>.sav
 #   menu.sh stop                  arrête ce runner (et lui seul)
 set -uo pipefail
@@ -51,6 +52,11 @@ case "$1" in
     cmd "command=read_memory\naddress=0x81000000\nsize=8388608\npath=$(win "$(run)/$2_hi.bin")\n"
     cmd "command=resume\n" ;;
   poke) cmd "command=write_memory\naddress=$2\ndata=$3\n" ;;
+  plage)  # plage <adresse> <taille> <nom> : ces octets dans <run>/<nom>.bin (sans pause)
+    cmd "command=read_memory\naddress=$2\nsize=$3\npath=$(win "$(run)/$4.bin")\n" ;;
+  peek)  # peek <adresse> [taille] : les octets en hexadécimal
+    f="$(run)/peek.bin"; rm -f "$f"
+    cmd "command=read_memory\naddress=$2\nsize=${3:-4}\npath=$(win "$f")\n" && od -An -tx1 "$f" | tr -d ' \n'; echo ;;
   save) cmd "command=save_state\npath=$(win "$(run)/$2.sav")\n" ;;
   stop)
     printf 'command=stop\n' > "$(run)/runner0/auto/commands/z.txt"; sleep 5

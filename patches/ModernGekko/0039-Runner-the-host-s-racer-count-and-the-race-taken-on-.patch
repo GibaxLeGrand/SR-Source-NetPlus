@@ -1,0 +1,315 @@
+From 1a7eccaa7873e3479fe6599a14399592cc239845 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:33:06 +0100
+Subject: [PATCH] Runner: the host's racer count, and the race taken on every
+ course
+
+The lobby host also sets the racers (Z: from the seats to 8; the AI drives the ones no seat has):
+RULES carries it, every runner sets SRNP_NB_RACERS's count from it at GO, and the waiting screen shows
+it ("4 RACERS").
+On SEGA Illusion the runner never took the race (one view for all, the HUD of racer 0): 0x801DFC80 is
+not a race phase but a value of the course's world (measured on the 16 courses: 0x10 on Player Entry
+and while loading, then 0xE, 0xD, 0x16, 3, or still 0x10 on Digital Dimension and Babylon Guardian).
+Sampled from Start on courses 1 and 7, 0x8021BB88 is 1 while the race loads and 0x8021C1C0 goes from 0
+to 4 at the sample where 0x801DFC80 changed on Metal City: the race is taken on those.
+Measured: SEGA Illusion with 3 seats and 4 racers, one view a runner (4th, 1st, 2nd), 39 identical
+checksums; Digital Dimension and Metal City races taken as before, 39 and 40 identical checksums. The
+16 course names checked on each race's title card.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp         | 32 +++++++++++++++++++----
+ src/runtime/srnp_racers.hpp         |  5 ++++
+ src/runtime/srnp_relay.cpp          | 40 +++++++++++++++++++----------
+ src/runtime/srnp_relay.hpp          |  1 +
+ src/runtime/srnp_waiting_screen.cpp | 11 ++++----
+ 5 files changed, 65 insertions(+), 24 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 52c9ec4..2aafead 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -4,6 +4,7 @@
+ #include "srnp_racers.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -27,7 +28,14 @@ constexpr std::uint32_t kGamePads = 0x801AF9F0;  // the game's controller struct
+ constexpr std::uint32_t kSeatPads = 0x80002C00;  // ours: low memory that stays at zero in races
+ constexpr std::uint32_t kPadSize = 0x30;
+ constexpr std::uint32_t kRacerCount = 0x8021B8C0;  // racers in the race (CPUs + humans)
+-constexpr std::uint32_t kRacePhase = 0x801DFC80;   // 0x10 before the start, 0xE racing (and on results)
++// Not a phase (measured on 2026-11-25 on the 16 courses): 0x10 on Player Entry and while the race loads,
++// then a value of the course's world (0xE Metal City, 0xD Egg Factory, 3 SEGA Carnival, 0x10 still for
++// Digital Dimension and Babylon Guardian). Only logged now.
++constexpr std::uint32_t kRacePhase = 0x801DFC80;
++// The race runs (measured on 2026-11-25, courses 1 and 7, sampled from Start): 0x8021BB88 is 1 while the
++// race loads (from the racer count's change), 0 after; 0x8021C1C0 goes from 0 to 4 at the same sample
++// (when 0x801DFC80 changed on Metal City, where the runner took the race until then).
++constexpr std::uint32_t kRaceLoading = 0x8021BB88, kRaceScene = 0x8021C1C0;
+ constexpr std::uint32_t kCameraRacer = 0x80601F71;  // racer followed by viewport 0's camera
+ constexpr std::uint32_t kCameraRacer1 = 0x806021CD;  // viewport 1's (viewports 0x25C apart)
+ constexpr std::uint32_t kPlayerCount = 0x8021B8C8;  // players (viewports)
+@@ -375,6 +383,7 @@ int AllCpuMode()
+ 
+ // SRNP_NB_RACERS=<n>: the number of racers the race is set up with (the menu only makes 8, or 4
+ // with 3 or more players).
++std::atomic<int> s_nb_racers{-1};  // the lobby host's count (SetNbRacers), else SRNP_NB_RACERS
+ int NbRacers()
+ {
+   static const int n = [] {
+@@ -382,7 +391,8 @@ int NbRacers()
+     const int x = v ? std::atoi(v) : 0;
+     return x >= 1 && x <= 8 ? x : 0;
+   }();
+-  return n;
++  const int host = s_nb_racers;
++  return host >= 1 ? host : n;
+ }
+ 
+ // Between the menu's writing of the racers (after Start, the racer count leaves 1, the Player
+@@ -461,6 +471,17 @@ int SeatGear(int seat)
+   return seat >= 0 && seat < 8 ? Lobby()[static_cast<std::size_t>(seat)].gear : -1;
+ }
+ 
++void SetNbRacers(int racers)
++{
++  if (racers >= 1 && racers <= 8)
++    s_nb_racers = racers;
++}
++
++int RacersWanted()
++{
++  return NbRacers();
++}
++
+ int GearCount()
+ {
+   return kGears;
+@@ -668,8 +689,8 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     SetUpRace(racers);
+   const std::uint32_t phase = Read32(kRacePhase);
+   const std::uint32_t count = Read32(kRacerCount);
+-  // 0xE: the race is set up (0x10 while it loads: the game still writes the racers then).
+-  const bool racing = count >= 2 && count <= 8 && phase == 0xE;
++  // The race is set up and runs (while it loads, the game still writes the racers).
++  const bool racing = count >= 2 && count <= 8 && Read32(kRaceLoading) == 0 && Read32(kRaceScene) == 4;
+   if (racing && !s_race && Get32(racers) == kGamePads)
+   {
+     // A race the game has set up (racer 0 points to port 0's structure), not taken yet.
+@@ -763,7 +784,8 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchAnimation(false);
+     PatchZones(false);
+     PatchTest(false);
+-    std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
++    std::fprintf(stderr, "[srnp racers] race over (0x%X, loading %u, scene %u): racers back to the game\n",
++                 phase, Read32(kRaceLoading), Read32(kRaceScene));
+     return false;
+   }
+   for (std::size_t k = 0; k < pads.size() && k < count; ++k)
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index aefc28a..5058d67 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -48,6 +48,11 @@ void SetSeatChoice(int seat, int character, int gear);
+ int SeatCharacter(int seat);
+ int SeatGear(int seat);
+ 
++// The racers in the race (the AI drives the ones no seat has): the lobby host's count, else
++// SRNP_NB_RACERS (0: the menu's).
++void SetNbRacers(int racers);
++int RacersWanted();
++
+ // The game's gears (41) and whether a character may ride one (the gear table, in the game's memory
+ // once its REL is loaded: false for every gear before).
+ int GearCount();
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index dd76f3d..50feb12 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -501,11 +501,12 @@ bool LobbyOn()
+ // The race's rules in the game's memory (measured on 2026-11-25 through the menus): the course (1 Metal
+ // City .. 16 SEGA Illusion), read when the race loads after Player Entry, and the laps (the rule the game
+ // keeps once Rule Settings is left; 0x803E2978 is only the menu's copy). The host (seat 0) sets them in
+-// the lobby; the relay passes them on (RULES <course> <laps>); every runner writes them at GO, before
+-// the menu's Start, so the race loads the host's course.
++// the lobby, with the racers (the AI drives the ones no seat has: SetNbRacers); the relay passes them on
++// (RULES <course> <laps> <racers>); every runner writes them at GO, before the menu's Start, so the race
++// loads the host's course.
+ constexpr std::uint32_t kRuleCourse = 0x806129ABu, kRuleLaps = 0x805D507Bu;
+ constexpr int kCourses = 16, kMaxLaps = 9;
+-std::atomic<int> s_rule_course{-1}, s_rule_laps{-1};
++std::atomic<int> s_rule_course{-1}, s_rule_laps{-1}, s_rule_racers{-1};
+ 
+ std::uint8_t* GuestByte(std::uint32_t address)
+ {
+@@ -517,11 +518,11 @@ std::uint8_t* GuestByte(std::uint32_t address)
+ 
+ bool TakeRules(const std::string& line)
+ {
+-  int course = 0, laps = 0;
+-  if (std::sscanf(line.c_str(), "RULES %d %d", &course, &laps) != 2)
++  int course = 0, laps = 0, racers = -1;
++  if (std::sscanf(line.c_str(), "RULES %d %d %d", &course, &laps, &racers) < 2)
+     return false;
+   if (course >= 1 && course <= kCourses && laps >= 1 && laps <= kMaxLaps)
+-    s_rule_course = course, s_rule_laps = laps;
++    s_rule_course = course, s_rule_laps = laps, s_rule_racers = racers >= 1 && racers <= 8 ? racers : -1;
+   return true;
+ }
+ 
+@@ -534,10 +535,11 @@ void ApplyRules()
+   std::uint8_t* l = GuestByte(kRuleLaps);
+   if (!c || !l)
+     return;
+-  std::fprintf(stderr, "[srnp relay] the host's rules: course %d (was %d), %d laps (was %d)\n", course, *c,
+-               laps, *l);
++  std::fprintf(stderr, "[srnp relay] the host's rules: course %d (was %d), %d laps (was %d), %d racers\n",
++               course, *c, laps, *l, static_cast<int>(s_rule_racers));
+   *c = static_cast<std::uint8_t>(course);
+   *l = static_cast<std::uint8_t>(laps);
++  SetNbRacers(s_rule_racers);
+ }
+ 
+ // PICKS <c0>/<g0>,<c1>/<g1>,... ("-": none yet): every seat's choice, for the waiting screen and the race.
+@@ -564,7 +566,8 @@ bool TakePicks(const std::string& line)
+ // Tests: SRNP_LOBBY_AUTO=<c>/<g>/<seconds>[/<back>]: that choice, then ready, after that many seconds;
+ // with <back>, B that many seconds later (back to choosing), then A again after as many.
+ // SRNP_LOBBY_KEYS=<L R U D A B...>: those presses in place of the pad's, one every 0.5 s after 3 s.
+-// The host (seat 0) also sets the rules while choosing: X/Y the course, R/L the laps (keys X Y + -).
++// The host (seat 0) also sets the rules while choosing: X/Y the course, R/L the laps, Z the racers
++// (keys X Y + - Z).
+ struct LobbyLocal
+ {
+   int character = 0, gear = 0;
+@@ -574,6 +577,11 @@ struct LobbyLocal
+   std::chrono::steady_clock::time_point since;
+ };
+ 
++void SendRules(int course, int laps, int racers)
++{
++  SendLine("RULES 0 " + std::to_string(course) + " " + std::to_string(laps) + " " + std::to_string(racers));
++}
++
+ void LobbySend(int seat, const LobbyLocal& l)
+ {
+   SendLine("PICK " + std::to_string(seat) + " " + std::to_string(l.character) + " " +
+@@ -593,7 +601,7 @@ bool LobbyStep(LobbyLocal* l)
+     const std::uint8_t* c = GuestByte(kRuleCourse);
+     const std::uint8_t* laps = GuestByte(kRuleLaps);
+     if (seat == 0 && c && laps && *c >= 1 && *c <= kCourses && *laps >= 1 && *laps <= kMaxLaps)
+-      SendLine("RULES 0 " + std::to_string(*c) + " " + std::to_string(*laps));
++      SendRules(*c, *laps, std::max(s_relay.seats, RacersWanted() ? RacersWanted() : 8));
+   }
+   const auto set_ready = [&](bool ready) {
+     l->ready = ready;
+@@ -627,7 +635,7 @@ bool LobbyStep(LobbyLocal* l)
+     {
+       const char k = keys[i];
+       bits = k == 'L' ? 0x100u : k == 'R' ? 0x200u : k == 'U' ? 0x40u : k == 'D' ? 0x80u : k == 'A' ? 0x1u :
+-             k == 'B' ? 0x2u : k == 'X' ? 0x4u : k == 'Y' ? 0x8u : k == '+' ? 0x800u : k == '-' ? 0x400u : 0u;
++             k == 'B' ? 0x2u : k == 'X' ? 0x4u : k == 'Y' ? 0x8u : k == '+' ? 0x800u : k == '-' ? 0x400u : k == 'Z' ? 0x10u : 0u;
+     }
+   }
+   else
+@@ -683,10 +691,11 @@ bool LobbyStep(LobbyLocal* l)
+     l->gear = next_gear(l->gear, -1, l->character), changed = true;
+   if (changed)
+     LobbySend(seat, *l);
+-  // The host's rules: X/Y the course, R/L the laps.
+-  if (seat == 0 && s_rule_course >= 1 && (pressed & (0x4u | 0x8u | 0x400u | 0x800u)))
++  // The host's rules: X/Y the course, R/L the laps, Z the racers (from the seats to 8).
++  if (seat == 0 && s_rule_course >= 1 && (pressed & (0x4u | 0x8u | 0x10u | 0x400u | 0x800u)))
+   {
+     int course = s_rule_course, laps = s_rule_laps;
++    int racers = std::max(s_relay.seats, static_cast<int>(s_rule_racers));
+     if (pressed & 0x4u)
+       course = course % kCourses + 1;
+     if (pressed & 0x8u)
+@@ -695,7 +704,9 @@ bool LobbyStep(LobbyLocal* l)
+       laps = std::min(kMaxLaps, laps + 1);
+     if (pressed & 0x400u)
+       laps = std::max(1, laps - 1);
+-    SendLine("RULES 0 " + std::to_string(course) + " " + std::to_string(laps));
++    if (pressed & 0x10u)
++      racers = racers >= 8 ? s_relay.seats : racers + 1;
++    SendRules(course, laps, racers);
+     changed = true;
+   }
+   if (pressed & 0x1u)
+@@ -799,6 +810,7 @@ WaitView RelayWaitView()
+   view.host = view.lobby && std::find(view.local.begin(), view.local.end(), 0) != view.local.end();
+   view.course = s_rule_course;
+   view.laps = s_rule_laps;
++  view.racers = s_rule_racers;
+   for (int k = 0; k < view.seats && k < 8; ++k)
+   {
+     view.characters[static_cast<std::size_t>(k)] = SeatCharacter(k);
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 9c5b896..40e3297 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -40,6 +40,7 @@ struct WaitView
+   bool lobby = false;
+   bool host = false;  // this machine has seat 0: it sets the rules
+   int course = -1, laps = -1;  // the host's rules (-1: the save state's)
++  int racers = -1;             // the host's racers, the AI's included (-1: the seats)
+   int seats = 0;
+   std::string states;
+   std::vector<int> local;
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 1651920..8535fce 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -48,7 +48,7 @@ constexpr const char* kGearNames[] = {
+     "GRINDER",      "ADVANTAGE S", "ADVANTAGE F", "ADVANTAGE P",   "CANNONBALL"};
+ static_assert(std::size(kGearNames) == 41);
+ 
+-// The courses by the game's number (1-16: measured on 2026-11-25, the race's title for 1, 2, 9, 13, 16).
++// The courses by the game's number (1-16: measured on 2026-11-25, the race's title card for each).
+ constexpr const char* kCourseNames[] = {
+     "",           "METAL CITY",  "SPLASH CANYON", "EGG FACTORY", "GREEN CAVE",        "SAND RUINS",
+     "BABYLON GARDEN", "DIGITAL DIMENSION", "SEGA CARNIVAL", "NIGHT CHASE", "RED CANYON", "ICE FACTORY",
+@@ -170,7 +170,7 @@ void LobbyHint(const WaitView& view, ImDrawList* list, ImFont* font, ImVec2 disp
+   // the host's rules, while it chooses
+   if (view.host && s == 'O' && view.course >= 1)
+   {
+-    const char* rules = "X/Y  TRACK      L/R  LAPS";
++    const char* rules = "X/Y  TRACK      L/R  LAPS      Z  RACERS";
+     const ImVec2 above(display.x * 0.5f, display.y * 0.865f);
+     if (!(name_font && NameTextCentred(list, rules, above, unit * 0.75f, Rgba(120, 220, 255), display.x * 0.9f)))
+       TextCentred(list, font, unit * 0.55f, above, Rgba(120, 220, 255), rules);
+@@ -233,7 +233,7 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+     // the line would not fit
+     char texts[3][32];
+     std::snprintf(texts[0], sizeof(texts[0]), "%d PLAYERS", players);
+-    std::snprintf(texts[1], sizeof(texts[1]), "%d RACERS", seats);
++    std::snprintf(texts[1], sizeof(texts[1]), "%d RACERS", view.racers > 0 ? view.racers : seats);
+     std::snprintf(texts[2], sizeof(texts[2]), "%d/%d READY", ready, players);
+     float h = unit * 0.95f, gap = unit * 1.6f;
+     GamePicture pictures[3];
+@@ -258,7 +258,8 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+   }
+   else
+   {
+-    std::snprintf(line, sizeof(line), "%d Players    %d Racers    %d/%d Ready", players, seats, ready, players);
++    std::snprintf(line, sizeof(line), "%d Players    %d Racers    %d/%d Ready", players,
++                  view.racers > 0 ? view.racers : seats, ready, players);
+     TextCentred(list, font, unit * 0.95f, ImVec2(display.x * 0.5f, display.y * 0.19f), Rgba(255, 255, 255), line);
+   }
+ 
+@@ -372,7 +373,7 @@ void Draw(const WaitView& view)
+   char line[64];
+   std::snprintf(line, sizeof(line), "%d Players", players);
+   TextCentred(list, font, unit * 1.1f, ImVec2(display.x * 0.5f, display.y * 0.14f), Rgba(255, 255, 255), line);
+-  std::snprintf(line, sizeof(line), "%d Racers", seats);
++  std::snprintf(line, sizeof(line), "%d Racers", view.racers > 0 ? view.racers : seats);
+   TextCentred(list, font, unit * 1.1f, ImVec2(display.x * 0.5f, display.y * 0.22f), Rgba(255, 255, 255), line);
+   std::snprintf(line, sizeof(line), "%d/%d Ready", ready, players);
+   TextCentred(list, font, unit * 1.1f, ImVec2(display.x * 0.5f, display.y * 0.30f), Rgba(255, 214, 64), line);
+-- 
+2.34.1.windows.1
+
