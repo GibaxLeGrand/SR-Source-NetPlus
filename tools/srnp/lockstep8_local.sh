@@ -57,21 +57,29 @@ for r in $(seq 0 $((N - 1))); do
   [[ " ${SON:-} " == *" $r "* ]] || ARGS+=(--mute)
   # HD="0 1 2 3" (ou all) : ces runners-là chargent le pack de textures HD (work\textures\pack_hd), en
   # deux mods (Gigapixel AI, puis Waifu Caffe qui gagne sur les doublons), par des jonctions.
+  # ETIQ="0 3" (ou all) : ces runners-là montent le mod des étiquettes 5P-8P (work\etiquettes\mods :
+  # srnp_etiquettes, un GTSE à nous, et srnp_etiquettes_hd avec HD). Visible depuis un state pris avant
+  # le chargement de la course (pret1p…).
+  MODS=()
+  E="$W/etiquettes/mods"
+  etiq=0; [[ " ${ETIQ:-} " == *" $r "* || "${ETIQ:-}" == all ]] && etiq=1
+  (( etiq )) && MODS+=("srnp_etiquettes:files:$E/srnp_etiquettes/files")
   if [[ " ${HD:-} " == *" $r "* || "${HD:-}" == all ]]; then
     # RES=1920x1080 (ou 1280x720, 2560x1440…) : la résolution interne de ces runners-là.
     [[ -n "${RES:-}" ]] && sed -i "s/^resolution=.*/resolution=$RES/" "$D/userdir/config.ini"
     P="$W/textures/pack_hd/Vanilla(ECT_Optimized)"
-    for m in "hd_gigapixel:Gigapixel AI" "hd_waifu:Waifu Caffe (Denoise & Magnify)"; do
-      id="${m%%:*}"; src="${m#*:}"
-      mkdir -p "$D/userdir/Mods/$id"
-      printf 'name=%s\ngame=GXEE8P\n' "$id" > "$D/userdir/Mods/$id/mod.ini"
-      # (cmd mklink /J : Git Bash change /J en chemin ; PowerShell s'en sort, & et () compris.)
-      powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/$id/textures")' -Target '$(w "$P/$src")' | Out-Null"
-      printf 'mod=%s\n' "$id" >> "$D/userdir/config.ini"
-    done
-  else
-    ARGS+=(--no-mods)
+    MODS+=("hd_gigapixel:textures:$P/Gigapixel AI" "hd_waifu:textures:$P/Waifu Caffe (Denoise & Magnify)")
+    (( etiq )) && MODS+=("srnp_etiquettes_hd:textures:$E/srnp_etiquettes_hd/textures")
   fi
+  for m in "${MODS[@]}"; do
+    id="${m%%:*}"; rest="${m#*:}"; kind="${rest%%:*}"; src="${rest#*:}"
+    mkdir -p "$D/userdir/Mods/$id"
+    printf 'name=%s\ngame=GXEE8P\n' "$id" > "$D/userdir/Mods/$id/mod.ini"
+    # (cmd mklink /J : Git Bash change /J en chemin ; PowerShell s'en sort, & et () compris.)
+    powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/$id/$kind")' -Target '$(w "$src")' | Out-Null"
+    printf 'mod=%s\n' "$id" >> "$D/userdir/config.ini"
+  done
+  (( ${#MODS[@]} )) || ARGS+=(--no-mods)
   if [[ "$MODE" == "natif" ]]; then
     ARGS+=(--module "$(w "$CHASSIS/gGXEE8P_recomp.dll")"); export MODERNGEKKO_STATICRECOMP=1
   else export MODERNGEKKO_STATICRECOMP=0; fi

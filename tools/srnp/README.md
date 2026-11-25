@@ -59,6 +59,10 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   `SRNP_JOUEUR=0` keeps the game's. `SRNP_WATCH=<addresses>` logs guest words when they change,
   `SRNP_TRACE=<addresses>` which racer takes a path. `SON="0"` in the lockstep script keeps runner 0's
   sound (all runners are muted otherwise; muting does not change the emulation).
+- The 5P-8P labels over the players' racers (patch 0014, from the labels session: a texture of our own
+  in the GTSE of the srnp_etiquettes file mod; nothing changes without it). `ETIQ="0 3"` (or all) in the
+  lockstep script mounts the mod on those runners (and srnp_etiquettes_hd with `HD`); start from a save
+  state taken before the race loads (pret1p...).
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same

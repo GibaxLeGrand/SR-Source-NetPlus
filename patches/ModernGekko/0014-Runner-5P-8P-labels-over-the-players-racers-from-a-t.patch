@@ -1,0 +1,374 @@
+From b759373a0c574a63840e7d6b558d8dea61491b18 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:45:26 +0100
+Subject: [PATCH] Runner: 5P-8P labels over the players' racers, from a texture
+ of our own
+
+The game draws "1P".."4P" over human racers 0..3 and "COM" over CPUs from
+36x30 rectangles of its HUD atlas ("Icon_Eff_E" in GTSE), picked by racer
+index; a human racer 4..7 reads other sprites (character heads). The atlas
+has no room for four more labels, so they come from a texture of our own:
+the srnp_etiquettes file mod (built from the user's disc, outside any
+repository) adds to GTSE a "SRNPLBL1" block, a palette and 256x32 C8 texels
+(5P..8P), the file compressed again no bigger than the game's (from a save
+state, the file table in RAM is the original disc's).
+
+When the loaded GTSE carries that block, srnp_labels patches the two label
+functions (1P HUD 0x8042F47C, split screen 0x804297C8): the rectangle comes
+from a table of ours (the game's 1P-4P and COM, our 5P-8P) and the label's
+quad goes through a 36-word routine that binds our texture around the
+game's quad for 5P-8P. The routine sits in zero padding of the first code
+section (0x80004D40): run from low memory, it hung the game. The label left
+out (the player's own racer) stays the game's or the spotter's.
+
+Measured (2 runners, 8 seats in lockstep, one with the labels, one without):
+43 checksums equal, 0 divergences in JIT64; 38 equal, 0 divergences native;
+29 equal with the HD pack at 1080p on one side.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                  |   1 +
+ src/runtime/dolphin_runtime.cpp |   3 +
+ src/runtime/srnp_labels.cpp     | 259 ++++++++++++++++++++++++++++++++
+ src/runtime/srnp_labels.hpp     |  30 ++++
+ 4 files changed, 293 insertions(+)
+ create mode 100644 src/runtime/srnp_labels.cpp
+ create mode 100644 src/runtime/srnp_labels.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d75c43a..5500f3f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -437,6 +437,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/mod_hud.cpp
+         src/runtime/srnp_relay.cpp
+         src/runtime/srnp_racers.cpp
++        src/runtime/srnp_labels.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index e79aac9..885aef9 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -14,6 +14,7 @@
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/CPU.h"
++#include "srnp_labels.hpp"
+ #include "srnp_racers.hpp"
+ #include "srnp_relay.hpp"
+ #include "Core/HW/GBACore.h"
+@@ -1493,6 +1494,8 @@ RuntimeRunResult Runtime::Run() {
+         // SR-Source Net Plus, phase 1 prototype: the next frame's inputs closed by a relay
+         // (SRNP_RELAY; nothing without it), on this thread, before the game polls its pads.
+         srnp::RelayOnFrame(info.frame_count);
++        // SR-Source Net Plus: the 5P-8P labels (srnp_labels.hpp; only with the srnp_etiquettes mod).
++        srnp::LabelsOnFrame();
+         // SR-Source Net Plus: an exact pause (pad_frames pause_at=<frame>), on this thread.
+         const std::uint64_t pause_at =
+             m_impl->automation_state.pause_at_frame.load(std::memory_order_relaxed);
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+new file mode 100644
+index 0000000..0e9ad1c
+--- /dev/null
++++ b/src/runtime/srnp_labels.cpp
+@@ -0,0 +1,259 @@
++// SR-Source Net Plus: the "1P".."8P" labels. See srnp_labels.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "srnp_labels.hpp"
++
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/JitInterface.h"
++#include "Core/System.h"
++
++namespace srnp
++{
++namespace
++{
++// GXEE8P, _Main.rel loaded at 0x803FBD00 (read in the game's code on 2026-11-25).
++constexpr std::uint32_t kHudTextures = 0x80603494;  // -> the HUD's texture list (6 textures)
++constexpr std::uint32_t kEntrySize = 0x40;           // a list entry: flags, GXTexObj at +0x10...
++constexpr std::uint32_t kAtlasIndex = 5;             // "Icon_Eff_E", the atlas of the labels
++constexpr std::uint32_t kAtlasImage0 = 0x0093FCFF;   // 256x256 C8
++constexpr std::uint32_t kAtlasInGtse = 0x78B60;      // the atlas' texels in the GTSE file
++constexpr std::uint32_t kGtseSize = 0xA9560;         // the game's GTSE (English), decompressed
++// Our block, after it: a 0x20-byte header, the palette (0x200), the texels (256x32 C8, 0x2000):
++// 5P, 6P, 7P, 8P. The compressed file must not outgrow the game's (from a save state, the file table
++// in RAM is the original disc's and the game reads no more than its size; 2026-11-25).
++constexpr std::uint32_t kBlockSize = 0x20 + 0x200 + 0x2000;
++constexpr std::uint32_t kGameLabels = 0x805D3DB4;  // the game's sprite table: 1P..4P, then COM
++
++// Ours, in low memory the game leaves at zero (0x80002C00-0x80002D80: the seats' pads).
++constexpr std::uint32_t kTable = 0x80002E00;  // 16 rectangles: [k] racer k's "nP", [8 + k] COM
++constexpr std::uint32_t kEntry = 0x80002F00;  // our texture entry (0x40 bytes)
++// The routine: code may only run in the game's code sections (in low memory, the game hangs; tried
++// on 2026-11-25), so it goes in zero padding of the first one (0x80004D18-0x800051E4, between the
++// unused debugger vectors; zero in race RAM dumps).
++constexpr std::uint32_t kRoutine = 0x80004D40;
++
++// Two functions draw the labels, on the same pattern: 0x804297C8 for the split-screen HUD
++// (0x80427174; r27 racer, r28 its index) and 0x8042F47C for the 1P HUD (0x8042D42C; r30 racer, r31
++// its index). In each, two places change:
++// - the rectangle (6 words): lbz r15,0xBD(racer); rlwinm r15,r15,7,24,24; rlwimi r15,index,4,25,27;
++//   addis r15,r15,0x8000; addi r15,r15,0x2E00; nop  ->  r15 = kTable + (CPU << 7) + (index << 4);
++// - the label's quad (bl 0x800087CC) goes through the routine.
++// The label left out (the player's own racer) is the game's choice, or the phase 2 runner's ("spotter":
++// cmplwi r31, seat at 0x8042F710, srnp_racers.cpp): not touched here.
++struct Patch
++{
++  std::uint32_t address;
++  std::array<std::uint32_t, 6> game, ours;
++  std::size_t n;
++};
++constexpr std::array<Patch, 4> kPatches = {{
++    {0x80429BFC, {0x881B00BD, 0x28000000, 0x4082000C, 0x81E101AC, 0x48000008, 0x39F90040},
++     {0x89FB00BD, 0x55EF3E30, 0x538F2676, 0x3DEF8000, 0x39EF2E00, 0x60000000}, 6},
++    {0x80429D48, {0x4BBDEA85}, {0x4BBDAFF9}, 1},  // bl 0x800087CC -> bl the routine (split screen)
++    {0x8042F6EC, {0x881E00BD, 0x28000000, 0x4082000C, 0x7E4F9378, 0x48000008, 0x39FA0040},
++     {0x89FE00BD, 0x55EF3E30, 0x53EF2676, 0x3DEF8000, 0x39EF2E00, 0x60000000}, 6},
++    {0x8042F830, {0x4BBD8F9D}, {0x4BBD5511}, 1},  // bl 0x800087CC -> bl the routine (1P)
++}};
++// Our texture holds 5P-8P only: for any other label ((r15 & 0xC0) != 0x40, the table being
++// 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours: saves r3-r9 and
++// f1 (the quad's arguments), binds kEntry to texmap 0 (bl 0x8007D1EC), draws the quad, binds the
++// game's current texture again (lwz r4,-0x7708(r13); li r3,0; bl 0x80053C54). Encoded and checked
++// with capstone (work\etiquettes\code_ppc.py).
++constexpr std::array<std::uint32_t, 36> kRoutineCode = {
++    0x9421FFC0, 0x7C0802A6, 0x90010044, 0x55EB0632, 0x280B0040, 0x40820068, 0x90610008, 0x9081000C,
++    0x90A10010, 0x90C10014, 0x90E10018, 0x9101001C, 0x91210020, 0xD8210028, 0x3C608000, 0x60632F00,
++    0x38800000, 0x48078469, 0x80610008, 0x8081000C, 0x80A10010, 0x80C10014, 0x80E10018, 0x8101001C,
++    0x81210020, 0xC8210028, 0x48003A25, 0x808D88F8, 0x38600000, 0x4804EEA1, 0x48000008, 0x48003A11,
++    0x80010044, 0x7C0803A6, 0x38210040, 0x4E800020};
++
++// Our texture: 256x32 C8, 5P..8P side by side. A rectangle is in the game's units, 1/256 of the
++// texture on both axes (the label code multiplies by 1/256): x as is, y x 8 (32 texels tall).
++
++std::uint8_t* Guest(std::uint32_t address, std::uint32_t size)
++{
++  return Core::System::GetInstance().GetMemory().GetPointerForRange(address, size);
++}
++std::uint32_t Get32(const std::uint8_t* p)
++{
++  return (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) | (std::uint32_t{p[2]} << 8) | p[3];
++}
++void Put32(std::uint8_t* p, std::uint32_t v)
++{
++  p[0] = static_cast<std::uint8_t>(v >> 24);
++  p[1] = static_cast<std::uint8_t>(v >> 16);
++  p[2] = static_cast<std::uint8_t>(v >> 8);
++  p[3] = static_cast<std::uint8_t>(v);
++}
++std::uint32_t Read32(std::uint32_t address)
++{
++  const std::uint8_t* p = Guest(address, 4);
++  return p ? Get32(p) : 0;
++}
++bool InMem1(std::uint32_t address, std::uint32_t size)
++{
++  return address >= 0x80000000u && address + size <= 0x81800000u && address + size > address;
++}
++
++// The address of our texels, or 0: the loaded GTSE must carry our block.
++std::uint32_t OurTexels(std::uint32_t* atlas_entry)
++{
++  const std::uint32_t list = Read32(kHudTextures);
++  if (!InMem1(list, 8))
++    return 0;
++  const std::uint32_t entries = Read32(list + 4);
++  if (Read32(list) <= kAtlasIndex || !InMem1(entries, (kAtlasIndex + 1) * kEntrySize))
++    return 0;
++  const std::uint32_t atlas = entries + kAtlasIndex * kEntrySize;
++  if (Read32(atlas + 0x18) != kAtlasImage0)
++    return 0;
++  const std::uint32_t texels = 0x80000000u | (Read32(atlas + 0x1C) << 5);
++  const std::uint32_t block = texels - kAtlasInGtse + kGtseSize;
++  if (!InMem1(block, kBlockSize))
++    return 0;
++  const std::uint8_t* h = Guest(block, 0x20);
++  if (!h || std::memcmp(h, "SRNPLBL1", 8) != 0 || Get32(h + 0x08) != 0x01000020u ||
++      Get32(h + 0x0C) != 9 || Get32(h + 0x10) != 0x20 || Get32(h + 0x14) != 0x220)
++    return 0;
++  *atlas_entry = atlas;
++  return block + 0x220;
++}
++
++// Our texture entry: the atlas' entry (same sampling, same palette handling: C8 with an RGB5A3
++// palette, which the game's loader finds just before the texels), with our texture: 256x32.
++void WriteEntry(std::uint32_t atlas, std::uint32_t texels)
++{
++  std::uint8_t* out = Guest(kEntry, kEntrySize);
++  const std::uint8_t* in = Guest(atlas, kEntrySize);
++  if (!out || !in)
++    return;
++  std::memcpy(out, in, kEntrySize);
++  Put32(out + 0x0C, 0x01000020);                         // 256, 32
++  Put32(out + 0x18, 0xFFu | (31u << 10) | (9u << 20));  // image0: 256x32, C8
++  Put32(out + 0x1C, (texels & 0x01FFFFFFu) >> 5);        // image3: the texels' physical address >> 5
++  Put32(out + 0x2C, (0x0100u << 16) | (Get32(in + 0x2C) & 0xFFFFu));  // load count: 0x2000 / 32
++  Put32(out + 0x30, texels - 0x200);                     // the palette
++}
++
++// [k] human racer k: 1P..4P from the game's table (the atlas), 5P..8P ours; [8 + k] COM (the game's).
++bool WriteTable()
++{
++  std::uint8_t* t = Guest(kTable, 16 * 16);
++  const std::uint8_t* game = Guest(kGameLabels, 5 * 16);
++  if (!t || !game || Get32(game + 8) != 36)
++    return false;
++  for (std::uint32_t i = 0; i < 16; ++i)
++  {
++    std::uint8_t* r = t + i * 16;
++    if (i < 4 || i >= 8)
++      std::memcpy(r, game + (i < 4 ? i : 4) * 16, 16);
++    else
++    {
++      Put32(r + 0, 36 * (i - 4));
++      Put32(r + 4, 0);
++      Put32(r + 8, 36);
++      Put32(r + 12, 30 * 8);
++    }
++  }
++  return true;
++}
++
++void WriteWords(std::uint32_t address, const std::uint32_t* words, std::size_t n)
++{
++  std::uint8_t* p = Guest(address, static_cast<std::uint32_t>(n * 4));
++  if (!p)
++    return;
++  for (std::size_t i = 0; i < n; ++i)
++    Put32(p + i * 4, words[i]);
++  Core::System::GetInstance().GetJitInterface().InvalidateICache(address,
++                                                                 static_cast<std::uint32_t>(n * 4), true);
++}
++
++bool Holds(std::uint32_t address, const std::uint32_t* words, std::size_t n)
++{
++  for (std::size_t i = 0; i < n; ++i)
++    if (Read32(address + static_cast<std::uint32_t>(i * 4)) != words[i])
++      return false;
++  return true;
++}
++
++std::uint32_t s_texels = 0;  // what our entry points to
++bool s_told_off = false;
++
++// SRNP_ETIQUETTES_MASQUE=<hex>: which of kPatches go in (bit i: kPatches[i]; all by default).
++unsigned Mask()
++{
++  static const unsigned mask = [] {
++    const char* v = std::getenv("SRNP_ETIQUETTES_MASQUE");
++    return v && *v ? static_cast<unsigned>(std::strtoul(v, nullptr, 16)) : 0xFu;
++  }();
++  return mask;
++}
++const std::array<std::uint32_t, 6>& Words(std::size_t i, bool ours)
++{
++  return ours && ((Mask() >> i) & 1u) ? kPatches[i].ours : kPatches[i].game;
++}
++bool AllHold(bool ours)
++{
++  for (std::size_t i = 0; i < kPatches.size(); ++i)
++    if (!Holds(kPatches[i].address, Words(i, ours).data(), kPatches[i].n))
++      return false;
++  return true;
++}
++void WriteAll(bool ours)
++{
++  for (std::size_t i = 0; i < kPatches.size(); ++i)
++    WriteWords(kPatches[i].address, Words(i, ours).data(), kPatches[i].n);
++}
++}  // namespace
++
++void LabelsOnFrame()
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_ETIQUETTES");
++    return v && *v == '0';
++  }();
++  if (off)
++    return;
++  std::uint32_t atlas = 0;
++  const std::uint32_t texels = OurTexels(&atlas);
++  const bool ours = AllHold(true);
++  if (!texels)
++  {
++    if (ours)  // no block (another file, a save state from before): the game's code again
++    {
++      WriteAll(false);
++      s_texels = 0;
++      std::fprintf(stderr, "[srnp labels] no label texture: the game's labels\n");
++    }
++    return;
++  }
++  // The low memory (a save state brings back its own) and the entry (the file moves with each load).
++  if (!Holds(kRoutine, kRoutineCode.data(), kRoutineCode.size()))
++    WriteWords(kRoutine, kRoutineCode.data(), kRoutineCode.size());
++  if (Read32(kTable + 0x40 + 12) != 30 * 8 && !WriteTable())
++    return;
++  if (texels != s_texels || Read32(kEntry + 0x1C) != ((texels & 0x01FFFFFFu) >> 5))
++  {
++    WriteEntry(atlas, texels);
++    s_texels = texels;
++    std::fprintf(stderr, "[srnp labels] label texture at 0x%08X\n", texels);
++  }
++  if (ours)
++    return;
++  // The game's code must be there (same game, same version) before ours goes in.
++  if (!AllHold(false))
++  {
++    if (!s_told_off)
++      std::fprintf(stderr, "[srnp labels] the label code is not the game's: left alone\n");
++    s_told_off = true;
++    return;
++  }
++  WriteAll(true);
++  std::fprintf(stderr, "[srnp labels] labels 5P-8P on (1P and split-screen HUDs)\n");
++}
++}  // namespace srnp
+diff --git a/src/runtime/srnp_labels.hpp b/src/runtime/srnp_labels.hpp
+new file mode 100644
+index 0000000..c5577b7
+--- /dev/null
++++ b/src/runtime/srnp_labels.hpp
+@@ -0,0 +1,30 @@
++// SR-Source Net Plus: the "1P".."8P" labels above the players' racers in Sonic Riders (GXEE8P).
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// The game draws "1P".."4P" above human racers 0..3 and "COM" above CPUs, from a 36x30 rectangle of
++// its HUD atlas ("Icon_Eff_E", 256x256 C8, in the GTSE file), picked in a table (REL data
++// 0x805D3DB4) by the racer's index; a human racer 4..7 would read other sprites. The atlas has no
++// room left for four more labels, so they come from a texture of our own: the srnp_etiquettes file
++// mod appends it to GTSE (the file decompressed, the block added, compressed again, no bigger than
++// the game's), after a 0x20-byte header "SRNPLBL1": a palette and 256x32 C8 texels (5P..8P).
++//
++// Two functions draw the labels: 0x8042F47C for the 1P HUD, 0x804297C8 for the split-screen HUD.
++// When the loaded GTSE carries that block, the runner patches both (display only; it writes no
++// racer and no game state):
++// - the rectangle is taken in a table of ours, by the racer's index and its CPU flag (+0xBD): the
++//   game's 1P..4P and COM, our 5P..8P;
++// - the label's quad is drawn by a small routine (in zero padding of the game's first code
++//   section: code in low memory hangs the game); for 5P..8P, it binds our texture
++//   (the game's own loader, 0x8007D1EC, given a texture entry of ours) around the game's quad
++//   function (0x800087CC), then binds the game's texture again (0x80053C54).
++// The table and the entry live in low memory the game leaves at zero (0x80002E00-0x80002F40).
++// Without the block (no mod, another language), the game's code is put back. SRNP_ETIQUETTES=0
++// leaves everything alone. The label left out (the player's own racer) is not changed here: the game's
++// (racer 0, or the viewport's), or the phase 2 runner's "spotter" (the seat's racer).
++#pragma once
++
++namespace srnp
++{
++// On the emulation thread, after each present.
++void LabelsOnFrame();
++}  // namespace srnp
+-- 
+2.34.1.windows.1
+
