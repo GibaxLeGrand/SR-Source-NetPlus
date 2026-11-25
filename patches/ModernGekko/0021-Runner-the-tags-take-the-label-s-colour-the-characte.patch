@@ -1,0 +1,40 @@
+From af06a5d433567df54684a238815b088dd2378382 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:33:54 +0100
+Subject: [PATCH 21/24] Runner: the tags take the label's colour (the
+ character's, as 1P/2P)
+
+Gibax: ideally the tags have the colours the 1P/2P would have had. The
+tag quad now gets the label's colour (r7: the character's colour) instead
+of white. 29 checksums equal, 0 divergences (JIT64, 8 seats).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 1c3aea5..6cdb794 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -68,7 +68,7 @@ constexpr std::array<Patch, 4> kPatches = {{
+ // else we put the player's tag"):
+ // - a racer a player drives (not a CPU: r15 & 0x80) with a tag (tag k = (r15 >> 4) & 7 has a width
+ //   in kTagTable): the tag instead of the label, from the tags' texture (kTagEntry) with the table's
+-//   UVs, centred on the label, a third of the way down, twice its texel size, in white;
++//   UVs, centred on the label, a third of the way down, twice its texel size, in the label's colour (the character's, as 1P/2P);
+ // - otherwise the label: our texture holds 5P-8P only; for any other label ((r15 & 0xC0) != 0x40,
+ //   the table being 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours,
+ //   it binds kEntry to texmap 0 (bl 0x8007D1EC) and draws the quad;
+@@ -80,7 +80,7 @@ constexpr std::array<std::uint32_t, 79> kRoutineCode = {
+     0x616B4F40, 0x7D8C5A14, 0xA00C0010, 0x28000000, 0x41820088, 0x91810030, 0x3C608000, 0x60634F00,
+     0x38800000, 0x48078449, 0x81810030, 0x80610008, 0x80A10010, 0x7C632A14, 0x7C630E70, 0xA00C0010,
+     0x7CA01850, 0x7D630214, 0x7CA32B78, 0x7D655B78, 0x8081000C, 0x80C10014, 0x7C043050, 0x1C00000B,
+-    0x7C002E70, 0x7D640214, 0xA00C0012, 0x7C805850, 0x7CCB0214, 0x38E0FFFF, 0x39000000, 0x7D896378,
++    0x7C002E70, 0x7D640214, 0xA00C0012, 0x7C805850, 0x7CCB0214, 0x80E10018, 0x39000000, 0x7D896378,
+     0xC8210028, 0x480039C9, 0x808D88F8, 0x38600000, 0x4804EE45, 0x48000058, 0x55EB0632, 0x280B0040,
+     0x40820048, 0x3C608000, 0x60632F00, 0x38800000, 0x480783BD, 0x80610008, 0x8081000C, 0x80A10010,
+     0x80C10014, 0x80E10018, 0x8101001C, 0x81210020, 0xC8210028, 0x48003979, 0x808D88F8, 0x38600000,
+-- 
+2.34.1.windows.1
+

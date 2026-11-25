@@ -1,0 +1,358 @@
+From 055f6f031d0a57927d2b82428a425c66414dc579 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:00:07 +0100
+Subject: [PATCH 19/24] Runner: the players' tags over their racers (SRNP_TAGS)
+
+SRNP_TAGS=TAG0,TAG1,... (seat k = racer k, up to 8 characters, upper
+case) puts each player's tag over the "nP" label of the racer they drive;
+none for a CPU, none over the player's own racer (the game's or the
+spotter's choice, as for the label).
+
+The tags come from a second texture of ours in the srnp_etiquettes block
+(version 4: 128x128 C4, one 16-texel row per seat, zero in the file), which
+the runner writes with its own pixel font: 7 texels high, 2-texel uprights
+and 1-texel bars like the game's labels, white to grey with a navy outline
+(the game's text font, "EnglishNormal_game", only has the letters its
+English texts use). The routine (now 72 words) draws a second quad over
+the label, centred, from that texture with a UV table of ours, in white.
+Its entry and table sit after the routine in the same code padding
+(0x80004F00-0x80005000). The block stays within the size the game loads
+from a save state (GTSE 0xAD7A0 decompressed, 246548 bytes compressed).
+
+Measured (2 runners, 8 seats in lockstep, one with labels and tags, one
+without): 29 checksums equal, 0 divergences in JIT64; 24 equal, 0
+divergences native.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 253 ++++++++++++++++++++++++++++++++++--
+ src/runtime/srnp_labels.hpp |   6 +-
+ 2 files changed, 247 insertions(+), 12 deletions(-)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 0e9ad1c..14c17b8 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -2,11 +2,15 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #include "srnp_labels.hpp"
+ 
++#include <algorithm>
+ #include <array>
++#include <cctype>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string>
++#include <vector>
+ 
+ #include "Core/HW/Memmap.h"
+ #include "Core/PowerPC/JitInterface.h"
+@@ -26,7 +30,8 @@ constexpr std::uint32_t kGtseSize = 0xA9560;         // the game's GTSE (English
+ // Our block, after it: a 0x20-byte header, the palette (0x200), the texels (256x32 C8, 0x2000):
+ // 5P, 6P, 7P, 8P. The compressed file must not outgrow the game's (from a save state, the file table
+ // in RAM is the original disc's and the game reads no more than its size; 2026-11-25).
+-constexpr std::uint32_t kBlockSize = 0x20 + 0x200 + 0x2000;
++constexpr std::uint32_t kBlockSize = 0x20 + 0x200 + 0x2000 + 0x20 + 0x2000;  // + the tags (version 4)
++constexpr std::uint32_t kTagTexels = 0x2240;  // in the block (its palette just before)
+ constexpr std::uint32_t kGameLabels = 0x805D3DB4;  // the game's sprite table: 1P..4P, then COM
+ 
+ // Ours, in low memory the game leaves at zero (0x80002C00-0x80002D80: the seats' pads).
+@@ -59,17 +64,85 @@ constexpr std::array<Patch, 4> kPatches = {{
+      {0x89FE00BD, 0x55EF3E30, 0x53EF2676, 0x3DEF8000, 0x39EF2E00, 0x60000000}, 6},
+     {0x8042F830, {0x4BBD8F9D}, {0x4BBD5511}, 1},  // bl 0x800087CC -> bl the routine (1P)
+ }};
+-// Our texture holds 5P-8P only: for any other label ((r15 & 0xC0) != 0x40, the table being
+-// 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours: saves r3-r9 and
+-// f1 (the quad's arguments), binds kEntry to texmap 0 (bl 0x8007D1EC), draws the quad, binds the
+-// game's current texture again (lwz r4,-0x7708(r13); li r3,0; bl 0x80053C54). Encoded and checked
+-// with capstone (work\etiquettes\code_ppc.py).
+-constexpr std::array<std::uint32_t, 36> kRoutineCode = {
+-    0x9421FFC0, 0x7C0802A6, 0x90010044, 0x55EB0632, 0x280B0040, 0x40820068, 0x90610008, 0x9081000C,
+-    0x90A10010, 0x90C10014, 0x90E10018, 0x9101001C, 0x91210020, 0xD8210028, 0x3C608000, 0x60632F00,
++// The routine saves r3-r9 and f1 (the quad's arguments), then:
++// 1. the label: our texture holds 5P-8P only; for any other label ((r15 & 0xC0) != 0x40, the table
++//    being 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours, it binds
++//    kEntry to texmap 0 (bl 0x8007D1EC), draws the quad, binds the game's current texture again
++//    (lwz r4,-0x7708(r13); li r3,0; bl 0x80053C54);
++// 2. the player's tag (not for a CPU: r15 & 0x80): if tag k ((r15 >> 4) & 7) has a width in
++//    kTagTable, a second quad over the label, centred, from the tags' texture (kTagEntry) with the
++//    table's UVs, in white; then the game's texture again.
++// Encoded and checked with capstone (work\etiquettes\code_ppc.py).
++constexpr std::array<std::uint32_t, 72> kRoutineCode = {
++    0x9421FFC0, 0x7C0802A6, 0x90010044, 0x90610008, 0x9081000C, 0x90A10010, 0x90C10014, 0x90E10018,
++    0x9101001C, 0x91210020, 0xD8210028, 0x55EB0632, 0x280B0040, 0x40820048, 0x3C608000, 0x60632F00,
+     0x38800000, 0x48078469, 0x80610008, 0x8081000C, 0x80A10010, 0x80C10014, 0x80E10018, 0x8101001C,
+     0x81210020, 0xC8210028, 0x48003A25, 0x808D88F8, 0x38600000, 0x4804EEA1, 0x48000008, 0x48003A11,
+-    0x80010044, 0x7C0803A6, 0x38210040, 0x4E800020};
++    0x55EB0631, 0x4082008C, 0x55ECE77E, 0x1D8C0018, 0x3D608000, 0x616B4F40, 0x7D8C5A14, 0xA00C0010,
++    0x28000000, 0x4182006C, 0x91810030, 0x3C608000, 0x60634F00, 0x38800000, 0x480783F5, 0x81810030,
++    0x80610008, 0x80A10010, 0x7C632A14, 0x7C630E70, 0xA00C0010, 0x7C0B0E70, 0x7C6B1850, 0x7CA30214,
++    0x80C1000C, 0x38C6FFFF, 0xA00C0012, 0x7C803050, 0x38E0FFFF, 0x39000000, 0x7D896378, 0xC8210028,
++    0x4800398D, 0x808D88F8, 0x38600000, 0x4804EE09, 0x80010044, 0x7C0803A6, 0x38210040, 0x4E800020};
++
++// The players' tags (SRNP_TAGS=TAG0,TAG1,... : seat k = racer k): a texture of ours too,
++// 128x128 C4, one 16-texel row per seat, zero in the file), written by the runner with our own pixel
++// font (the game's text font only has the letters of its English texts), white to grey with a navy
++// outline like the labels. Its entry and the UV table live after the routine, in the same padding.
++constexpr std::uint32_t kTagEntry = 0x80004F00;
++constexpr std::uint32_t kTagTable = 0x80004F40;  // 8 x 0x18: u0 v0 u1 v1 (floats), width, height (u16)
++constexpr std::uint32_t kTagSize = 128;
++constexpr std::uint32_t kTagHeight = 9;  // 7 + the outline
++struct Glyph
++{
++  char c;
++  int w;
++  std::uint8_t rows[7];  // bit 7 = the leftmost column
++};
++// work\etiquettes\police_tags.py --cpp
++constexpr Glyph kFont[] = {
++    {'A', 6, {0x78, 0xCC, 0xCC, 0xFC, 0xCC, 0xCC, 0xCC}},
++    {'B', 6, {0xF8, 0xCC, 0xCC, 0xF8, 0xCC, 0xCC, 0xF8}},
++    {'C', 6, {0x7C, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0x7C}},
++    {'D', 6, {0xF8, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xF8}},
++    {'E', 6, {0xFC, 0xC0, 0xC0, 0xF8, 0xC0, 0xC0, 0xFC}},
++    {'F', 6, {0xFC, 0xC0, 0xC0, 0xF8, 0xC0, 0xC0, 0xC0}},
++    {'G', 6, {0x7C, 0xC0, 0xC0, 0xDC, 0xCC, 0xCC, 0x7C}},
++    {'H', 6, {0xCC, 0xCC, 0xCC, 0xFC, 0xCC, 0xCC, 0xCC}},
++    {'I', 2, {0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0}},
++    {'J', 6, {0x0C, 0x0C, 0x0C, 0x0C, 0xCC, 0xCC, 0x78}},
++    {'K', 6, {0xCC, 0xD8, 0xF0, 0xE0, 0xF0, 0xD8, 0xCC}},
++    {'L', 6, {0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xFC}},
++    {'M', 7, {0xC6, 0xEE, 0xFE, 0xD6, 0xC6, 0xC6, 0xC6}},
++    {'N', 6, {0xCC, 0xEC, 0xFC, 0xDC, 0xCC, 0xCC, 0xCC}},
++    {'O', 6, {0x78, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x78}},
++    {'P', 6, {0xF8, 0xCC, 0xCC, 0xF8, 0xC0, 0xC0, 0xC0}},
++    {'Q', 6, {0x78, 0xCC, 0xCC, 0xCC, 0xDC, 0xD8, 0x6C}},
++    {'R', 6, {0xF8, 0xCC, 0xCC, 0xF8, 0xD8, 0xCC, 0xCC}},
++    {'S', 6, {0x7C, 0xC0, 0xC0, 0x78, 0x0C, 0x0C, 0xF8}},
++    {'T', 6, {0xFC, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30}},
++    {'U', 6, {0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x78}},
++    {'V', 6, {0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x78, 0x30}},
++    {'W', 7, {0xC6, 0xC6, 0xC6, 0xD6, 0xFE, 0xEE, 0xC6}},
++    {'X', 6, {0xCC, 0xCC, 0x78, 0x30, 0x78, 0xCC, 0xCC}},
++    {'Y', 6, {0xCC, 0xCC, 0xCC, 0x78, 0x30, 0x30, 0x30}},
++    {'Z', 6, {0xFC, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0xFC}},
++    {'0', 6, {0x78, 0xCC, 0xDC, 0xFC, 0xEC, 0xCC, 0x78}},
++    {'1', 4, {0x30, 0x70, 0xF0, 0x30, 0x30, 0x30, 0x30}},
++    {'2', 6, {0x78, 0xCC, 0x0C, 0x18, 0x30, 0x60, 0xFC}},
++    {'3', 6, {0xF8, 0x0C, 0x0C, 0x78, 0x0C, 0x0C, 0xF8}},
++    {'4', 6, {0x1C, 0x3C, 0x6C, 0xCC, 0xFC, 0x0C, 0x0C}},
++    {'5', 6, {0xFC, 0xC0, 0xC0, 0xF8, 0x0C, 0x0C, 0xF8}},
++    {'6', 6, {0x7C, 0xC0, 0xC0, 0xF8, 0xCC, 0xCC, 0x78}},
++    {'7', 6, {0xFC, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x30}},
++    {'8', 6, {0x78, 0xCC, 0xCC, 0x78, 0xCC, 0xCC, 0x78}},
++    {'9', 6, {0x78, 0xCC, 0xCC, 0x7C, 0x0C, 0x0C, 0xF8}},
++    {'-', 4, {0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00}},
++    {'_', 6, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC}},
++    {'.', 2, {0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0xC0}},
++    {'!', 2, {0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0x00, 0xC0}},
++    {'?', 6, {0x78, 0xCC, 0x0C, 0x18, 0x30, 0x00, 0x30}},
++    {' ', 3, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
++};
+ 
+ // Our texture: 256x32 C8, 5P..8P side by side. A rectangle is in the game's units, 1/256 of the
+ // texture on both axes (the label code multiplies by 1/256): x as is, y x 8 (32 texels tall).
+@@ -116,8 +189,10 @@ std::uint32_t OurTexels(std::uint32_t* atlas_entry)
+   if (!InMem1(block, kBlockSize))
+     return 0;
+   const std::uint8_t* h = Guest(block, 0x20);
++  // version 4: then the tags' palette (0x20) and texels (128x128 C4) at +0x1C
+   if (!h || std::memcmp(h, "SRNPLBL1", 8) != 0 || Get32(h + 0x08) != 0x01000020u ||
+-      Get32(h + 0x0C) != 9 || Get32(h + 0x10) != 0x20 || Get32(h + 0x14) != 0x220)
++      Get32(h + 0x0C) != 9 || Get32(h + 0x10) != 0x20 || Get32(h + 0x14) != 0x220 ||
++      Get32(h + 0x18) != 4 || Get32(h + 0x1C) != 0x2220)
+     return 0;
+   *atlas_entry = atlas;
+   return block + 0x220;
+@@ -162,6 +237,138 @@ bool WriteTable()
+   return true;
+ }
+ 
++// The tags' entry: the atlas' entry with the tags' texture, 128x128 C4 (its 16-word RGB5A3 palette
++// just before the texels, where the game's loader looks for it).
++void WriteTagEntry(std::uint32_t atlas, std::uint32_t texels)
++{
++  std::uint8_t* out = Guest(kTagEntry, kEntrySize);
++  const std::uint8_t* in = Guest(atlas, kEntrySize);
++  if (!out || !in)
++    return;
++  std::memcpy(out, in, kEntrySize);
++  Put32(out + 0x08, (Get32(in + 0x08) & ~0xFFu) | 8u);   // palette flags kept, C4
++  Put32(out + 0x0C, (kTagSize << 16) | kTagSize);         // 128, 128
++  Put32(out + 0x18, (kTagSize - 1) | ((kTagSize - 1) << 10) | (8u << 20));  // image0: C4
++  Put32(out + 0x1C, (texels & 0x01FFFFFFu) >> 5);
++  Put32(out + 0x24, 8);                                   // format
++  Put32(out + 0x2C, (0x0100u << 16) | (Get32(in + 0x2C) & 0xFFFFu));  // load count: 0x2000 / 32
++  Put32(out + 0x30, texels - 0x20);                       // the palette
++}
++
++// SRNP_TAGS: one tag per seat (racer k), upper case, up to 8 characters; '?' for one the font lacks.
++const std::array<std::string, 8>& Tags()
++{
++  static const std::array<std::string, 8> tags = [] {
++    std::array<std::string, 8> out{};
++    const char* v = std::getenv("SRNP_TAGS");
++    for (std::size_t k = 0; v && *v && k < 8; ++k)
++    {
++      const char* end = std::strchr(v, ',');
++      std::string tag(v, end ? static_cast<std::size_t>(end - v) : std::strlen(v));
++      for (char& c : tag)
++        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++      out[k] = tag.substr(0, 8);
++      v = end ? end + 1 : nullptr;
++    }
++    return out;
++  }();
++  return tags;
++}
++
++const Glyph& GlyphOf(char c)
++{
++  for (const Glyph& g : kFont)
++    if (g.c == c)
++      return g;
++  for (const Glyph& g : kFont)
++    if (g.c == '?')
++      return g;
++  return kFont[0];
++}
++
++// The tags as the texture's C4 texels (8x8 tiles, high nibble first) and their widths. Palette
++// indices: 1 the navy outline, 3..9 the fill, row by row (construire_mod.py).
++void RenderTags(std::array<std::uint8_t, kTagSize * kTagSize / 2>* texels, std::array<int, 8>* widths)
++{
++  texels->fill(0);
++  for (std::size_t k = 0; k < 8; ++k)
++  {
++    const std::string& tag = Tags()[k];
++    (*widths)[k] = 0;
++    if (tag.empty())
++      continue;
++    // the fill, one column at a time (1 texel between two letters), then the outline around it
++    std::vector<std::array<bool, 7>> cols;
++    for (std::size_t i = 0; i < tag.size(); ++i)
++    {
++      const Glyph& g = GlyphOf(tag[i]);
++      if (i)
++        cols.push_back({});
++      for (int x = 0; x < g.w; ++x)
++      {
++        std::array<bool, 7> col{};
++        for (int y = 0; y < 7; ++y)
++          col[y] = (g.rows[y] >> (7 - x)) & 1;
++        cols.push_back(col);
++      }
++    }
++    const int w = std::min(static_cast<int>(cols.size()) + 2, static_cast<int>(kTagSize));
++    const int h = static_cast<int>(kTagHeight);
++    auto fill = [&](int x, int y) {
++      return x >= 1 && x - 1 < static_cast<int>(cols.size()) && y >= 1 && y <= 7 && cols[x - 1][y - 1];
++    };
++    for (int y = 0; y < h; ++y)
++    {
++      for (int x = 0; x < w; ++x)
++      {
++        int index = 0;
++        if (fill(x, y))
++          index = 3 + (y - 1);
++        else
++          for (int dy = -1; dy <= 1 && !index; ++dy)
++            for (int dx = -1; dx <= 1 && !index; ++dx)
++              if (fill(x + dx, y + dy))
++                index = 1;
++        if (!index)
++          continue;
++        const int ty = static_cast<int>(k) * 16 + y;
++        const std::size_t tile = static_cast<std::size_t>((ty / 8) * (kTagSize / 8) + x / 8);
++        std::uint8_t& byte = (*texels)[tile * 32 + (ty % 8) * 4 + (x % 8) / 2];
++        byte = static_cast<std::uint8_t>((x % 2) ? (byte & 0xF0) | index : (byte & 0x0F) | (index << 4));
++      }
++    }
++    (*widths)[k] = w;
++  }
++}
++
++// The tags' table: per racer, u0 v0 u1 v1 (floats) over the texture, then width and height in
++// texels (u16), the size of the quad on screen; width 0: no tag.
++void WriteTagTable(const std::array<int, 8>& widths)
++{
++  std::uint8_t* t = Guest(kTagTable, 8 * 0x18);
++  if (!t)
++    return;
++  auto put_float = [](std::uint8_t* p, float f) {
++    std::uint32_t v;
++    std::memcpy(&v, &f, 4);
++    Put32(p, v);
++  };
++  for (std::uint32_t k = 0; k < 8; ++k)
++  {
++    std::uint8_t* r = t + k * 0x18;
++    const float size = static_cast<float>(kTagSize);
++    put_float(r + 0x00, 0.0f);
++    put_float(r + 0x04, static_cast<float>(k * 16) / size);
++    put_float(r + 0x08, static_cast<float>(widths[k]) / size);
++    put_float(r + 0x0C, static_cast<float>(k * 16 + kTagHeight) / size);
++    r[0x10] = static_cast<std::uint8_t>(widths[k] >> 8);
++    r[0x11] = static_cast<std::uint8_t>(widths[k]);
++    r[0x12] = 0;
++    r[0x13] = widths[k] ? static_cast<std::uint8_t>(kTagHeight) : 0;
++    Put32(r + 0x14, 0);
++  }
++}
++
+ void WriteWords(std::uint32_t address, const std::uint32_t* words, std::size_t n)
+ {
+   std::uint8_t* p = Guest(address, static_cast<std::uint32_t>(n * 4));
+@@ -243,6 +450,30 @@ void LabelsOnFrame()
+     s_texels = texels;
+     std::fprintf(stderr, "[srnp labels] label texture at 0x%08X\n", texels);
+   }
++  // The tags: their texels in the file's block (zero as loaded), their entry, their table.
++  static std::array<std::uint8_t, kTagSize * kTagSize / 2> tag_texels{};
++  static std::array<int, 8> tag_widths{};
++  static const bool tags_rendered = [] {
++    RenderTags(&tag_texels, &tag_widths);
++    return true;
++  }();
++  (void)tags_rendered;
++  const std::uint32_t tags = texels - 0x220 + kTagTexels;
++  if (std::uint8_t* p = Guest(tags, static_cast<std::uint32_t>(tag_texels.size())))
++  {
++    if (std::memcmp(p, tag_texels.data(), tag_texels.size()) != 0)
++    {
++      std::memcpy(p, tag_texels.data(), tag_texels.size());
++      WriteTagEntry(atlas, tags);
++      WriteTagTable(tag_widths);
++      std::fprintf(stderr, "[srnp labels] players' tags written at 0x%08X\n", tags);
++    }
++    else if (Read32(kTagEntry + 0x1C) != ((tags & 0x01FFFFFFu) >> 5))
++    {
++      WriteTagEntry(atlas, tags);
++      WriteTagTable(tag_widths);
++    }
++  }
+   if (ours)
+     return;
+   // The game's code must be there (same game, same version) before ours goes in.
+diff --git a/src/runtime/srnp_labels.hpp b/src/runtime/srnp_labels.hpp
+index c5577b7..d59eb54 100644
+--- a/src/runtime/srnp_labels.hpp
++++ b/src/runtime/srnp_labels.hpp
+@@ -17,7 +17,11 @@
+ //   section: code in low memory hangs the game); for 5P..8P, it binds our texture
+ //   (the game's own loader, 0x8007D1EC, given a texture entry of ours) around the game's quad
+ //   function (0x800087CC), then binds the game's texture again (0x80053C54).
+-// The table and the entry live in low memory the game leaves at zero (0x80002E00-0x80002F40).
++// - the players' tags (SRNP_TAGS=TAG0,TAG1,... : seat k = racer k, up to 8 characters): a second quad
++//   over the label of a racer a player drives, from a second texture of ours in the block (128x128 C4,
++//   zero in the file) that the runner writes with its own pixel font; none for a CPU.
++// The table and the entry live in low memory the game leaves at zero (0x80002E00-0x80002F40); the
++// tags' entry and UV table after the routine (0x80004F00-0x80005000).
+ // Without the block (no mod, another language), the game's code is put back. SRNP_ETIQUETTES=0
+ // leaves everything alone. The label left out (the player's own racer) is not changed here: the game's
+ // (racer 0, or the viewport's), or the phase 2 runner's "spotter" (the seat's racer).
+-- 
+2.34.1.windows.1
+

@@ -78,8 +78,24 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   waited its own time). The racers' checksum also leaves out three fields that only the characters'
   drawing writes (+0x84C-0x857, +0x8BC, +0x8DB). The waiting screen's pictures are no longer freed
   at exit (the video backend is gone by then: the runner crashed).
-- `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (every Sonic Riders Source
-  process is stopped first): the waiting screen fills up, then the race, photos of the 8 windows at
+- Patches 0019-0024: the labels session's player tags (`SRNP_TAGS=TAG0,TAG1,...`, seat k = racer k) over
+  the labels and in place of the names on the results screen (needs the srnp_etiquettes mod, version 5).
+- Patch 0025:
+  - `SRNP_INPUT=manette`: the machine's real pad, read on a port the game does not see (GCPad4,
+    `SRNP_MANETTE_PORT`, SI device None), is the seat's input; the game only gets it through the relay,
+    on every machine at once. `test_manette.sh`: two runners, the pad drives racer 0 on runner 0,
+    runner 1 stays neutral with its camera on racer 0 (no pad reaches the game directly);
+  - `SRNP_TOUS_CPU=1` flags the players' racers CPU at setup (`+0xBD` = 1: the AI's data is made) and
+    leaves them driven as humans (`+0xBC` = 0); the AI takes them at the start (with `+0xBD` = 0 at
+    setup, the AI crashes). `SRNP_TOUS_CPU=ancien`: the old way;
+  - test switches: `SRNP_IA_JOUEURS=<n>` (seats 0 to n-1 simulated players), `SRNP_HUMAINS=<hex mask>`
+    (the humans' flag at the start). Measured with them: **the stage's scenery goes missing (roads,
+    tubes, buildings after ~14") as soon as racer 5 is a human**, whatever its character, and with no
+    human at all; racers 6 or 7 human, or any humans among racers 0-4, keep it whole. Not understood
+    yet: a real 8-player game has a human racer 5. `ram_masque.sh <mask> <frames>`: MEM1 at frames of
+    the game, one runner, for such comparisons.
+- `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (leftovers of an earlier demo
+  are stopped, other sessions' runners waited for; `N=<seats>`, `TOUS_CPU`): the waiting screen fills up, then the race, photos of the 8 windows at
   three frames of the game, and contact sheets.
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.

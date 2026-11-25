@@ -1,0 +1,89 @@
+From 8868f2c150fc0b078116c56ac964c64e7b1bc408 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:19:02 +0100
+Subject: [PATCH 20/24] Runner: a player's tag instead of their label
+
+Gibax: if no tag, keep the 1P/2P label; else the player's tag. A racer a
+player drives with a tag (SRNP_TAGS) now shows the tag in place of its
+label, centred on it, a third of the way down, at twice its texel size;
+no tag, or a CPU: the label as before (nP, COM). The routine is 79 words.
+
+Measured (2 runners, 8 seats, tags on 5 seats): 29 checksums equal, 0
+divergences in JIT64; the untagged seats keep 7P.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 36 +++++++++++++++++++-----------------
+ src/runtime/srnp_labels.hpp |  7 ++++---
+ 2 files changed, 23 insertions(+), 20 deletions(-)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 14c17b8..1c3aea5 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -64,25 +64,27 @@ constexpr std::array<Patch, 4> kPatches = {{
+      {0x89FE00BD, 0x55EF3E30, 0x53EF2676, 0x3DEF8000, 0x39EF2E00, 0x60000000}, 6},
+     {0x8042F830, {0x4BBD8F9D}, {0x4BBD5511}, 1},  // bl 0x800087CC -> bl the routine (1P)
+ }};
+-// The routine saves r3-r9 and f1 (the quad's arguments), then:
+-// 1. the label: our texture holds 5P-8P only; for any other label ((r15 & 0xC0) != 0x40, the table
+-//    being 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours, it binds
+-//    kEntry to texmap 0 (bl 0x8007D1EC), draws the quad, binds the game's current texture again
+-//    (lwz r4,-0x7708(r13); li r3,0; bl 0x80053C54);
+-// 2. the player's tag (not for a CPU: r15 & 0x80): if tag k ((r15 >> 4) & 7) has a width in
+-//    kTagTable, a second quad over the label, centred, from the tags' texture (kTagEntry) with the
+-//    table's UVs, in white; then the game's texture again.
++// The routine saves r3-r9 and f1 (the quad's arguments), then (Gibax: "if no tag we keep the 1P/2P,
++// else we put the player's tag"):
++// - a racer a player drives (not a CPU: r15 & 0x80) with a tag (tag k = (r15 >> 4) & 7 has a width
++//   in kTagTable): the tag instead of the label, from the tags' texture (kTagEntry) with the table's
++//   UVs, centred on the label, a third of the way down, twice its texel size, in white;
++// - otherwise the label: our texture holds 5P-8P only; for any other label ((r15 & 0xC0) != 0x40,
++//   the table being 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours,
++//   it binds kEntry to texmap 0 (bl 0x8007D1EC) and draws the quad;
++// then binds the game's current texture again (lwz r4,-0x7708(r13); li r3,0; bl 0x80053C54).
+ // Encoded and checked with capstone (work\etiquettes\code_ppc.py).
+-constexpr std::array<std::uint32_t, 72> kRoutineCode = {
++constexpr std::array<std::uint32_t, 79> kRoutineCode = {
+     0x9421FFC0, 0x7C0802A6, 0x90010044, 0x90610008, 0x9081000C, 0x90A10010, 0x90C10014, 0x90E10018,
+-    0x9101001C, 0x91210020, 0xD8210028, 0x55EB0632, 0x280B0040, 0x40820048, 0x3C608000, 0x60632F00,
+-    0x38800000, 0x48078469, 0x80610008, 0x8081000C, 0x80A10010, 0x80C10014, 0x80E10018, 0x8101001C,
+-    0x81210020, 0xC8210028, 0x48003A25, 0x808D88F8, 0x38600000, 0x4804EEA1, 0x48000008, 0x48003A11,
+-    0x55EB0631, 0x4082008C, 0x55ECE77E, 0x1D8C0018, 0x3D608000, 0x616B4F40, 0x7D8C5A14, 0xA00C0010,
+-    0x28000000, 0x4182006C, 0x91810030, 0x3C608000, 0x60634F00, 0x38800000, 0x480783F5, 0x81810030,
+-    0x80610008, 0x80A10010, 0x7C632A14, 0x7C630E70, 0xA00C0010, 0x7C0B0E70, 0x7C6B1850, 0x7CA30214,
+-    0x80C1000C, 0x38C6FFFF, 0xA00C0012, 0x7C803050, 0x38E0FFFF, 0x39000000, 0x7D896378, 0xC8210028,
+-    0x4800398D, 0x808D88F8, 0x38600000, 0x4804EE09, 0x80010044, 0x7C0803A6, 0x38210040, 0x4E800020};
++    0x9101001C, 0x91210020, 0xD8210028, 0x55EB0631, 0x408200A8, 0x55ECE77E, 0x1D8C0018, 0x3D608000,
++    0x616B4F40, 0x7D8C5A14, 0xA00C0010, 0x28000000, 0x41820088, 0x91810030, 0x3C608000, 0x60634F00,
++    0x38800000, 0x48078449, 0x81810030, 0x80610008, 0x80A10010, 0x7C632A14, 0x7C630E70, 0xA00C0010,
++    0x7CA01850, 0x7D630214, 0x7CA32B78, 0x7D655B78, 0x8081000C, 0x80C10014, 0x7C043050, 0x1C00000B,
++    0x7C002E70, 0x7D640214, 0xA00C0012, 0x7C805850, 0x7CCB0214, 0x38E0FFFF, 0x39000000, 0x7D896378,
++    0xC8210028, 0x480039C9, 0x808D88F8, 0x38600000, 0x4804EE45, 0x48000058, 0x55EB0632, 0x280B0040,
++    0x40820048, 0x3C608000, 0x60632F00, 0x38800000, 0x480783BD, 0x80610008, 0x8081000C, 0x80A10010,
++    0x80C10014, 0x80E10018, 0x8101001C, 0x81210020, 0xC8210028, 0x48003979, 0x808D88F8, 0x38600000,
++    0x4804EDF5, 0x48000008, 0x48003965, 0x80010044, 0x7C0803A6, 0x38210040, 0x4E800020};
+ 
+ // The players' tags (SRNP_TAGS=TAG0,TAG1,... : seat k = racer k): a texture of ours too,
+ // 128x128 C4, one 16-texel row per seat, zero in the file), written by the runner with our own pixel
+diff --git a/src/runtime/srnp_labels.hpp b/src/runtime/srnp_labels.hpp
+index d59eb54..f83ae96 100644
+--- a/src/runtime/srnp_labels.hpp
++++ b/src/runtime/srnp_labels.hpp
+@@ -17,9 +17,10 @@
+ //   section: code in low memory hangs the game); for 5P..8P, it binds our texture
+ //   (the game's own loader, 0x8007D1EC, given a texture entry of ours) around the game's quad
+ //   function (0x800087CC), then binds the game's texture again (0x80053C54).
+-// - the players' tags (SRNP_TAGS=TAG0,TAG1,... : seat k = racer k, up to 8 characters): a second quad
+-//   over the label of a racer a player drives, from a second texture of ours in the block (128x128 C4,
+-//   zero in the file) that the runner writes with its own pixel font; none for a CPU.
++// - the players' tags (SRNP_TAGS=TAG0,TAG1,... : seat k = racer k, up to 8 characters): a racer a
++//   player drives with a tag shows the tag instead of its label (no tag, or a CPU: the label), from a
++//   second texture of ours in the block (128x128 C4, zero in the file) that the runner writes with its
++//   own pixel font.
+ // The table and the entry live in low memory the game leaves at zero (0x80002E00-0x80002F40); the
+ // tags' entry and UV table after the routine (0x80004F00-0x80005000).
+ // Without the block (no mod, another language), the game's code is put back. SRNP_ETIQUETTES=0
+-- 
+2.34.1.windows.1
+

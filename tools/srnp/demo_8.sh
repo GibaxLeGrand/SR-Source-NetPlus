@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Démo à 8 joueurs : tout ce que fait SR-Source Net Plus aujourd'hui, en photos des vraies fenêtres.
-#   - avant tout : aucun processus Sonic Riders Source ne doit tourner (ils sont arrêtés) ;
+#   - avant tout : aucun processus Sonic Riders Source ne doit tourner (restes d'une démo arrêtés,
+#     runners des autres sessions attendus) ;
 #   - 8 runners natifs sur ce poste, un siège chacun, lancés à ECART s d'écart : l'écran d'attente se
 #     remplit (photos du runner 0 et de tous) ;
-#   - GO, course complète depuis « Are you ready? » (8 racers en CPU au montage, conduits par l'IA) :
+#   - GO, course complète depuis « Are you ready? » (les 8 racers conduits par l'IA, SRNP_TOUS_CPU=1) :
 #     chaque runner sa caméra, son HUD, sa mini-carte, son spotter, les étiquettes 5P-8P du mod ;
 #   - photos des 8 fenêtres aux frames du jeu CAPT1, CAPT2, CAPT3 (pause à la même frame partout :
 #     SRNP_PAUSE_JEU=1) ; sommes de contrôle du relais ; SRNP_IA_JOUEUR=1 : racers « nP » conduits par l IA ;
 #   - planches (une par moment) dans le dossier du run.
 #   demo_8.sh [CAPT1] [CAPT2] [CAPT3]
 set -uo pipefail
-C1="${1:-1900}"; C2="${2:-3850}"; C3="${3:-5650}"   # frames du jeu (SRNP_PAUSE_JEU)
-N=8
+C1="${1:-1900}"; C2="${2:-3125}"; C3="${3:-5650}"   # frames du jeu (SRNP_PAUSE_JEU)
+N="${N:-8}"
 W=/d/_SonicRidersSource/work
 CHASSIS="${CHASSIS:-$W/chassis_p2}"
 PY="/c/Program Files/Python313/python.exe"
@@ -22,8 +23,18 @@ RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-demo-8"
 mkdir -p "$RUN"
 w() { cygpath -w "$1"; }
 ps_lignes() { powershell -NoProfile -Command "$1" | tr -d '\r'; }
-# 1. Plus aucun processus Sonic Riders Source (ni relais d'un essai) : ils voleraient des perfs.
-ps_lignes "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'moderngekko' -or (\$_.Name -eq 'python.exe' -and \$_.CommandLine -like '*relais.py*') } | ForEach-Object { taskkill /F /T /PID \$_.ProcessId | Out-Null; 'arrêté ' + \$_.ProcessId + ' ' + \$_.Name }"
+# 1. Aucun autre processus Sonic Riders Source : ils voleraient des perfs. Les restes d'une démo
+#    précédente sont arrêtés ; ceux des autres sessions (tests des étiquettes...) ne sont pas tués :
+#    on attend qu'ils finissent (ATTENDRE=0 : ne pas attendre, pour un test de charge voulu).
+ps_lignes "Get-CimInstance Win32_Process | Where-Object { (\$_.Name -match 'moderngekko' -or \$_.Name -eq 'python.exe') -and \$_.CommandLine -like '*-demo-8*' } | ForEach-Object { taskkill /F /T /PID \$_.ProcessId | Out-Null; 'arrêté ' + \$_.ProcessId + ' ' + \$_.Name }"
+if [[ "${ATTENDRE:-1}" != 0 ]]; then
+  for i in $(seq 1 180); do
+    autres=$(tasklist.exe | grep -ci moderngekko)
+    [[ "$autres" == 0 ]] && break
+    [[ $i == 1 ]] && echo "$(date +%T) $autres runner(s) d'une autre session : j'attends qu'ils finissent"
+    sleep 5
+  done
+fi
 sleep 2
 "$PY" -I "$RELAIS" --sieges $N --port 7845 --journal "$(w "$RUN/relais.log")" > "$RUN/relais.out" 2>&1 &
 sleep 1
@@ -38,7 +49,7 @@ lance() {  # lance <siège>
   powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
   printf 'mod=srnp_etiquettes\n' >> "$D/userdir/config.ini"
   local SON=--mute; [[ "$r" == "${SON_RUNNER:-0}" ]] && SON=
-  (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU=1 \
+  (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU="${TOUS_CPU:-1}" \
      SRNP_PERSOS="$PERSOS" SRNP_INPUT=ia SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_CKDUMP="$(w "$D/ck")" \
      MODERNGEKKO_STATICRECOMP=1 ./moderngekko-run.exe --game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" \
      --automation-dir "$(w "$D/auto")" $SON --load-state "$(w "$STATE")" \
@@ -97,7 +108,8 @@ done
 sleep 3
 for r in $(seq 0 $((N - 1))); do printf 'command=stop\n' > "$RUN/runner$r/auto/commands/z.txt"; done
 sleep 12
-ps_lignes "Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'moderngekko' -or (\$_.Name -eq 'python.exe' -and \$_.CommandLine -like '*relais.py*') } | ForEach-Object { taskkill /F /T /PID \$_.ProcessId | Out-Null }"
+# Seulement les processus de ce run (runners et relais), jamais ceux des autres sessions.
+ps_lignes "Get-CimInstance Win32_Process | Where-Object { (\$_.Name -match 'moderngekko' -or \$_.Name -eq 'python.exe') -and \$_.CommandLine -like '*$(basename "$RUN")*' } | ForEach-Object { taskkill /F /T /PID \$_.ProcessId | Out-Null }"
 grep -h "GO\|DIVERGENCE" "$RUN/relais.log" | head -5; grep -h "parti" "$RUN/relais.log" | tail -1
 # 4. Les planches.
 "$PY" - "$(w "$RUN")" <<'PY'

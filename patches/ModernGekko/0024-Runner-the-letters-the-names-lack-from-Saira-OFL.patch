@@ -1,0 +1,84 @@
+From a02b3b6e126a9fcef1e542c431d47667d8dbf1f1 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:15:17 +0100
+Subject: [PATCH 24/24] Runner: the letters the names lack, from Saira (OFL)
+
+The game's names look like New Rodin Bold (Fontworks, not free). Of the
+faces tried for the letters the names do not have (B F P Q X Z, 2-9,
+! ? _), Saira Italic (SIL Open Font License 1.1; width axis 118, weight
+650) is the closest: at the names' size its letters match their mean
+width and white. Gibax chose it. The fills are rendered by
+work\etiquettes\police_cpp.py saira.
+
+Measured (2 runners, 8 seats, the 8 racers CPUs, SRNP_TAGS=GIBAX,,K-NUX,
+AMY_R,,WAVE!,BOB-PIP,TAILSMKR): 8 finishes, 201 checksums equal, 2
+divergences in camera fields; the runner's texture is the prototype's
+texel for texel in all 8 bands.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 41 +++++++++++++++++++------------------
+ 1 file changed, 21 insertions(+), 20 deletions(-)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 04898ff..bb72d14 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -595,9 +595,10 @@ Pixels Normalised(const Pixels& g, bool drawn, char c)
+ }
+ 
+ // The letters the names do not have: fills (palette indices, row by row from `dy`, the capitals' top
+-// being row 0), rendered from a TTF Gibax gave (DejaVu Sans Bold Oblique renamed, Bitstream Vera
+-// licence) at the names' size: widened, slanted a little more, 11 rows, the greys F E D 8 C
+-// (work\etiquettes\police_cpp.py ttf).
++// being row 0), rendered from Saira Italic (Copyright 2020 The Saira Project Authors,
++// https://github.com/Omnibus-Type/Saira, SIL Open Font License 1.1) at the names' size: width axis 118,
++// weight 650, slanted a little more, 11 rows, the greys F E D 8 C (work\etiquettes\police_cpp.py saira).
++// The game's names look like New Rodin Bold (Fontworks, not free); Saira is the closest free face tried.
+ struct DrawnGlyph
+ {
+   char c;
+@@ -605,23 +606,23 @@ struct DrawnGlyph
+   const char* rows[16];  // up to nullptr
+ };
+ const DrawnGlyph kDrawn[] = {
+-    {'B', 0, {"   8EEEEDD", "   FFFFFFFF", "   FFFC8FFF", "  8FFD  FFF", "  DFFEDFFF8", "  FFFFFFFE", "  FFE88FFFC", " 8FF8  DFFC", " EFFC CFFF", " FFFFFFFF8", "CFFFFFFEC", nullptr}},
+-    {'F', 0, {"   8EEEEEED", "   FFFFFFFD", "   FFF8888", "  8FFD", "  DFFEEEEC", "  FFFFFFFC", "  FFFDDDD", " 8FF8", " EFFC", " FFF", "CFFE", nullptr}},
+-    {'P', 0, {"   8EEEEED", "   FFFFFFFF", "   FFF88FFFC", "  8FFD  DFFC", "  DFFC  FFF", "  FFFEEFFFD", "  FFFFFFFD", " 8FFDCCC", " EFFC", " FFF", "CFFE", nullptr}},
+-    {'Q', 0, {"    8EFFE8", "  CFFFFFFFE", "  FFFDC8FFFC", " EFF8   DFFD", "CFFE    8FFD", "DFF8    DFF8", "EFFC    FFF", "FFFC   8FFE", "DFFE  8FFFC", "CFFFFFFFFC", " CFFFFFE", "    CFFE", "     DFF8", nullptr}},
+-    {'X', 0, {"  CEED   8EE8", "   FFF  8FFE", "   DFF8CFFF", "    FFFFFF", "    EFFFF", "    DFFFC", "   CFFFF8", "  CFFFFFF", "  FFF EFFC", " FFFC 8FFD", "FFFC   FFF", nullptr}},
+-    {'Z', 0, {"   EEEEEEEED", "  8FFFFFFFFD", "  C888DFFFF", "      DFFF", "     DFFF", "    DFFE", "   EFFE", "  EFFE", " EFFFC", "DFFFFFFFFD", "FFFFFFFFF8", nullptr}},
+-    {'2', 0, {"   CDEFFEC", "   FFFFFFF", "  CF8 CFFFC", "       EFF", "      CFFE", "     8FFE", "    EFFD", "  CFFF8", " 8FFFC", " FFFFFFFD", "8FFFFFFF8", nullptr}},
+-    {'3', 0, {"   CEFFFEC", "   EFFFFFF", "   DC CFFFC", "       EFF", "    8DFFF8", "   8FFFFD", "   C8DFFF", "      EFFC", " 8    FFF", "CFFEFFFF8", "8FFFFFEC", "   C", nullptr}},
+-    {'4', 0, {"      CEEE", "     CFFFF", "     FFFFD", "    FFEFF8", "   FF8DFF", "  EFD FFF", " EFE CFFD", " FFFFFFFFE", "8FFFFFFFFD", "     FFE", "    CFFD", nullptr}},
+-    {'5', 0, {"   CEEEEEEC", "   DFFFFFF", "   FFD8888", "   FF8C", "  8FFFFFE", "  EFFFFFF8", "  C   DFFD", "      8FF8", " D    FFF", " FFFFFFF8", "CFFFFFFC", nullptr}},
+-    {'6', 0, {"    8EFFE8", "   FFFFFF8", "  FFF8  8", " DFFC", " FFFFFFF", "8FFFFFFFD", "DFFE  FFE", "DFFC  FFE", "DFF  DFF8", "CFFFEFFE", " DFFFFD", "   C", nullptr}},
+-    {'7', 0, {"  DEEEEEEE", "  FFFFFFFF", "  8888FFF8", "     CFFE", "     FFF", "    EFFC", "   8FFD", "   FFF", "  EFFC", " DFF8", "CFFE", nullptr}},
+-    {'8', 0, {"   8EFFE8", "  EFFFFFF8", " CFFE 8FFD", " 8FFC 8FFC", " CFFFDFFD", "  EFFFFE", "CFFECEFFC", "FFF  CFF8", "FFE  DFFC", "FFFEEFFE", "CFFFFFD", "   C", nullptr}},
+-    {'9', 0, {"   8EFFD", "  EFFFFFE", " 8FFD EFFC", " FFF  8FFC", " FFE  FFFC", " FFFDEFFF", " DFFFFFFF", "  C888FF8", "     FFF", "EFEEFFF", "FFFFFD", "  C", nullptr}},
+-    {'!', 0, {"   EED", "   FFD", "  8FFC", "  EFF", "  FFE", "  FF8", "  FF", "  8C", " DD8", "CFF8", "DFF", nullptr}},
+-    {'?', 0, {" 8EFFEC", " FFFFFF", "CEC EFF", "    FFF", "   FFFC", " CFFFC", " FFF", " 88C", "CDD", "EFF", "FFE", nullptr}},
+-    {'_', 13, {"FFFFFFFD", "8888888C", nullptr}},
++    {'B', 0, {"   CCCCCC", "  FFFFFFFFD", "  FFD88DFFF", " CFF    DFF", " DFE    FF8", " EFFFFFFEC", " FFEEEEFFC", "CFF    DFE", "DFF    EFD", "EFFDDDEFFC", "FFFFFFFFD", "CCCCCCC", nullptr}},
++    {'F', 0, {"   CCCCCCC", "  FFFFFFFF", "  FFD88888", " CFF", " DFF", " EFFDDDD", " FFFFFFF", "CFFCCCCC", "DFF", "EFD", "FFC", "CC", nullptr}},
++    {'P', 0, {"   CCCCCC", "  FFFFFFFFC", "  FFD88DFFE", " CFF    EFD", " DFF    FF8", " EFE  CDFF", " FFFFFFFFD", "CFFEEEEDC", "DFF", "EFD", "FFC", "CC", nullptr}},
++    {'Q', 0, {"    C888C", "  DFFFFFFFE", " CFFE888EFFC", " DFF    CFFC", " FF8    CFF", " FFC    DFF", "8FF     EFD", "DFE     FF8", "EFD 8FF8FF", "EFF88FFFFD", "8FFFFFFFE", "  C888FF8", "      8FF", nullptr}},
++    {'X', 0, {"   CC      CC", "   FFD   CFFD", "   DFF  CFFD", "    FFDCFFD", "    DFFFFD", "     FFFD", "    8FFFC", "   8FFFFF", "  8FF8CFF8", " 8FFC  EFF", "8FFC   CFF8", "CC      CCC", nullptr}},
++    {'Z', 0, {"   CCCCCCCC", "  CFFFFFFFF8", "  C8888EFFF", "       FFF", "     CFFF", "    CFFE", "   CFFE", "  8FFE", " 8FFE", "8FFFDDDDDC", "EFFFFFFFFC", "CCCCCCCCC", nullptr}},
++    {'2', 0, {"    C8888", "   FFFFFFFD", "   D8888FFF", "        DFE", "       8FF8", "    CDFFFE", "  8FFFFEC", " CFFE8", " EFD", " FFEDDDDD", "CFFFFFFFF", " CCCCCCCC", nullptr}},
++    {'3', 0, {"    CCCC", "   FFFFFFFC", "  C8888DFFE", "        EFE", "       CFFC", "    FFFFEC", "    FFFFFC", "       FFD", "       FFD", " D8888EFF", "8FFFFFFF8", " CC888C", nullptr}},
++    {'4', 0, {"       CC", "      DFF", "     DFF", "    8FFC", "   CFFC 8E", "  CFF8  FF", "  FF8  8FD", " FFFEEEFFFE", "CFFFFFFFFFE", "      8FF", "      DFE", "      CC", nullptr}},
++    {'5', 0, {"   CCCCCCC", "  EFFFFFFE", "  FFD8888C", "  FF", " 8FECCC", " DFFFFFFE", " DDDDDFFF", "      CFF", "      DFF", "DD888EFFD", "FFFFFFFD", " CCCCC", nullptr}},
++    {'6', 0, {"     C888C", "   FFFFFFFE", "  FFF88888C", " 8FF", " EFD CCC", " FFEFFFFF8", "CFFFDDDFFF", "DFF    8FF", "EFE    DFE", "EFF888DFF8", "CFFFFFFFD", "  C888C", nullptr}},
++    {'7', 0, {" CCCCCCCC", "DFFFFFFFF", "88888DFF8", "     EFE", "    DFF", "   CFF8", "   FFD", "  EFF", " DFFC", "CFFD", "FFE", "CC", nullptr}},
++    {'8', 0, {"    C888C", "  8FFFFFFFD", "  FFE888EFF", " 8FF    CFF", " 8FF    EFE", "  EFFFFFF8", " DFFEEEFFD", "8FF    CFF", "EFD    8FF", "FFF888DFFD", "CFFFFFFFE", "  CC88C", nullptr}},
++    {'9', 0, {"    C888C", "  EFFFFFFFC", " DFFD888FFD", " FF8    EFD", " FFC    FF8", " FFFDDEFFFC", " 8FFFFFEFF", "    C  DFE", "       FFC", "8D888DFFE", "EFFFFFFE", " CC8CC", nullptr}},
++    {'!', 0, {"  CCC", "  FFD", "  FFC", " CFF", " 8FE", " DF8", " EF", " ED", "", "EF8", "FFC", "CC", nullptr}},
++    {'?', 0, {" C888C", "8FFFFFF", "C8C8DFFC", "    CFF", "   CEFF", " CFFFE", " EF8", " EE", "", "DFD", "FF8", "CC", nullptr}},
++    {'_', 12, {"C88888", "EFFFFF", nullptr}},
+ };
+ 
+ // The font: the game's letters, then the drawn ones (kDrawn, generated outline).
+-- 
+2.34.1.windows.1
+

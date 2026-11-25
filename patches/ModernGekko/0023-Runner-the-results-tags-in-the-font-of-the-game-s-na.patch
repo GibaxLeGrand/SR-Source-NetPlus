@@ -1,0 +1,571 @@
+From 4d9db46250e47237b3427f6dfcb9aa34b0f48c93 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:06:48 +0100
+Subject: [PATCH 23/24] Runner: the results' tags in the font of the game's
+ names
+
+Gibax: the tags on the results screen should look like the game's names
+(KNUCKLES...), not like our pixel font.
+
+The runner reads "GoalResult_01_E" in the loaded GTSE (nothing of the
+game in this source) and takes the letters its names have: a letter is
+the k-th piece of strong fill of a name with the texels nearest to it,
+its outline completed by a generated one with the game's profile. The
+letters the names lack (B F P Q X Z, 2-9, ! ? _) are fills rendered from
+a TTF Gibax gave (DejaVu Sans Bold Oblique renamed, Bitstream Vera
+licence) at the names' size. A tag is laid out like the names (fills one
+texel apart, the strongest index wins where letters touch), centred like
+them, in its racer's 16-row band of a third texture of the block
+(version 5 of the srnp_etiquettes file mod, 128x128 C4, the names'
+palette copied in).
+
+The results' routine (41 words) binds that texture and draws the name's
+cell 2 units shorter at the top and bottom; its entry and band table
+follow it in the same padding (0x800050E0, 0x80005120).
+
+Measured (2 runners, 8 seats, phase 2 runner + this code, the 8 racers
+CPUs, SRNP_TAGS=GIBAX,,K-NUX,AMY_R,,WAVE!,BOB-PIP,TAILSMKR): the v5 GTSE
+loads; 8 finishes, 201 checksums equal, 2 divergences in camera fields;
+the runner's texture is the prototype's (work\etiquettes\
+police_resultats.py) texel for texel in all 8 bands; the results show
+TAILSMKR, BOB-PIP, GIBAX in the names' font next to NIGHTS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 448 ++++++++++++++++++++++++++++++++++--
+ src/runtime/srnp_labels.hpp |  10 +-
+ 2 files changed, 435 insertions(+), 23 deletions(-)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index dd792bd..04898ff 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -9,7 +9,10 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
++#include <map>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "Core/HW/Memmap.h"
+@@ -30,8 +33,13 @@ constexpr std::uint32_t kGtseSize = 0xA9560;         // the game's GTSE (English
+ // Our block, after it: a 0x20-byte header, the palette (0x200), the texels (256x32 C8, 0x2000):
+ // 5P, 6P, 7P, 8P. The compressed file must not outgrow the game's (from a save state, the file table
+ // in RAM is the original disc's and the game reads no more than its size; 2026-11-25).
+-constexpr std::uint32_t kBlockSize = 0x20 + 0x200 + 0x2000 + 0x20 + 0x2000;  // + the tags (version 4)
++// + the tags (version 4) + the results' tags (version 5)
++constexpr std::uint32_t kBlockSize = 0x20 + 0x200 + 0x2000 + 0x20 + 0x2000 + 0x20 + 0x2000;
+ constexpr std::uint32_t kTagTexels = 0x2240;  // in the block (its palette just before)
++constexpr std::uint32_t kResTexels = 0x4260;  // in the block (its palette just before)
++// "GoalResult_01_E" (the results' names, 256x256 C4, RGB5A3 palette) in the GTSE file: its GVR header,
++// its palette (16 words) at +0x20, its texels at +0x40.
++constexpr std::uint32_t kNamesInGtse = 0x88BE0;
+ constexpr std::uint32_t kGameLabels = 0x805D3DB4;  // the game's sprite table: 1P..4P, then COM
+ 
+ // Ours, in low memory the game leaves at zero (0x80002C00-0x80002D80: the seats' pads).
+@@ -67,20 +75,22 @@ constexpr std::array<Patch, 5> kPatches = {{
+     {0x80526958, {0x4BAE22E5}, {0x4BADE6A9}, 1},  // bl 0x80008C3C -> bl kResults
+ }};
+ // The results screen: a racer's character name (indexed by +0xBA in 0x805EEAD0, texture
+-// "GoalResult_01_E", list [0x80603498]) becomes its player's tag. kResults (0x80005000, in the same
+-// padding): k = lbz 0x1029(r30) (the racer's index; every racer is a CPU by then); no tag in
+-// kTagTable: straight on to 0x80008C3C (the game's name); a tag: binds kTagEntry, draws the tag twice
+-// its texel size centred in the name's cell, in the caller's colour (its fades), binds the game's
+-// texture again (0x80053C54). work\etiquettes\RESULTATS.md, resultats_ppc.py.
++// "GoalResult_01_E", list [0x80603498]) becomes its player's tag, in the names' own font. kResults
++// (0x80005000, in the same padding): k = lbz 0x1029(r30) (the racer's index; every racer is a CPU by
++// then); no flag in kResTable: straight on to 0x80008C3C (the game's name); a tag: binds kResEntry,
++// draws the name's cell 2 units shorter at the top and bottom (the game's names use its rows 2-17 of
++// 20) from the tag's band of our texture, in the caller's colour (its fades), binds the game's texture
++// again (0x80053C54). work\etiquettes\RESULTATS.md, resultats_ppc.py.
+ constexpr std::uint32_t kResults = 0x80005000;
+-constexpr std::array<std::uint32_t, 51> kResultsCode = {
+-    0x897E1029, 0x556B077E, 0x1D6B0018, 0x3D808000, 0x618C4F40, 0x7D8C5A14, 0xA00C0010, 0x28000000,
++constexpr std::array<std::uint32_t, 41> kResultsCode = {
++    0x897E1029, 0x556B077E, 0x1D6B0018, 0x3D808000, 0x618C5120, 0x7D8C5A14, 0xA00C0010, 0x28000000,
+     0x40820008, 0x48003C18, 0x9421FFC0, 0x7C0802A6, 0x90010044, 0x90610008, 0x9081000C, 0x90A10010,
+-    0x90C10014, 0x90E10018, 0x91810030, 0x3C608000, 0x60634F00, 0x38800000, 0x48078195, 0x81810030,
+-    0x80610008, 0x80A10010, 0x7C632A14, 0x7C630E70, 0xA00C0010, 0x7CA01850, 0x7D630214, 0x7CA32B78,
+-    0x7D655B78, 0x8081000C, 0x80C10014, 0x7C843214, 0x7C8B0E70, 0xA00C0012, 0x7C805850, 0x7CCB0214,
+-    0x80E10018, 0x39000000, 0x7D896378, 0x48003B91, 0x808D88F8, 0x38600000, 0x4804EB9D, 0x80010044,
+-    0x7C0803A6, 0x38210040, 0x4E800020};
++    0x90C10014, 0x90E10018, 0x91810030, 0x3C608000, 0x606350E0, 0x38800000, 0x48078195, 0x81810030,
++    0x80610008, 0x8081000C, 0x38840002, 0x80A10010, 0x80C10014, 0x38C6FFFE, 0x80E10018, 0x39000000,
++    0x7D896378, 0x48003BB9, 0x808D88F8, 0x38600000, 0x4804EBC5, 0x80010044, 0x7C0803A6, 0x38210040,
++    0x4E800020};
++constexpr std::uint32_t kResEntry = 0x800050E0;  // the results' tags' texture entry (0x40 bytes)
++constexpr std::uint32_t kResTable = 0x80005120;  // 8 x 0x18: u0 v0 u1 v1 (floats), flag (u16)
+ // The routine saves r3-r9 and f1 (the quad's arguments), then:
+ // 1. the label: our texture holds 5P-8P only; for any other label ((r15 & 0xC0) != 0x40, the table
+ //    being 0x100-aligned), the game's quad with the game's atlas (bl 0x800087CC); for ours, it binds
+@@ -207,10 +217,11 @@ std::uint32_t OurTexels(std::uint32_t* atlas_entry)
+   if (!InMem1(block, kBlockSize))
+     return 0;
+   const std::uint8_t* h = Guest(block, 0x20);
+-  // version 4: then the tags' palette (0x20) and texels (128x128 C4) at +0x1C
++  // version 4: then the tags' palette (0x20) and texels (128x128 C4) at +0x1C; version 5: then the
++  // results' tags' palette and texels (128x128 C4) at kResTexels - 0x20
+   if (!h || std::memcmp(h, "SRNPLBL1", 8) != 0 || Get32(h + 0x08) != 0x01000020u ||
+       Get32(h + 0x0C) != 9 || Get32(h + 0x10) != 0x20 || Get32(h + 0x14) != 0x220 ||
+-      Get32(h + 0x18) != 4 || Get32(h + 0x1C) != 0x2220)
++      Get32(h + 0x18) != 5 || Get32(h + 0x1C) != 0x2220)
+     return 0;
+   *atlas_entry = atlas;
+   return block + 0x220;
+@@ -255,11 +266,11 @@ bool WriteTable()
+   return true;
+ }
+ 
+-// The tags' entry: the atlas' entry with the tags' texture, 128x128 C4 (its 16-word RGB5A3 palette
+-// just before the texels, where the game's loader looks for it).
+-void WriteTagEntry(std::uint32_t atlas, std::uint32_t texels)
++// The tags' entry (or the results' tags', at `entry`): the atlas' entry with a 128x128 C4 texture (its
++// 16-word RGB5A3 palette just before the texels, where the game's loader looks for it).
++void WriteTagEntry(std::uint32_t atlas, std::uint32_t texels, std::uint32_t entry = kTagEntry)
+ {
+-  std::uint8_t* out = Guest(kTagEntry, kEntrySize);
++  std::uint8_t* out = Guest(entry, kEntrySize);
+   const std::uint8_t* in = Guest(atlas, kEntrySize);
+   if (!out || !in)
+     return;
+@@ -387,6 +398,368 @@ void WriteTagTable(const std::array<int, 8>& widths)
+   }
+ }
+ 
++// ---- The results screen's tags, in the font of the game's names ----
++// The letters the game has (in its names, DR.EGGMAN ... E-10000R) are taken from "GoalResult_01_E" in
++// RAM once the file is loaded, so nothing of the game is in this source: a letter is the k-th piece of
++// strong fill (indices F, E, D; 4-connected, 2 texels at least) of a name, with the texels nearest to it
++// (the outline and halo), its outline completed by a generated one (a letter between two others shares
++// theirs). The others are fills defined here (kDrawn) with the generated outline. A tag is laid out
++// like the game's names (fills 1 texel apart, the strongest index wins where two letters touch),
++// centred like them, in its racer's 16-row band of our texture, which takes the names' palette.
++// Prototype and previews: work\etiquettes\police_resultats.py.
++using Pixels = std::map<std::pair<int, int>, std::uint8_t>;
++
++constexpr bool IsFill(std::uint8_t v)
++{
++  return v == 0xF || v == 0xE || v == 0xD || v == 0x8 || v == 0xC;
++}
++constexpr bool IsStrong(std::uint8_t v)
++{
++  return v == 0xF || v == 0xE || v == 0xD;
++}
++// the names' palette: 0 clear, 1-7 the halo (black, growing alpha, 3 and 6 white), 8 C D E F the fill's
++// greys and white, 9 A the dark greys inside the outline, B the black outline
++constexpr std::array<int, 16> kPrio = {0, 1, 4, 2, 5, 6, 3, 7, 12, 9, 10, 8, 11, 13, 14, 15};
++
++struct Source
++{
++  char c;
++  int col, row, k;  // the name in column col (x 0/128), row row (20 texels each), its k-th letter
++};
++constexpr Source kSources[] = {
++    {'A', 0, 11, 0}, {'C', 0, 9, 4}, {'D', 0, 2, 3},  {'E', 0, 5, 4}, {'G', 0, 5, 3},  {'H', 0, 2, 1},
++    {'I', 0, 9, 3},  {'J', 1, 1, 0}, {'K', 0, 1, 0},  {'L', 0, 7, 1}, {'M', 1, 0, 1},  {'N', 0, 9, 2},
++    {'O', 0, 9, 1},  {'R', 0, 5, 0}, {'S', 0, 9, 0},  {'T', 0, 8, 0}, {'U', 0, 5, 2},  {'V', 0, 10, 2},
++    {'W', 0, 10, 0}, {'Y', 1, 0, 2}, {'-', 1, 3, 1},  {'0', 1, 3, 3}, {'1', 1, 3, 2},  {'.', 0, 0, 2},
++};
++
++Pixels FillOf(const Pixels& g)
++{
++  Pixels out;
++  for (const auto& [p, v] : g)
++    if (IsFill(v))
++      out[p] = v;
++  return out;
++}
++
++// The generated outline, the game's profile: black up to 1.5 texels from the fill, then the halo.
++Pixels Outline(const Pixels& fill)
++{
++  Pixels out = fill;
++  if (fill.empty())
++    return out;
++  int x0 = 1 << 20, y0 = 1 << 20, x1 = -(1 << 20), y1 = -(1 << 20);
++  for (const auto& [p, v] : fill)
++  {
++    x0 = std::min(x0, p.first);
++    x1 = std::max(x1, p.first);
++    y0 = std::min(y0, p.second);
++    y1 = std::max(y1, p.second);
++  }
++  for (int y = y0 - 4; y <= y1 + 4; ++y)
++    for (int x = x0 - 4; x <= x1 + 4; ++x)
++    {
++      if (fill.count({x, y}))
++        continue;
++      int best = 99;  // squared distance
++      for (int dy = -3; dy <= 3; ++dy)
++        for (int dx = -3; dx <= 3; ++dx)
++          if (fill.count({x + dx, y + dy}))
++            best = std::min(best, dx * dx + dy * dy);
++      // 1.5 -> d2 <= 2.25, 2.0 -> 4, 2.25 -> 5.06, 3.0 -> 9
++      const std::uint8_t v = best <= 2 ? 0xB : best <= 4 ? 7 : best <= 5 ? 4 : best <= 9 ? 2 : 0;
++      if (v)
++        out[{x, y}] = v;
++    }
++  return out;
++}
++
++void Over(Pixels* a, const Pixels& b)
++{
++  for (const auto& [p, v] : b)
++  {
++    auto it = a->find(p);
++    if (it == a->end() || kPrio[v] > kPrio[it->second])
++      (*a)[p] = v;
++  }
++}
++
++// The k-th letter of a name of the names' texture (indices, 256x256), in the name cell's coordinates.
++Pixels GameLetter(const std::vector<std::uint8_t>& idx, const Source& s)
++{
++  const int x0 = 128 * s.col, y0 = 20 * s.row;
++  auto at = [&](int x, int y) { return idx[static_cast<std::size_t>(y) * 256 + static_cast<std::size_t>(x)]; };
++  auto inside = [&](int x, int y) { return x >= x0 && x < x0 + 128 && y >= y0 && y < y0 + 20; };
++  std::map<std::pair<int, int>, int> lab;
++  std::vector<std::pair<int, int>> order;  // labelled texels, in the order they were labelled
++  std::vector<std::vector<std::pair<int, int>>> comps;
++  for (int y = y0; y < y0 + 20; ++y)
++    for (int x = x0; x < x0 + 128; ++x)
++    {
++      if (!IsStrong(at(x, y)) || lab.count({x, y}))
++        continue;
++      const int n = static_cast<int>(comps.size());
++      comps.emplace_back();
++      std::deque<std::pair<int, int>> q{{x, y}};
++      lab[{x, y}] = n;
++      order.push_back({x, y});
++      comps[n].push_back({x, y});
++      while (!q.empty())
++      {
++        const auto [cx, cy] = q.front();
++        q.pop_front();
++        const std::pair<int, int> next[] = {{cx + 1, cy}, {cx - 1, cy}, {cx, cy + 1}, {cx, cy - 1}};
++        for (const auto& [nx, ny] : next)
++          if (inside(nx, ny) && !lab.count({nx, ny}) && IsStrong(at(nx, ny)))
++          {
++            lab[{nx, ny}] = n;
++            order.push_back({nx, ny});
++            comps[n].push_back({nx, ny});
++            q.push_back({nx, ny});
++          }
++      }
++    }
++  std::vector<int> big;
++  for (int n = 0; n < static_cast<int>(comps.size()); ++n)
++    if (comps[n].size() >= 2)
++      big.push_back(n);
++  auto min_x = [&](int n) {
++    int m = 1 << 20;
++    for (const auto& p : comps[n])
++      m = std::min(m, p.first);
++    return m;
++  };
++  std::stable_sort(big.begin(), big.end(), [&](int a, int b) { return min_x(a) < min_x(b); });
++  if (s.k >= static_cast<int>(big.size()))
++    return {};
++  const int target = big[s.k];
++  // every texel that is not clear goes to the nearest piece (breadth first, from all of them at once)
++  std::map<std::pair<int, int>, int> prop = lab;
++  std::deque<std::pair<int, int>> q(order.begin(), order.end());
++  while (!q.empty())
++  {
++    const auto [cx, cy] = q.front();
++    q.pop_front();
++    for (int dx = -1; dx <= 1; ++dx)
++      for (int dy = -1; dy <= 1; ++dy)
++      {
++        const int nx = cx + dx, ny = cy + dy;
++        if (inside(nx, ny) && !prop.count({nx, ny}) && at(nx, ny) != 0)
++        {
++          prop[{nx, ny}] = prop[{cx, cy}];
++          q.push_back({nx, ny});
++        }
++      }
++  }
++  Pixels out;
++  for (const auto& [p, n] : prop)
++    if (n == target)
++      out[{p.first - x0, p.second - y0}] = at(p.first, p.second);
++  return out;
++}
++
++Pixels Drawn(const char* const* rows, int dy)
++{
++  Pixels out;
++  for (int y = 0; rows[y]; ++y)
++    for (int x = 0; rows[y][x]; ++x)
++      if (rows[y][x] != ' ')
++      {
++        const char c = rows[y][x];
++        const int v = c <= '9' ? c - '0' : c - 'A' + 10;
++        out[{x, y + dy}] = static_cast<std::uint8_t>(v);
++      }
++  return out;
++}
++
++// Moves a letter so that its fill starts at x 0 and the top of the capitals is row 0.
++Pixels Normalised(const Pixels& g, bool drawn, char c)
++{
++  int fx = 1 << 20, fy = 1 << 20;
++  for (const auto& [p, v] : g)
++    if (IsFill(v))
++    {
++      fx = std::min(fx, p.first);
++      fy = std::min(fy, p.second);
++    }
++  if (drawn)
++    fy = 0;
++  else if (c == '.')
++    fy -= 8;
++  else if (c == '-')
++    fy -= 6;
++  Pixels out;
++  for (const auto& [p, v] : g)
++    out[{p.first - fx, p.second - fy}] = v;
++  return out;
++}
++
++// The letters the names do not have: fills (palette indices, row by row from `dy`, the capitals' top
++// being row 0), rendered from a TTF Gibax gave (DejaVu Sans Bold Oblique renamed, Bitstream Vera
++// licence) at the names' size: widened, slanted a little more, 11 rows, the greys F E D 8 C
++// (work\etiquettes\police_cpp.py ttf).
++struct DrawnGlyph
++{
++  char c;
++  int dy;
++  const char* rows[16];  // up to nullptr
++};
++const DrawnGlyph kDrawn[] = {
++    {'B', 0, {"   8EEEEDD", "   FFFFFFFF", "   FFFC8FFF", "  8FFD  FFF", "  DFFEDFFF8", "  FFFFFFFE", "  FFE88FFFC", " 8FF8  DFFC", " EFFC CFFF", " FFFFFFFF8", "CFFFFFFEC", nullptr}},
++    {'F', 0, {"   8EEEEEED", "   FFFFFFFD", "   FFF8888", "  8FFD", "  DFFEEEEC", "  FFFFFFFC", "  FFFDDDD", " 8FF8", " EFFC", " FFF", "CFFE", nullptr}},
++    {'P', 0, {"   8EEEEED", "   FFFFFFFF", "   FFF88FFFC", "  8FFD  DFFC", "  DFFC  FFF", "  FFFEEFFFD", "  FFFFFFFD", " 8FFDCCC", " EFFC", " FFF", "CFFE", nullptr}},
++    {'Q', 0, {"    8EFFE8", "  CFFFFFFFE", "  FFFDC8FFFC", " EFF8   DFFD", "CFFE    8FFD", "DFF8    DFF8", "EFFC    FFF", "FFFC   8FFE", "DFFE  8FFFC", "CFFFFFFFFC", " CFFFFFE", "    CFFE", "     DFF8", nullptr}},
++    {'X', 0, {"  CEED   8EE8", "   FFF  8FFE", "   DFF8CFFF", "    FFFFFF", "    EFFFF", "    DFFFC", "   CFFFF8", "  CFFFFFF", "  FFF EFFC", " FFFC 8FFD", "FFFC   FFF", nullptr}},
++    {'Z', 0, {"   EEEEEEEED", "  8FFFFFFFFD", "  C888DFFFF", "      DFFF", "     DFFF", "    DFFE", "   EFFE", "  EFFE", " EFFFC", "DFFFFFFFFD", "FFFFFFFFF8", nullptr}},
++    {'2', 0, {"   CDEFFEC", "   FFFFFFF", "  CF8 CFFFC", "       EFF", "      CFFE", "     8FFE", "    EFFD", "  CFFF8", " 8FFFC", " FFFFFFFD", "8FFFFFFF8", nullptr}},
++    {'3', 0, {"   CEFFFEC", "   EFFFFFF", "   DC CFFFC", "       EFF", "    8DFFF8", "   8FFFFD", "   C8DFFF", "      EFFC", " 8    FFF", "CFFEFFFF8", "8FFFFFEC", "   C", nullptr}},
++    {'4', 0, {"      CEEE", "     CFFFF", "     FFFFD", "    FFEFF8", "   FF8DFF", "  EFD FFF", " EFE CFFD", " FFFFFFFFE", "8FFFFFFFFD", "     FFE", "    CFFD", nullptr}},
++    {'5', 0, {"   CEEEEEEC", "   DFFFFFF", "   FFD8888", "   FF8C", "  8FFFFFE", "  EFFFFFF8", "  C   DFFD", "      8FF8", " D    FFF", " FFFFFFF8", "CFFFFFFC", nullptr}},
++    {'6', 0, {"    8EFFE8", "   FFFFFF8", "  FFF8  8", " DFFC", " FFFFFFF", "8FFFFFFFD", "DFFE  FFE", "DFFC  FFE", "DFF  DFF8", "CFFFEFFE", " DFFFFD", "   C", nullptr}},
++    {'7', 0, {"  DEEEEEEE", "  FFFFFFFF", "  8888FFF8", "     CFFE", "     FFF", "    EFFC", "   8FFD", "   FFF", "  EFFC", " DFF8", "CFFE", nullptr}},
++    {'8', 0, {"   8EFFE8", "  EFFFFFF8", " CFFE 8FFD", " 8FFC 8FFC", " CFFFDFFD", "  EFFFFE", "CFFECEFFC", "FFF  CFF8", "FFE  DFFC", "FFFEEFFE", "CFFFFFD", "   C", nullptr}},
++    {'9', 0, {"   8EFFD", "  EFFFFFE", " 8FFD EFFC", " FFF  8FFC", " FFE  FFFC", " FFFDEFFF", " DFFFFFFF", "  C888FF8", "     FFF", "EFEEFFF", "FFFFFD", "  C", nullptr}},
++    {'!', 0, {"   EED", "   FFD", "  8FFC", "  EFF", "  FFE", "  FF8", "  FF", "  8C", " DD8", "CFF8", "DFF", nullptr}},
++    {'?', 0, {" 8EFFEC", " FFFFFF", "CEC EFF", "    FFF", "   FFFC", " CFFFC", " FFF", " 88C", "CDD", "EFF", "FFE", nullptr}},
++    {'_', 13, {"FFFFFFFD", "8888888C", nullptr}},
++};
++
++// The font: the game's letters, then the drawn ones (kDrawn, generated outline).
++std::map<char, Pixels> ResultsFont(const std::vector<std::uint8_t>& idx)
++{
++  std::map<char, Pixels> font;
++  for (const Source& s : kSources)
++  {
++    const Pixels g = GameLetter(idx, s);
++    if (g.empty())
++      continue;
++    Pixels full = Outline(FillOf(g));
++    Over(&full, g);
++    font[s.c] = Normalised(full, false, s.c);
++  }
++  for (const DrawnGlyph& d : kDrawn)
++    font[d.c] = Normalised(Outline(Drawn(d.rows, d.dy)), true, d.c);
++  return font;
++}
++
++// One tag, laid out and centred like the game's names (fill centre at x 66 of 128), rows relative to the
++// top of the capitals.
++Pixels LayOut(const std::map<char, Pixels>& font, const std::string& tag)
++{
++  Pixels out;
++  int x = 4;
++  for (char c : tag)
++  {
++    if (c == ' ')
++    {
++      x += 6;
++      continue;
++    }
++    auto it = font.find(c);
++    if (it == font.end())
++      it = font.find('?');
++    if (it == font.end())
++      continue;
++    int right = 0;
++    for (const auto& [p, v] : it->second)
++    {
++      const std::pair<int, int> q{x + p.first, p.second};
++      auto o = out.find(q);
++      if (o == out.end() || kPrio[v] > kPrio[o->second])
++        out[q] = v;
++      if (IsFill(v))
++        right = std::max(right, p.first);
++    }
++    x += right + 2;
++  }
++  int x0 = 1 << 20, x1 = -(1 << 20);
++  for (const auto& [p, v] : out)
++    if (IsFill(v))
++    {
++      x0 = std::min(x0, p.first);
++      x1 = std::max(x1, p.first);
++    }
++  if (x1 < x0)
++    return {};
++  const int dx = 66 - (x0 + x1) / 2;
++  Pixels centred;
++  for (const auto& [p, v] : out)
++    centred[{p.first + dx, p.second}] = v;
++  return centred;
++}
++
++// The results' tags: reads the names' texture (its GVR header still in front of it in the loaded GTSE),
++// takes its palette, lays out each racer's tag in its 16-row band (the capitals' top on row 2, as the
++// game's names sit on rows 4-15 of their 20). False when the texture is not there yet.
++bool BuildResults(std::uint32_t gtse, std::array<std::uint8_t, kTagSize * kTagSize / 2>* texels,
++                  std::array<std::uint16_t, 16>* palette, std::array<int, 8>* flags)
++{
++  const std::uint8_t* h = Guest(gtse + kNamesInGtse, 0x40 + 256 * 256 / 2);
++  if (!h || std::memcmp(h, "GCIX", 4) != 0 || std::memcmp(h + 0x10, "GVRT", 4) != 0 || h[0x1B] != 8 ||
++      Get32(h + 0x1C) != 0x01000100u)
++    return false;
++  for (std::size_t i = 0; i < 16; ++i)
++    (*palette)[i] = static_cast<std::uint16_t>((h[0x20 + 2 * i] << 8) | h[0x21 + 2 * i]);
++  std::vector<std::uint8_t> idx(256 * 256);
++  const std::uint8_t* tex = h + 0x40;
++  std::size_t pos = 0;
++  for (int by = 0; by < 256; by += 8)
++    for (int bx = 0; bx < 256; bx += 8)
++    {
++      for (int i = 0; i < 64; ++i)
++      {
++        const std::uint8_t b = tex[pos + static_cast<std::size_t>(i / 2)];
++        idx[static_cast<std::size_t>(by + i / 8) * 256 + static_cast<std::size_t>(bx + i % 8)] =
++            (i % 2) ? (b & 0x0F) : (b >> 4);
++      }
++      pos += 32;
++    }
++  const std::map<char, Pixels> font = ResultsFont(idx);
++  texels->fill(0);
++  for (std::size_t k = 0; k < 8; ++k)
++  {
++    (*flags)[k] = 0;
++    const std::string& tag = Tags()[k];
++    if (tag.empty())
++      continue;
++    for (const auto& [p, v] : LayOut(font, tag))
++    {
++      const int x = p.first, y = p.second + 2;
++      if (x < 0 || x >= static_cast<int>(kTagSize) || y < 0 || y >= 16 || !v)
++        continue;
++      const int ty = static_cast<int>(k) * 16 + y;
++      const std::size_t tile = static_cast<std::size_t>((ty / 8) * (kTagSize / 8) + x / 8);
++      std::uint8_t& byte = (*texels)[tile * 32 + static_cast<std::size_t>((ty % 8) * 4 + (x % 8) / 2)];
++      byte = static_cast<std::uint8_t>((x % 2) ? (byte & 0xF0) | v : (byte & 0x0F) | (v << 4));
++    }
++    (*flags)[k] = 1;
++  }
++  return true;
++}
++
++// The results' table: per racer, its band of the texture (u0 v0 u1 v1) and a flag (u16): 0 = no tag.
++void WriteResTable(const std::array<int, 8>& flags)
++{
++  std::uint8_t* t = Guest(kResTable, 8 * 0x18);
++  if (!t)
++    return;
++  auto put_float = [](std::uint8_t* p, float f) {
++    std::uint32_t v;
++    std::memcpy(&v, &f, 4);
++    Put32(p, v);
++  };
++  for (std::uint32_t k = 0; k < 8; ++k)
++  {
++    std::uint8_t* r = t + k * 0x18;
++    put_float(r + 0x00, 0.0f);
++    put_float(r + 0x04, static_cast<float>(k * 16) / static_cast<float>(kTagSize));
++    put_float(r + 0x08, 1.0f);
++    put_float(r + 0x0C, static_cast<float>(k * 16 + 16) / static_cast<float>(kTagSize));
++    Put32(r + 0x10, flags[k] ? 0x00010000u : 0);
++    Put32(r + 0x14, 0);
++  }
++}
++
+ void WriteWords(std::uint32_t address, const std::uint32_t* words, std::size_t n)
+ {
+   std::uint8_t* p = Guest(address, static_cast<std::uint32_t>(n * 4));
+@@ -494,6 +867,43 @@ void LabelsOnFrame()
+       WriteTagTable(tag_widths);
+     }
+   }
++  // The results' tags: built once from the names' texture of the loaded file, written in the block
++  // (palette just before the texels) when it does not hold them (a new load), with their entry and table.
++  static std::array<std::uint8_t, kTagSize * kTagSize / 2> res_texels{};
++  static std::array<std::uint16_t, 16> res_palette{};
++  static std::array<int, 8> res_flags{};
++  static bool res_built = false;
++  const std::uint32_t gtse = texels - 0x220 - kGtseSize;
++  if (!res_built)
++  {
++    res_built = BuildResults(gtse, &res_texels, &res_palette, &res_flags);
++    if (res_built)
++      std::fprintf(stderr, "[srnp labels] results' tags laid out in the game's name font\n");
++  }
++  const std::uint32_t res = texels - 0x220 + kResTexels;
++  if (std::uint8_t* p = res_built ? Guest(res - 0x20, 0x20 + static_cast<std::uint32_t>(res_texels.size())) : nullptr)
++  {
++    std::array<std::uint8_t, 0x20> pal{};
++    for (std::size_t i = 0; i < 16; ++i)
++    {
++      pal[2 * i] = static_cast<std::uint8_t>(res_palette[i] >> 8);
++      pal[2 * i + 1] = static_cast<std::uint8_t>(res_palette[i]);
++    }
++    if (std::memcmp(p, pal.data(), pal.size()) != 0 ||
++        std::memcmp(p + 0x20, res_texels.data(), res_texels.size()) != 0)
++    {
++      std::memcpy(p, pal.data(), pal.size());
++      std::memcpy(p + 0x20, res_texels.data(), res_texels.size());
++      WriteTagEntry(atlas, res, kResEntry);
++      WriteResTable(res_flags);
++      std::fprintf(stderr, "[srnp labels] results' tags written at 0x%08X\n", res);
++    }
++    else if (Read32(kResEntry + 0x1C) != ((res & 0x01FFFFFFu) >> 5))
++    {
++      WriteTagEntry(atlas, res, kResEntry);
++      WriteResTable(res_flags);
++    }
++  }
+   if (ours)
+     return;
+   // The game's code must be there (same game, same version) before ours goes in.
+diff --git a/src/runtime/srnp_labels.hpp b/src/runtime/srnp_labels.hpp
+index f122926..a9106e8 100644
+--- a/src/runtime/srnp_labels.hpp
++++ b/src/runtime/srnp_labels.hpp
+@@ -21,11 +21,13 @@
+ //   player drives with a tag shows the tag over its label, in the label's colour (no tag, or a CPU:
+ //   the label alone), from a second texture of ours in the block (128x128 C4, zero in the file) that
+ //   the runner writes with its own pixel font;
+-// - the results screen: a racer with a tag shows it instead of its character's name (a second small
+-//   routine around the name's quad, 0x80526958).
++// - the results screen: a racer with a tag shows it instead of its character's name, in the font of the
++//   game's names (a second small routine around the name's quad, 0x80526958). The runner lays the tags
++//   out from the names' texture of the loaded file (the letters it has) and fills of its own for the
++//   others, in a third texture of the block (version 5, 128x128 C4, the names' palette).
+ // The table and the entry live in low memory the game leaves at zero (0x80002E00-0x80002F40); the
+-// tags' entry and UV table after the routine (0x80004F00-0x80005000), the results' routine after them
+-// (0x80005000).
++// tags' entry and UV table after the routine (0x80004F00-0x80005000), the results' routine, entry and
++// table after them (0x80005000-0x800051E0).
+ // Without the block (no mod, another language), the game's code is put back. SRNP_ETIQUETTES=0
+ // leaves everything alone. The label left out (the player's own racer) is not changed here: the game's
+ // (racer 0, or the viewport's), or the phase 2 runner's "spotter" (the seat's racer).
+-- 
+2.34.1.windows.1
+
