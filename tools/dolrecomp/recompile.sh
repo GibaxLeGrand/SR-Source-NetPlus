@@ -107,6 +107,16 @@ fi
 # --- 3. Run DolRecomp into a scratch directory ------------------------------
 STAGE="$ROOT/build/dolrecomp-out"
 LOG="$ROOT/build/dolrecomp.log"
+# SR-Source Net Plus: SRNP_RECOMP_OUT=<new folder> puts the scratch directory, the log and the
+# output (<folder>/<GAME_ID>/) there instead, so that several recompilations (settings to compare)
+# live side by side and none replaces src/recompiled/<GAME_ID>. src/recompiled/CMakeLists.txt reads
+# it back with -DSRNP_GENERATED_ROOT=<folder>.
+if [[ -n "${SRNP_RECOMP_OUT:-}" ]]; then
+  [[ -e "$SRNP_RECOMP_OUT/$GAME_ID" ]] && die "$SRNP_RECOMP_OUT/$GAME_ID exists already: give a new folder"
+  mkdir -p "$SRNP_RECOMP_OUT" || die "cannot create $SRNP_RECOMP_OUT"
+  STAGE="$SRNP_RECOMP_OUT/stage"
+  LOG="$SRNP_RECOMP_OUT/dolrecomp.log"
+fi
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
@@ -146,7 +156,7 @@ fi
 # --- 5. Normalise into src/recompiled/<GAME_ID>/ ----------------------------
 # Layout expected by the RecompCore module template:
 #   generated.h  generated_smc.txt  main.dol  chunks/*.c
-FINAL="$ROOT/src/recompiled/$GAME_ID"
+FINAL="${SRNP_RECOMP_OUT:-$ROOT/src/recompiled}/$GAME_ID"
 NEW="$FINAL.new"
 rm -rf "$NEW"
 mkdir -p "$NEW"
@@ -208,6 +218,16 @@ command -v python3 > /dev/null || die "python3 is needed (it builds the module t
 if [[ "$BACKEND" == "c" ]]; then
   python3 -I "$ROOT/tools/dolrecomp/fast_cache_ops.py" "$NEW" | sed 's/^/[recompile] /'
   POST="fast_cache_ops"
+elif [[ -n "${FASTLOOKUP:-}" ]]; then
+  # SR-Source Net Plus: FASTLOOKUP=<path to fastlookup.py of Piconet's DolRecomp fork>. It writes
+  # an O(1) lookup instead, and native_tables.c beside generated.h: the tables that the runtime
+  # switches need (DOLRECOMP_INDIRECT_CALLS=native, GATHER_PIPE=inline, CLOSED_ROOTS) and
+  # staticrecomp_set_native_valid / staticrecomp_set_gather_pipe for the chassis. It reads the
+  # DOLRECOMP_* switches from the environment. src/recompiled/CMakeLists.txt compiles the file.
+  [[ -f "$FASTLOOKUP" ]] || die "FASTLOOKUP not found: $FASTLOOKUP"
+  python3 -I "$FASTLOOKUP" "$NEW/generated.h" | sed 's/^/[recompile] /'
+  [[ "${PIPESTATUS[0]}" == "0" && -f "$NEW/native_tables.c" ]] || die "$FASTLOOKUP failed"
+  POST="fastlookup"
 else
   python3 -I "$ROOT/tools/dolrecomp/fast_dispatch_lookup.py" "$NEW" | sed 's/^/[recompile] /'
   POST="fast_dispatch_lookup"

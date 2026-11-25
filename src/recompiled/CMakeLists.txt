@@ -19,8 +19,15 @@ if(NOT EXISTS "${_dolphin}/module-template/CMakeLists.txt")
     "Run: git submodule update --init --recursive")
 endif()
 
+# SR-Source Net Plus: SRNP_GENERATED_ROOT=<folder> builds the module from <folder>/<GAME_ID>/
+# (recompile.sh with SRNP_RECOMP_OUT=<folder>) instead of src/recompiled/<GAME_ID>/.
+set(SRNP_GENERATED_ROOT "" CACHE PATH "Folder holding <GAME_ID>/ from recompile.sh (empty: src/recompiled)")
+
 foreach(_game IN LISTS SRZGS_GAME_IDS)
   set(_generated "${CMAKE_CURRENT_SOURCE_DIR}/${_game}")
+  if(SRNP_GENERATED_ROOT)
+    set(_generated "${SRNP_GENERATED_ROOT}/${_game}")
+  endif()
   if(NOT EXISTS "${_generated}/generated.h")
     message(FATAL_ERROR
       "No recompiled output in ${_generated}\n"
@@ -64,6 +71,13 @@ foreach(_game IN LISTS SRZGS_GAME_IDS)
        REGEX "ppc_native_region_available")
   if(_generated_header MATCHES "DOLRECOMP_BACKEND_LLVM" AND NOT _gxruntime_has_region_query)
     target_sources("g${_game}_recomp" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/native_region.c")
+  endif()
+
+  # SR-Source Net Plus: the native-call tables written by Piconet's fastlookup.py
+  # (recompile.sh with FASTLOOKUP=...): indirect calls in generated code, the
+  # entry bytes and the write-gather pipe the chassis hands the module.
+  if(EXISTS "${_generated}/native_tables.c")
+    target_sources("g${_game}_recomp" PRIVATE "${_generated}/native_tables.c")
   endif()
 endforeach()
 
