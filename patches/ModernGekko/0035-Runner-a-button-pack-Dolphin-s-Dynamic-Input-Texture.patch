@@ -1,0 +1,47 @@
+From 2685e1fdff19aa28f13e1b9d2e6d0897b84a6cb5 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:16:56 +0100
+Subject: [PATCH] Runner: a button pack (Dolphin's Dynamic Input Textures)
+ turns custom textures on
+
+With a pack in <user>\Load\DynamicInputTextures (such as UniversalDynamicInput, CC0), Dolphin draws the
+game's button pictures for the player's controller as the game starts, into the custom textures, which
+the runner only turned on for texture mods. Measured: the Sonic Riders pack (real copies: Dolphin's walk
+does not follow junctions) generates 15 textures for GXEE8P. With an Xbox pad the menu's A and B look
+like the GameCube's; a PlayStation pad should show the difference (to check with Gibax).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index c661028..df0aedc 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -1267,6 +1267,22 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+         }
+       }
+     }
++    // SR-Source Net Plus: a button pack (Dolphin's Dynamic Input Textures, such as
++    // UniversalDynamicInput, in <user>\Load\DynamicInputTextures): Dolphin draws the game's button
++    // pictures for the player's controller as the game starts, into the custom textures, which must
++    // then be on even with no texture mod.
++    {
++      std::error_code dit_error;
++      const std::filesystem::path dit =
++          std::filesystem::path(File::GetUserPath(D_DYNAMICINPUT_IDX));
++      if (!custom_textures && std::filesystem::is_directory(dit, dit_error) &&
++          !std::filesystem::is_empty(dit, dit_error))
++      {
++        custom_textures = true;
++        std::cerr << "mods: button pack in " << PathToString(dit)
++                  << ": custom textures on for the controller's buttons\n";
++      }
++    }
+     Config::SetBase(Config::GFX_HIRES_TEXTURES, custom_textures);
+     // Load the mods' textures before the game starts (Dolphin's "Prefetch
+     // Custom Textures"). Loaded as the game asks for them, each one shows
+-- 
+2.34.1.windows.1
+
