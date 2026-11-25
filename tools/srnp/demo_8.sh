@@ -40,8 +40,9 @@ sleep 2
 sleep 1
 # TAGS_RELAIS="T0,T1,..." : chaque runner n'a que son tag (SRNP_TAG) ; ceux des autres viennent du relais.
 tag_de() { [[ -n "${TAGS_RELAIS:-}" ]] && echo "$TAGS_RELAIS" | cut -d, -f$(($1 + 1)) || true; }
-# LOBBY=1 : le lobby à l'essai (choix du perso sur l'écran d'attente) ; LOBBY_AUTO="c/g/s;..." : le choix
-# automatique de chaque runner (perso/planche/secondes avant d'être prêt).
+# LOBBY=1 : le lobby à l'essai (choix du perso sur l'écran d'attente) ; LOBBY_AUTO="c/g/s[/b];..." : le
+# choix automatique de chaque runner (perso/planche/secondes avant d'être prêt ; b : B b secondes plus
+# tard, retour au choix, puis prêt de nouveau b secondes après).
 auto_de() { [[ -n "${LOBBY_AUTO:-}" ]] && echo "$LOBBY_AUTO" | cut -d';' -f$(($1 + 1)) || true; }
 lance() {  # lance <siège>
   local r=$1 D="$RUN/runner$1"
@@ -104,6 +105,14 @@ for r in $(seq 0 $((N - 1))); do
   sleep "$ECART"
   [[ $r == 0 ]] && sleep 10   # le premier charge le jeu
   case $r in 1|3|5) fenetre 0 "attente_$((r + 1))sur8";; 6) for k in $(seq 0 6); do fenetre $k attente_7sur8; done;; esac
+done
+# PHOTOS_ATTENTE="5 15 24" : photos de toutes les fenêtres pendant l'attente (le lobby), à ces secondes
+# après le dernier lancement.
+t0=$(date +%s)
+for s in ${PHOTOS_ATTENTE:-}; do
+  while (( $(date +%s) - t0 < s )); do sleep 0.5; done
+  for k in $(seq 0 $((N - 1))); do fenetre $k "lobby_${s}s"; done
+  echo "$(date +%T) photos de l'attente à ${s} s"
 done
 # 3. La course : trois moments, les 8 fenêtres.
 for c in "$C1" "$C2" "$C3"; do

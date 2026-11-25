@@ -1,0 +1,238 @@
+From bea6754372ec5cc55314d5988e70ff0d668497ac Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:26:04 +0100
+Subject: [PATCH] Runner: the lobby's B (back to choosing), gear number and
+ controls hint
+
+On the waiting screen with SRNP_LOBBY=1: the local pad is read even once ready, and B sends UNREADY
+(the relay puts the seat back to choosing and the race waits for it). Each card shows the gear chosen
+("GEAR n": the gear table's names are not known yet; the race still corrects a gear the character may
+not ride), and a line at the bottom gives this machine's seat its controls in the names' font
+("LEFT/RIGHT CHARACTER  UP/DOWN GEAR  A READY", then "B BACK TO CHOOSING"; the font has "/" but no
+":"). SRNP_LOBBY_AUTO=<c>/<g>/<s>/<b> tests B without a pad: ready, B <b> seconds later, ready again.
+Measured with 3 runners: the relay logs ready, back to choosing, ready (30.5 s, 38.5 s, 46.5 s) and
+starts once the last seat is ready; the race has the characters chosen; 39 identical checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp         |  5 ++++
+ src/runtime/srnp_racers.hpp         |  4 ++-
+ src/runtime/srnp_relay.cpp          | 42 ++++++++++++++++++++---------
+ src/runtime/srnp_relay.hpp          |  5 +++-
+ src/runtime/srnp_waiting_screen.cpp | 32 ++++++++++++++++++++++
+ 5 files changed, 74 insertions(+), 14 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index d79db2b..3201a65 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -456,6 +456,11 @@ int SeatCharacter(int seat)
+   return seat >= 0 && seat < 8 ? Lobby()[static_cast<std::size_t>(seat)].character : -1;
+ }
+ 
++int SeatGear(int seat)
++{
++  return seat >= 0 && seat < 8 ? Lobby()[static_cast<std::size_t>(seat)].gear : -1;
++}
++
+ long long RaceFrame()
+ {
+   return s_race ? static_cast<long long>(s_frames - s_race_start) : -1;
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index f748d99..237ce17 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -42,9 +42,11 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+ long long RaceFrame();
+ 
+ // A seat's character and gear for the race to be set up (as SRNP_PERSOS gives them; the relay's
+-// choice for a seat the AI takes over), and the character known for a seat (-1: the game's choice).
++// choice for a seat the AI takes over), and the character and gear known for a seat (-1: the game's
++// choice).
+ void SetSeatChoice(int seat, int character, int gear);
+ int SeatCharacter(int seat);
++int SeatGear(int seat);
+ 
+ // FNV-1a 64 of the 8 racers, without the fields that follow the camera (measured on 2026-11-25).
+ std::uint64_t RacersHash();
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 7668877..6ecea9d 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -518,12 +518,14 @@ bool TakePicks(const std::string& line)
+ }
+ 
+ // The local seat's choice on the waiting screen: left/right (D-pad or stick) the character (0-16 but
+-// Super Sonic), up/down the gear, A ready, B back to choosing. SRNP_LOBBY_AUTO=<c>/<g>/<seconds> (tests):
+-// that choice, then ready, after that many seconds.
++// Super Sonic), up/down the gear, A ready, B back to choosing. SRNP_LOBBY_AUTO=<c>/<g>/<seconds>[/<back>]
++// (tests): that choice, then ready, after that many seconds; with <back>, B that many seconds later (back
++// to choosing), then A again after as many.
+ struct LobbyLocal
+ {
+   int character = 0, gear = 0;
+   bool ready = false, started = false;
++  int auto_step = 0;
+   unsigned previous = 0;
+   std::chrono::steady_clock::time_point since;
+ };
+@@ -544,18 +546,23 @@ bool LobbyStep(LobbyLocal* l)
+     l->character = std::max(0, SeatCharacter(seat));
+     LobbySend(seat, *l);
+   }
+-  if (l->ready)
+-    return false;
++  const auto set_ready = [&](bool ready) {
++    l->ready = ready;
++    SendLine((ready ? "READY " : "UNREADY ") + std::to_string(seat));
++  };
+   static const char* autopick = std::getenv("SRNP_LOBBY_AUTO");
+   if (autopick && *autopick)
+   {
+-    int c = 0, g = 0, seconds = 3;
+-    std::sscanf(autopick, "%d/%d/%d", &c, &g, &seconds);
+-    if (std::chrono::steady_clock::now() - l->since < std::chrono::seconds(seconds))
++    int c = 0, g = 0, seconds = 3, back = 0;
++    std::sscanf(autopick, "%d/%d/%d/%d", &c, &g, &seconds, &back);
++    const int steps = back > 0 ? 3 : 1;  // ready; with <back>: then back to choosing, then ready again
++    if (l->auto_step >= steps ||
++        std::chrono::steady_clock::now() - l->since < std::chrono::seconds(seconds + back * l->auto_step))
+       return false;
+-    l->character = c, l->gear = g, l->ready = true;
+-    LobbySend(seat, *l);
+-    SendLine("READY " + std::to_string(seat));
++    if (l->auto_step == 0)
++      l->character = c, l->gear = g, LobbySend(seat, *l);
++    set_ready(l->auto_step != 1);
++    ++l->auto_step;
+     return true;
+   }
+   g_controller_interface.UpdateInput();  // the game stands still: nothing else reads the pads now
+@@ -566,6 +573,14 @@ bool LobbyStep(LobbyLocal* l)
+           (y < -40 ? 0x80u : 0u);
+   const unsigned pressed = bits & ~l->previous;
+   l->previous = bits;
++  if (l->ready)
++  {
++    // Ready: only B, back to choosing (the relay starts the race once nobody is choosing).
++    if (!(pressed & 0x2u))
++      return false;
++    set_ready(false);
++    return true;
++  }
+   bool changed = false;
+   const auto next = [](int c, int step) {
+     do
+@@ -585,8 +600,7 @@ bool LobbyStep(LobbyLocal* l)
+     LobbySend(seat, *l);
+   if (pressed & 0x1u)
+   {
+-    l->ready = true;
+-    SendLine("READY " + std::to_string(seat));
++    set_ready(true);
+     changed = true;
+   }
+   return changed;
+@@ -680,8 +694,12 @@ WaitView RelayWaitView()
+     view.states = s_wait_states;
+   }
+   view.local = s_relay.local;
++  view.lobby = LobbyOn();
+   for (int k = 0; k < view.seats && k < 8; ++k)
++  {
+     view.characters[static_cast<std::size_t>(k)] = SeatCharacter(k);
++    view.gears[static_cast<std::size_t>(k)] = SeatGear(k);
++  }
+   return view;
+ }
+ 
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index a8ffdbc..2bc22d7 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -32,14 +32,17 @@ bool RelayConfigured();
+ bool RelayWaiting(int* present, int* seats);
+ 
+ // What the waiting screen shows: one letter a seat (O expected, V there, X left: the AI's), this
+-// machine's seats, and the characters known (SRNP_PERSOS; -1 when not known).
++// machine's seats, and the characters and gears known (SRNP_PERSOS or the lobby's; -1 when not known);
++// lobby: the seats choose on this screen (SRNP_LOBBY=1).
+ struct WaitView
+ {
+   bool waiting = false;
++  bool lobby = false;
+   int seats = 0;
+   std::string states;
+   std::vector<int> local;
+   std::array<int, 8> characters{-1, -1, -1, -1, -1, -1, -1, -1};
++  std::array<int, 8> gears{-1, -1, -1, -1, -1, -1, -1, -1};
+ };
+ WaitView RelayWaitView();
+ 
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 4a10b21..92bef26 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -129,6 +129,25 @@ void GameLabel(ImDrawList* list, ImFont* font, ImVec2 centre, float unit, int se
+   Label(list, font, centre, unit, text, com);
+ }
+ 
++// Lobby (SRNP_LOBBY=1): the controls for this machine's seat at the bottom of the screen, in the names'
++// font if there (`name_font`): the choice while it chooses, B once it is ready.
++void LobbyHint(const WaitView& view, ImDrawList* list, ImFont* font, ImVec2 display, float unit, bool name_font)
++{
++  if (!view.lobby || view.local.empty())
++    return;
++  const int seat = view.local.front();
++  const char s = seat < static_cast<int>(view.states.size()) ? view.states[static_cast<std::size_t>(seat)] : 'O';
++  // (the names' font has "/" but no ":")
++  const char* hint = s == 'O' ? "LEFT/RIGHT  CHARACTER      UP/DOWN  GEAR      A  READY" :
++                     s == 'V' ? "B  BACK TO CHOOSING" :
++                                nullptr;
++  if (!hint)
++    return;
++  const ImVec2 at(display.x * 0.5f, display.y * 0.93f);
++  if (!(name_font && NameTextCentred(list, hint, at, unit * 0.75f, Rgba(255, 214, 64), display.x * 0.9f)))
++    TextCentred(list, font, unit * 0.55f, at, Rgba(255, 214, 64), hint);
++}
++
+ // Gibax's mockup in the game's look: the blue of the menus (Player Entry), the game's "ARE YOU READY?",
+ // one card a seat on the menus' rounded panel, with the game's label and the character's select icon
+ // (its head and name), faded and bluish while the player is on the way.
+@@ -237,6 +256,17 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+       const float q = side_h;
+       Picture(list, unknown, ImVec2(x - q * 0.5f, i0.y), ImVec2(x + q * 0.5f, i0.y + q), ImVec2(0, 0), ImVec2(1, 1), tint);
+     }
++    // Lobby: the gear chosen, under the head (its number for now: the race corrects a gear the
++    // character may not ride).
++    const int gear = view.gears[static_cast<std::size_t>(k)];
++    if (view.lobby && s != 'X' && gear >= 0)
++    {
++      char text[16];
++      std::snprintf(text, sizeof(text), "GEAR %d", gear);
++      const ImVec2 at(x, top + card_h * 0.745f);
++      if (!(name_font && NameTextCentred(list, text, at, card_h * 0.075f, tint, card_w * 0.9f)))
++        TextCentred(list, font, card_h * 0.06f, at, tint, text);
++    }
+     // The state: blue circle (on the way, pulsing), green tick (there), red cross (left).
+     const ImVec2 mark(x, top + card_h * 0.88f);
+     const float r = unit * 0.42f;
+@@ -268,6 +298,7 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+     if (mine && !(name_font && NameTextCentred(list, "YOU", ImVec2(x, below), unit * 0.7f, Rgba(255, 214, 64))))
+       TextCentred(list, font, unit * 0.5f, ImVec2(x, below), Rgba(255, 214, 64), "YOU");
+   }
++  LobbyHint(view, list, font, display, unit, name_font);
+ }
+ 
+ void Draw(const WaitView& view)
+@@ -346,6 +377,7 @@ void Draw(const WaitView& view)
+     if (mine)
+       TextCentred(list, font, unit * 0.5f, ImVec2(x, display.y * 0.86f), Rgba(255, 214, 64), "YOU");
+   }
++  LobbyHint(view, list, font, display, unit, false);
+ }
+ }  // namespace
+ 
+-- 
+2.34.1.windows.1
+
