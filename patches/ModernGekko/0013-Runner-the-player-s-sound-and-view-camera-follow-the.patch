@@ -1,0 +1,318 @@
+From 80bf9eefcbc522ff0d19d171679a8dbe1c590d07 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:36:14 +0100
+Subject: [PATCH] Runner: the player's sound and view camera follow the seat;
+ SRNP_TRACE, SRNP_WATCH
+
+The game treats the racers whose index (+0x1029) is below the player
+count as "the player"; on a 1P machine that is racer 0 everywhere. The
+minimap's index remap (three words of code in low memory: lbz,
+addi -seat, blr) becomes a list, now with two paths of the race logic
+that only touch presentation:
+- 0x80453300 (racer events, 0x8045390C): a sound for the player, and
+  the frame of the last such sound (only read by the same "once a
+  frame" sound code);
+- 0x805735EC (0x80574608): two bytes of the player's view camera.
+Left as the game has them until understood: 0x80484A3C (a per-player
+task's state) and 0x8054E644 (an effect from the player's camera, then
+a per-player table); the paths that create tasks (the heap would differ
+from machine to machine) or touch a racer's position are not changed.
+Set with the HUD; SRNP_JOUEUR=0 keeps only the minimap's.
+
+Tools: SRNP_TRACE=<addresses> logs which racer takes a path (host
+hooks; only seen while the function runs in the interpreter),
+SRNP_WATCH=<addresses> logs guest words when they change, read at the
+head of the game's frame.
+
+Measured: 8 runners on one PC, each its own seat, a full race: 142
+checksums equal, 0 divergences. Neither path happened in the test races,
+so their effect is not seen yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp |   4 +
+ src/runtime/srnp_racers.cpp     | 170 ++++++++++++++++++++++++++++----
+ src/runtime/srnp_racers.hpp     |   9 ++
+ 3 files changed, 164 insertions(+), 19 deletions(-)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 4fce691..e79aac9 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -14,6 +14,7 @@
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/CPU.h"
++#include "srnp_racers.hpp"
+ #include "srnp_relay.hpp"
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GCPad.h"
+@@ -1268,6 +1269,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+     setenv("STATICRECOMP_FALLBACK_RANGES", ranges.c_str(), 1);
+ #endif
+   }
++  // SRNP_TRACE: which racer takes a path of the game's code (srnp_racers.hpp).
++  for (const std::uint32_t at : srnp::TraceAddresses())
++    impl->mods->AddHostHook(at, &srnp::TraceHook);
+   // The mods' hooks into the game's code. StaticRecomp asks them about every
+   // address it runs (a few percent of the CPU thread), so they are only
+   // installed when a mod is loaded (or the runtime hooks): without one,
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index c4e1d91..9a62fc2 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -7,6 +7,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <map>
++#include <string>
+ #include <string_view>
+ #include <utility>
+ 
+@@ -171,7 +173,6 @@ constexpr CodeWord kHudCode[] = {
+     {0x8042EEF8, 0x809A0B98},  // lwz r4, 0xB98(r26)
+     {0x8042BC10, 0x39C49440},  // addi r14, r4, -0x6BC0: racer 0 in the HUD task 0x8042BBEC
+     {0x80421D20, 0x3B649440},  // addi r27, r4, -0x6BC0: racer 0 in the HUD task 0x80421D00 (rank)
+-    {0x80415C54, 0x89331029},  // lbz r9, 0x1029(r19): the minimap's racer index (below)
+     // The 1P labels over the racers (0x8042F47C, called by the 1P HUD: "nP" by racer index for a
+     // human, +0xBD = 0, "COM" for a CPU, with the character's head; the same number on every machine)
+     // leave out the player's own racer, racer 0 (loop index r31 == 0). It is the seat's racer that must
+@@ -180,15 +181,67 @@ constexpr CodeWord kHudCode[] = {
+     {0x8042F9B8, 0x281F0000},  // cmplwi r31, 0
+     {0x8042FD28, 0x281F0000},  // cmplwi r31, 0
+ };
+-// The minimap (task 0x80414758) draws every racer's head, from last place to first, the players'
+-// heads (index +0x1029 below the player count, 0x8021B8C8) blinking and the others fixed: on a 1P
+-// machine, racer 0. For this machine's seat to be the blinking one, the index is read through a few
+-// words of code in free low memory (right after the seats' pads; 0x80002E00-0x80002FBC is the
+-// 5P-8P labels'): index - seat, so that only the seat's racer is below 1 (unsigned). 2026-11-25.
+-constexpr std::uint32_t kMinimapIndex = 0x80415C54;
+-constexpr std::uint32_t kMinimapCave = 0x80002D80;
++// Reads of a racer's index (+0x1029, lbz rD) by code that treats the racers below the player count
++// (0x8021B8C8) as "the player": on a 1P machine, racer 0. For this machine's seat to be the player
++// there, each read goes through three words of code in free low memory (right after the seats' pads;
++// 0x80002E00-0x80002FBC is the 5P-8P labels'): lbz, addi rD, rD, -seat, blr. The seat's racer then
++// reads 0 (player 0, view 0, pad 0) and the others read a number past the player count (unsigned).
++// Only presentation: none of these paths allocates or writes a racer; with all eleven of the game's
++// player tests forced to "not a player", a whole race kept the same positions (2026-11-25).
++// SRNP_JOUEUR=0 keeps only the minimap's.
++struct IndexRead
++{
++  std::uint32_t address, original;
++  bool game_logic;  // in race logic rather than the HUD
++};
++constexpr IndexRead kIndexReads[] = {
++    // The minimap (task 0x80414758): every racer's head, the player's blinking.
++    {0x80415C54, 0x89331029, false},  // lbz r9, 0x1029(r19)
++    // 0x80453300 (racer events): a sound for the player (0x80089120, 0xA9120100), and [0x80612D40],
++    // the frame of the last such sound (only read by the same "once a frame" sound code).
++    {0x8045390C, 0x88FF1029, true},  // lbz r7, 0x1029(r31)
++    // 0x805735EC: two bytes of the player's view camera (0x80601D28 + index x 0x25C: +0x24A, +0x24B).
++    {0x80574608, 0x889C1029, true},  // lbz r4, 0x1029(r28)
++    // Left as the game has them until understood: 0x80484A3C (0x804874FC: the player's task
++    // 0x80604784[index], state 5 to 4) and 0x8054E644 (0x8054E714, 0x8054E820: an effect drawn from the
++    // player's camera, then [0x80604428] + index x 0x30).
++};
++constexpr std::uint32_t kIndexCaves = 0x80002D80;  // 12 bytes each, up to 0x80002DC8
+ int s_hud_seat = 0;
+ 
++void PatchIndexReads(int seat)
++{
++  static const bool logic_off = [] {
++    const char* v = std::getenv("SRNP_JOUEUR");
++    return v && *v == '0';
++  }();
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  for (std::size_t i = 0; i < std::size(kIndexReads); ++i)
++  {
++    const IndexRead& read = kIndexReads[i];
++    if (read.game_logic && logic_off)
++      continue;
++    std::uint8_t* p = Guest(read.address, 4);
++    const std::uint32_t cave = kIndexCaves + static_cast<std::uint32_t>(i) * 12u;
++    std::uint8_t* c = Guest(cave, 12);
++    const std::uint32_t call = 0x48000001u | ((cave - read.address) & 0x03FFFFFCu);  // bl cave
++    if (!p || !c || (Get32(p) != read.original && Get32(p) != call))
++    {
++      std::fprintf(stderr, "[srnp racers] index read 0x%08X holds %08X: left alone\n", read.address,
++                   p ? Get32(p) : 0u);
++      continue;
++    }
++    const std::uint32_t rd = (read.original >> 21) & 31u;
++    Put32(c, read.original);
++    Put32(c + 4, 0x38000000u | rd << 21 | rd << 16 |
++                     ((0u - static_cast<std::uint32_t>(seat)) & 0xFFFFu));  // addi rD, rD, -seat
++    Put32(c + 8, 0x4E800020u);                                              // blr
++    jit.InvalidateICache(cave, 12, true);
++    Put32(p, seat ? call : read.original);  // seat 0: the game's own lbz
++    jit.InvalidateICache(read.address, 4, true);
++  }
++}
++
+ void PatchHud(int seat)
+ {
+   static const bool off = [] {
+@@ -204,13 +257,11 @@ void PatchHud(int seat)
+       0x809A0000u | ((0x0B98u - shift) & 0xFFFFu),           // lwz r4, 0xB98 - shift(r26)
+       0x39C40000u | ((0x9440u + shift) & 0xFFFFu),           // addi r14, r4, -0x6BC0 + shift
+       0x3B640000u | ((0x9440u + shift) & 0xFFFFu),           // addi r27, r4, -0x6BC0 + shift
+-      // bl kMinimapCave (seat 0: the game's lbz)
+-      seat ? 0x48000001u | ((kMinimapCave - kMinimapIndex) & 0x03FFFFFCu) : 0x89331029u,
+       0x281F0000u | static_cast<std::uint32_t>(seat),  // cmplwi r31, seat
+       0x281F0000u | static_cast<std::uint32_t>(seat),
+       0x281F0000u | static_cast<std::uint32_t>(seat),
+   };
+-  static_assert(std::size(kHudCode) == 9);
++  static_assert(std::size(kHudCode) == std::size(patched));
+   if (s_hud_seat == 0)  // the game's code must be there (same game, same version)
+   {
+     for (const CodeWord& word : kHudCode)
+@@ -224,13 +275,7 @@ void PatchHud(int seat)
+     }
+   }
+   auto& jit = Core::System::GetInstance().GetJitInterface();
+-  if (std::uint8_t* cave = Guest(kMinimapCave, 12))
+-  {
+-    Put32(cave, 0x89331029u);                                              // lbz r9, 0x1029(r19)
+-    Put32(cave + 4, 0x39290000u | ((0u - static_cast<std::uint32_t>(seat)) & 0xFFFFu));  // addi r9, r9, -seat
+-    Put32(cave + 8, 0x4E800020u);                                          // blr
+-    jit.InvalidateICache(kMinimapCave, 12, true);
+-  }
++  PatchIndexReads(seat);
+   for (std::size_t i = 0; i < std::size(kHudCode); ++i)
+   {
+     if (std::uint8_t* p = Guest(kHudCode[i].address, 4))
+@@ -444,9 +489,44 @@ void PatchTest(bool on)
+   }
+ }
+ 
++namespace
++{
++void TraceReport();
++}
++
++// SRNP_WATCH=<address>,... (hexadecimal): words of guest memory logged whenever they change, with the
++// race frame (read at the head of the game's frame, as the checksums).
++void WatchWords()
++{
++  static std::vector<std::pair<std::uint32_t, std::uint32_t>> watched = [] {
++    std::vector<std::pair<std::uint32_t, std::uint32_t>> list;
++    const char* v = std::getenv("SRNP_WATCH");
++    for (const char* p = v; p && *p;)
++    {
++      char* end = nullptr;
++      const unsigned long address = std::strtoul(p, &end, 16);
++      if (end == p)
++        break;
++      list.emplace_back(static_cast<std::uint32_t>(address) & ~3u, 0u);
++      p = *end == ',' ? end + 1 : nullptr;
++    }
++    return list;
++  }();
++  for (auto& [address, last] : watched)
++  {
++    const std::uint32_t now = Read32(address);
++    if (now != last)
++      std::fprintf(stderr, "[srnp watch] frame %llu 0x%08X %08X -> %08X\n",
++                   static_cast<unsigned long long>(s_frames), address, last, now);
++    last = now;
++  }
++}
++
+ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2)
+ {
+-  ++s_frames;
++  if (++s_frames % 1200 == 0)
++    TraceReport();
++  WatchWords();
+   std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
+   std::uint8_t* seat_pads = Guest(kSeatPads, 8 * kPadSize);
+   if (!racers || !seat_pads)
+@@ -576,6 +656,58 @@ std::uint64_t RacersHash()
+   return hash;
+ }
+ 
++namespace
++{
++// SRNP_TRACE: counts of (address, racer), shown with the race frame.
++std::map<std::pair<std::uint32_t, int>, std::uint64_t> s_trace;
++
++void TraceReport()
++{
++  if (s_trace.empty())
++    return;
++  std::string line;
++  for (const auto& [key, count] : s_trace)
++  {
++    char item[48];
++    std::snprintf(item, sizeof(item), " %08X/r%d:%llu", key.first, key.second,
++                  static_cast<unsigned long long>(count));
++    line += item;
++  }
++  std::fprintf(stderr, "[srnp trace] frame %llu:%s\n", static_cast<unsigned long long>(s_frames),
++               line.c_str());
++}
++}  // namespace
++
++std::vector<std::uint32_t> TraceAddresses()
++{
++  std::vector<std::uint32_t> list;
++  const char* v = std::getenv("SRNP_TRACE");
++  for (const char* p = v; p && *p;)
++  {
++    char* end = nullptr;
++    const unsigned long address = std::strtoul(p, &end, 16);
++    if (end == p)
++      break;
++    list.push_back(static_cast<std::uint32_t>(address) & ~3u);
++    p = *end == ',' ? end + 1 : nullptr;
++  }
++  return list;
++}
++
++void TraceHook(CPUState* state)
++{
++  int racer = -1;
++  for (int r = 31; r >= 14 && racer < 0; --r)
++  {
++    const std::uint32_t v = state->gpr[r];
++    if (v >= kRacers && v < kRacers + 8 * kRacerSize && (v - kRacers) % kRacerSize == 0)
++      racer = static_cast<int>((v - kRacers) / kRacerSize);
++  }
++  if (s_trace[{state->pc, racer}]++ == 0)
++    std::fprintf(stderr, "[srnp trace] 0x%08X racer %d first at race frame %llu\n", state->pc, racer,
++                 static_cast<unsigned long long>(s_frames));
++}
++
+ void PadCheckOnFrame(std::uint64_t frame)
+ {
+   static const bool on = [] {
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 5a93d73..604454b 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -16,6 +16,8 @@
+ #include <cstdint>
+ #include <vector>
+ 
++#include "moderngekko/cpu_state.h"
++
+ namespace srnp
+ {
+ // A seat's input: buttons (bit 0..11: A B X Y Z Start Up Down Left Right L R; kSeatAI), main stick
+@@ -45,4 +47,11 @@ std::uint64_t RacersHash();
+ // SRNP_PADCHECK=1: after each present, fills a copy of port 0's controller structure from the
+ // PADStatus the game used and compares it with the game's (counts in the runner's log).
+ void PadCheckOnFrame(std::uint64_t frame);
++
++// SRNP_TRACE=<address>,... (hexadecimal): StaticRecomp host hooks that log which racer takes a path
++// of the game's code (the racer a register r14-r31 points to), with the race frame, and the counts
++// every 1200 frames. A function's hooks are only seen while it runs in the interpreter (a changed
++// chunk, or STATICRECOMP_FALLBACK_RANGES).
++std::vector<std::uint32_t> TraceAddresses();
++void TraceHook(CPUState* state);
+ }  // namespace srnp
+-- 
+2.34.1.windows.1
+

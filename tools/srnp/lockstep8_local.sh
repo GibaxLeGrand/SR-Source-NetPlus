@@ -51,7 +51,10 @@ for r in $(seq 0 $((N - 1))); do
   SEATS=${GROUPES[$r]:-$(seq -s, $((r * K)) $((r * K + K - 1)))}
   printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$CAPT" > "$A/commands/00_capt.txt"
   ARGS=(--game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" --automation-dir "$(w "$A")"
-        --mute --load-state "$(w "$STATE")")
+        --load-state "$(w "$STATE")")
+  # SON="0" (ou "0 3") : ces runners-là gardent le son ; les autres sont muets. Couper le son ne
+  # change pas l'émulation (le DSP tourne pareil, seul le volume de sortie est à 0).
+  [[ " ${SON:-} " == *" $r "* ]] || ARGS+=(--mute)
   # HD="0 1 2 3" (ou all) : ces runners-là chargent le pack de textures HD (work\textures\pack_hd), en
   # deux mods (Gigapixel AI, puis Waifu Caffe qui gagne sur les doublons), par des jonctions.
   if [[ " ${HD:-} " == *" $r "* || "${HD:-}" == all ]]; then
