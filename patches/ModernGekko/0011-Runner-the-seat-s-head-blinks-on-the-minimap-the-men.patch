@@ -1,0 +1,208 @@
+From d3962cd5122dd48c6b9c01581b432bd6abdcbff8 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:03:32 +0100
+Subject: [PATCH] Runner: the seat's head blinks on the minimap; the menu never
+ pauses online; SRNP_PATCH
+
+- Minimap (task 0x80414758): every racer's head is drawn, from last
+  place to first; a player's head (racer index +0x1029 below the player
+  count) blinks, the others are fixed. On a 1P machine that was racer 0
+  on every machine. The index it reads (0x80415C54) now goes through
+  three words of code in free low memory (0x80002E00: lbz, addi -seat,
+  blr), so the seat's racer is the one that blinks. Set with the HUD
+  (SRNP_HUD=0 leaves it).
+- The runner's menu opens as in Netplay when SRNP_RELAY is set: the
+  match goes on behind it (srnp::RelayConfigured()).
+- SRNP_PATCH=<address>=<word>,...: code words written for the race and
+  taken back at its end, for experiments.
+
+Measured: camera and HUD on racer 5, the same frames: racer 5's head
+blinks instead of racer 0's. 8 runners on one PC, each with its own
+seat's HUD, a full race: 142 checksums equal, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/game_menu.cpp   |  6 +++-
+ src/runtime/srnp_racers.cpp | 69 +++++++++++++++++++++++++++++++++++++
+ src/runtime/srnp_relay.cpp  |  9 +++++
+ src/runtime/srnp_relay.hpp  |  4 +++
+ 4 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/game_menu.cpp b/src/runtime/game_menu.cpp
+index 86e3ea2..893f8da 100644
+--- a/src/runtime/game_menu.cpp
++++ b/src/runtime/game_menu.cpp
+@@ -26,6 +26,7 @@
+ #include "launcher_look.hpp"
+ #include "launcher_text.hpp"
+ #include "screenshot.hpp"
++#include "srnp_relay.hpp"
+ 
+ #include <imgui.h>
+ 
+@@ -734,7 +735,10 @@ std::unique_ptr<GameMenu> GameMenu::Create(const GameMenuSettings& settings, Gam
+   auto impl = std::make_unique<Impl>();
+   impl->settings = settings;
+   impl->hooks = std::move(hooks);
+-  impl->netplay = NetPlay::IsNetPlayRunning();
++  // SR-Source Net Plus: with a relay the match goes on too (SRNP_RELAY, srnp_relay.hpp).
++  impl->netplay = NetPlay::IsNetPlayRunning() || srnp::RelayConfigured();
++  if (srnp::RelayConfigured())
++    std::fprintf(stderr, "[srnp relay] the menu does not pause the game: the match goes on\n");
+   // The rows keep the frontend's order: keep_quick_setting is told rows by
+   // their place in settings.quick_settings.
+   std::vector<std::size_t> choice_counts;
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 1a30c93..21a2cea 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -171,7 +171,15 @@ constexpr CodeWord kHudCode[] = {
+     {0x8042EEF8, 0x809A0B98},  // lwz r4, 0xB98(r26)
+     {0x8042BC10, 0x39C49440},  // addi r14, r4, -0x6BC0: racer 0 in the HUD task 0x8042BBEC
+     {0x80421D20, 0x3B649440},  // addi r27, r4, -0x6BC0: racer 0 in the HUD task 0x80421D00 (rank)
++    {0x80415C54, 0x89331029},  // lbz r9, 0x1029(r19): the minimap's racer index (below)
+ };
++// The minimap (task 0x80414758) draws every racer's head, from last place to first, the players'
++// heads (index +0x1029 below the player count, 0x8021B8C8) bright and the others greyed: on a 1P
++// machine, racer 0. For this machine's seat to be the bright one, the index is read through a few
++// words of code in free low memory (after the seats' pads): index - seat, so that only the seat's
++// racer is below 1 (unsigned). 2026-11-25.
++constexpr std::uint32_t kMinimapIndex = 0x80415C54;
++constexpr std::uint32_t kMinimapCave = 0x80002E00;
+ int s_hud_seat = 0;
+ 
+ void PatchHud(int seat)
+@@ -189,6 +197,8 @@ void PatchHud(int seat)
+       0x809A0000u | ((0x0B98u - shift) & 0xFFFFu),           // lwz r4, 0xB98 - shift(r26)
+       0x39C40000u | ((0x9440u + shift) & 0xFFFFu),           // addi r14, r4, -0x6BC0 + shift
+       0x3B640000u | ((0x9440u + shift) & 0xFFFFu),           // addi r27, r4, -0x6BC0 + shift
++      // bl kMinimapCave (seat 0: the game's lbz)
++      seat ? 0x48000001u | ((kMinimapCave - kMinimapIndex) & 0x03FFFFFCu) : 0x89331029u,
+   };
+   if (s_hud_seat == 0)  // the game's code must be there (same game, same version)
+   {
+@@ -203,6 +213,13 @@ void PatchHud(int seat)
+     }
+   }
+   auto& jit = Core::System::GetInstance().GetJitInterface();
++  if (std::uint8_t* cave = Guest(kMinimapCave, 12))
++  {
++    Put32(cave, 0x89331029u);                                              // lbz r9, 0x1029(r19)
++    Put32(cave + 4, 0x39290000u | ((0u - static_cast<std::uint32_t>(seat)) & 0xFFFFu));  // addi r9, r9, -seat
++    Put32(cave + 8, 0x4E800020u);                                          // blr
++    jit.InvalidateICache(kMinimapCave, 12, true);
++  }
+   for (std::size_t i = 0; i < std::size(kHudCode); ++i)
+   {
+     if (std::uint8_t* p = Guest(kHudCode[i].address, 4))
+@@ -366,6 +383,56 @@ void PatchAnimation(bool on)
+                on ? "moved on (every machine alike)" : "the game's");
+ }
+ 
++// SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
++// (finding which HUD task shows what); the game's words come back at the end of the race.
++std::vector<std::pair<std::uint32_t, std::uint32_t>> s_test_patch_saved;
++
++void PatchTest(bool on)
++{
++  static const std::vector<std::pair<std::uint32_t, std::uint32_t>> words = [] {
++    std::vector<std::pair<std::uint32_t, std::uint32_t>> list;
++    const char* v = std::getenv("SRNP_PATCH");
++    for (const char* p = v; p && *p;)
++    {
++      char* end = nullptr;
++      const unsigned long address = std::strtoul(p, &end, 16);
++      if (!end || *end != '=')
++        break;
++      const unsigned long word = std::strtoul(end + 1, &end, 16);
++      list.emplace_back(static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(word));
++      p = end && *end == ',' ? end + 1 : nullptr;
++    }
++    return list;
++  }();
++  if (words.empty() || on == !s_test_patch_saved.empty())
++    return;
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  if (on)
++  {
++    for (const auto& [address, word] : words)
++    {
++      if (std::uint8_t* p = Guest(address, 4))
++      {
++        s_test_patch_saved.emplace_back(address, Get32(p));
++        Put32(p, word);
++        jit.InvalidateICache(address, 4, true);
++        std::fprintf(stderr, "[srnp racers] test patch: 0x%08X %08X -> %08X\n", address,
++                     s_test_patch_saved.back().second, word);
++      }
++    }
++  }
++  else
++  {
++    for (const auto& [address, word] : s_test_patch_saved)
++    {
++      if (std::uint8_t* p = Guest(address, 4))
++        Put32(p, word);
++      jit.InvalidateICache(address, 4, true);
++    }
++    s_test_patch_saved.clear();
++  }
++}
++
+ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2)
+ {
+   ++s_frames;
+@@ -394,6 +461,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+                  std::min<std::size_t>(pads.size(), count) - 1);
+     PatchHud(camera_seat);
+     PatchAnimation(true);
++    PatchTest(true);
+   }
+   if (!s_race)
+     return false;
+@@ -407,6 +475,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     s_race = false;
+     PatchHud(0);
+     PatchAnimation(false);
++    PatchTest(false);
+     std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
+     return false;
+   }
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 5ec10e1..2380a93 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -355,6 +355,15 @@ std::uint64_t s_game_frames = 0;
+ void RelayStep(std::uint64_t frame);
+ }  // namespace
+ 
++bool RelayConfigured()
++{
++  static const bool configured = [] {
++    const char* v = std::getenv("SRNP_RELAY");
++    return v && *v;
++  }();
++  return configured;
++}
++
+ std::uint32_t GameFrameHookAddress()
+ {
+   static const std::uint32_t address = [] {
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 5eab2bc..e4cf587 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -20,6 +20,10 @@ namespace srnp
+ // relay steps in the game's main loop (below).
+ void RelayOnFrame(std::uint64_t frame);
+ 
++// SRNP_RELAY is set: the other machines go on, so this one must not pause (the runner's menu then
++// opens as in Netplay, the match going on behind it).
++bool RelayConfigured();
++
+ // Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
+ // Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
+ // drawn), through a StaticRecomp host hook. Inputs are then applied, and checksums taken, at the same
+-- 
+2.34.1.windows.1
+

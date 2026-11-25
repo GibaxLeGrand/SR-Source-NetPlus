@@ -49,6 +49,9 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   present instead, as before.
 - During a race, racers out of the camera's sight keep their animations (patch 0010: the game's 1P
   drawing picks the next animation only for the racers it sees); `SRNP_ANIM=0` keeps the game's code.
+- The seat's head is the one that blinks on the minimap (patch 0011, with the HUD); with a relay the
+  runner's menu never pauses the game. `SRNP_PATCH=<address>=<word>,...` writes code words for the
+  race (experiments: which HUD task shows what).
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same
