@@ -39,6 +39,10 @@ if [[ "$c" == start ]]; then
   mkdir -p "$AUTO/commands"
   cp -a "$WORK/userdir_modele" "$RUN/userdir" || exit 2
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$RUN/userdir/Config/Dolphin.ini"
+  # PORTS=<n> : des manettes standard (SIDevice = 6) sur les ports 1 à n-1 aussi.
+  for p in $(seq 1 $(( ${PORTS:-1} - 1 ))); do
+    sed -i "s/^\[Core\]\$/[Core]\nSIDevice$p = 6/" "$RUN/userdir/Config/Dolphin.ini"
+  done
   ARGS=(--game "$(w "$WORK/games/GXEE8P")" --user-dir "$(w "$RUN/userdir")"
         --automation-dir "$(w "$AUTO")" --no-mods --mute)
   [[ -n "$SAV" ]] && ARGS+=(--load-state "$(w "$SAV")")

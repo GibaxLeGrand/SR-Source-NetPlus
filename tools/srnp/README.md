@@ -39,7 +39,8 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   `SRNP_NB_RACERS` the race is set up with the lobby's characters and that many racers), test inputs
   `SRNP_INPUT=course:1` (forward, random steering, then the AI takes the racer), each runner's camera
   on its seat; screenshots at the capture frame and at the end, MEM1 compared (measurement PC's
-  paths).
+  paths). `REPARTITION="0,1 2,3 4 5 6 7"` gives each runner its seats (two seats: split screen, from
+  a 2-player save state, with `PORTS=2`).
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `depart_8cpu.sh`: makes the save state of a race whose 8 racers are CPUs when it is set up (from the

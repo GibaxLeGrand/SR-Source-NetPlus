@@ -13,6 +13,8 @@
 set -uo pipefail
 N="${1:?runners}"; MODE="${2:?natif ou jit}"; CAPT="${3:-10800}"; FIN="${4:-14400}"
 SIEGES="${SIEGES:-8}"; K=$((SIEGES / N))
+# REPARTITION="0,1 2 3 4 5 6 7" : les sièges de chaque runner (N = nombre de groupes).
+GROUPES=(${REPARTITION:-}); (( ${#GROUPES[@]} )) && N=${#GROUPES[@]}
 W=/d/_SonicRidersSource/work
 CHASSIS=/d/_SonicRidersSource/SR-Source-NetPlus/build/chassis
 PY="/c/Program Files/Python313/python.exe"
@@ -36,8 +38,12 @@ for r in $(seq 0 $((N - 1))); do
   sed -i "s/^\[Core\]\$/[Core]\nEmulationSpeed = ${VITESSE:-0.0}/" "$D/userdir/Config/Dolphin.ini"
   # Pas de fenêtre d'alerte (elle bloquerait le runner) : le message reste dans runner.log.
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$D/userdir/Config/Dolphin.ini"
+  # PORTS=<n> : des manettes standard sur les ports 1 à n-1 aussi (une course 2P en a besoin).
+  for p in $(seq 1 $(( ${PORTS:-1} - 1 ))); do
+    sed -i "s/^\[Core\]\$/[Core]\nSIDevice$p = 6/" "$D/userdir/Config/Dolphin.ini"
+  done
   mkdir -p "$D/ck"
-  SEATS=$(seq -s, $((r * K)) $((r * K + K - 1)))
+  SEATS=${GROUPES[$r]:-$(seq -s, $((r * K)) $((r * K + K - 1)))}
   printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$CAPT" > "$A/commands/00_capt.txt"
   ARGS=(--game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" --automation-dir "$(w "$A")"
         --no-mods --mute --load-state "$(w "$STATE")")

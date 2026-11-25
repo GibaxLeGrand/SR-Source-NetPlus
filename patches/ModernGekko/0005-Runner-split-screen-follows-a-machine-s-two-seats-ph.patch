@@ -1,0 +1,105 @@
+From 3e3bf3294d4213d56ee692ef5931ae164f6f80da Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:15:05 +0100
+Subject: [PATCH] Runner: split screen follows a machine's two seats (phase 2)
+
+In a race with 2 players (the same count on every machine), viewport 1's
+camera (racer byte 0x806021CD; viewports are 0x25C apart) follows the
+runner's second seat, or its only one. +0x8B4, which differs with the
+viewports, joins the fields left out of the racers' checksum.
+
+Measured on one PC: a 2-player race from the "Are you ready?" menu,
+6 native runners (two with 2 seats, four with 1), 9634 frames, all 8
+finishers; the racers' dumps at 160 checksums agree outside the camera
+fields.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 12 ++++++++++--
+ src/runtime/srnp_racers.hpp | 11 +++++++----
+ src/runtime/srnp_relay.cpp  |  3 ++-
+ 3 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index fb6d3f4..a4fe364 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -26,6 +26,8 @@ constexpr std::uint32_t kPadSize = 0x30;
+ constexpr std::uint32_t kRacerCount = 0x8021B8C0;  // racers in the race (CPUs + humans)
+ constexpr std::uint32_t kRacePhase = 0x801DFC80;   // 0x10 before the start, 0xE racing (and on results)
+ constexpr std::uint32_t kCameraRacer = 0x80601F71;  // racer followed by viewport 0's camera
++constexpr std::uint32_t kCameraRacer1 = 0x806021CD;  // viewport 1's (viewports 0x25C apart)
++constexpr std::uint32_t kPlayerCount = 0x8021B8C8;  // players (viewports)
+ constexpr std::uint32_t kPadStatusNow = 0x8021BB44;  // -> this frame's PADStatus[4] (12 bytes each)
+ constexpr std::uint32_t kControl = 0xBC;           // racer byte: 0 human, 1 CPU
+ 
+@@ -289,7 +291,7 @@ long long RaceFrame()
+   return s_race ? static_cast<long long>(s_frames - s_race_start) : -1;
+ }
+ 
+-bool DriveRacers(const std::vector<Pad>& pads, int camera_seat)
++bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2)
+ {
+   ++s_frames;
+   std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
+@@ -366,6 +368,12 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat)
+   if (camera_seat >= 0 && camera_seat < 8)
+     if (std::uint8_t* camera = Guest(kCameraRacer, 1))
+       *camera = static_cast<std::uint8_t>(camera_seat);
++  // Split screen (2 players on every machine): viewport 1 follows this machine's second seat, or
++  // its only seat.
++  const int second = camera_seat2 >= 0 ? camera_seat2 : camera_seat;
++  if (Read32(kPlayerCount) >= 2 && second >= 0 && second < 8)
++    if (std::uint8_t* camera = Guest(kCameraRacer1, 1))
++      *camera = static_cast<std::uint8_t>(second);
+   return true;
+ }
+ 
+@@ -378,7 +386,7 @@ std::uint64_t RacersHash()
+   // whole race, 2026-11-25; 0xDC4-0xE74: two 0x58-byte records of the followed racer, colours,
+   // vectors and positions, likely a light or a shadow): left out of the checksum.
+   static constexpr std::pair<std::uint32_t, std::uint32_t> kCameraFields[] = {
+-      {0x370, 0x394},   {0x8C0, 0x8C4},   {0xDC4, 0xE74},  {0xFD8, 0xFDC},
++      {0x370, 0x394},   {0x8B4, 0x8B8},   {0x8C0, 0x8C4},  {0xDC4, 0xE74},  {0xFD8, 0xFDC},
+       {0x1000, 0x1004}, {0x102C, 0x102D}, {0x1036, 0x1037}, {0x105C, 0x1060}};
+   std::uint64_t hash = 0xCBF29CE484222325ull;
+   for (std::uint32_t k = 0; k < 8; ++k)
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 62b9464..5a93d73 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -28,10 +28,13 @@ constexpr std::uint16_t kSeatAI = 0x8000;
+ //
+ // SRNP_PERSOS=<character>/<gear>,... (one per seat, as the racer's +0xBA and +0xBB: 0 Sonic,
+ // 1 Tails, 2 Knuckles, 3 Amy, 4 Jet, 5 Storm, 6 Wave, 16 E-10000R...; gear 0 = the character's
+-// own): once the menu has set the race up (racer count 8) and until the race starts, every present
+-// writes them to the racers, duplicates allowed, and makes the 8 racers CPUs (so that the AI can
+-// take any seat's racer back).
+-bool DriveRacers(const std::vector<Pad>& pads, int camera_seat);
++// own): once the menu has set the race up (after Start the racer count leaves 1) and until the
++// race starts, every present writes them to the racers, duplicates allowed, and makes the racers
++// CPUs (so that the AI can take any seat's racer back). SRNP_NB_RACERS=<n> sets the racer count
++// then (the menu only makes 8, or 4 with 3 players or more).
++// Viewport 0's camera follows camera_seat; in split screen (2 players, the same count on every
++// machine), viewport 1 follows camera_seat2 (or camera_seat when it is -1).
++bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2);
+ 
+ // Frames since the runner took the race (the first frame it drove the racers), or -1.
+ long long RaceFrame();
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 6a165da..1c3069f 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -449,7 +449,8 @@ void RelayOnFrame(std::uint64_t frame)
+   {
+     // Outside races, seat 0 drives the menus through pad 0 (the same frames on every machine); in
+     // a race, pad 0 is left neutral (the racers have their own structures; no pause).
+-    const bool racing = DriveRacers(pads, s_relay.camera);
++    const bool racing = DriveRacers(pads, s_relay.camera,
++                                    s_relay.local.size() > 1 ? s_relay.local[1] : -1);
+     if (!pads.empty())
+       ApplyPad(0, racing ? Pad{} : pads[0]);
+   }
+-- 
+2.34.1.windows.1
+
