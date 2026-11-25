@@ -1,0 +1,775 @@
+From 93e4ae45cfc114deb727cacc18c660ab7737d924 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:00:24 +0100
+Subject: [PATCH] Launcher: Japanese voices from the player's Japanese disc;
+ the room checks everyone's mods
+
+Mods & expansions gets a JAPANESE VOICES section: the player chooses their Japanese disc (Sonic
+Riders, Japan, GXEJ8P; any image the launcher reads), and the launcher makes the file mod
+srnp_voix_jp in their Mods folder and turns it on: the files only the US disc has (voices in the
+race, menus, Chao, story cutscenes, films, tutorial), each served from its Japanese counterpart
+under the English name; one identical to the English file is left out (launcher_voices.cpp, as
+tools/srnp's construire_mod_voix_jp.py does). Nothing of the game is in the code: the files come
+from the player's disc. --japanese-voices <disc image> does the same without the window.
+
+Online/LAN play: the room's protocol SRNP-ONLINE-2 adds each player's fingerprint of the file mods
+the match's game loads (name, mod.ini, files and sizes); START needs the host's mods for everyone
+("OTHER MODS" otherwise): a mod's files do not load at the disc's pace (measured with the Japanese
+voices: ~414 frames ahead on a cold start), so the games would leave lockstep.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                 |   1 +
+ tools/launcher_online.cpp      |  97 ++++++++++++++++--
+ tools/launcher_online.hpp      |  19 +++-
+ tools/launcher_online_ui.hpp   |   8 +-
+ tools/launcher_voices.cpp      | 179 +++++++++++++++++++++++++++++++++
+ tools/launcher_voices.hpp      |  51 ++++++++++
+ tools/moderngekko_launcher.cpp | 119 +++++++++++++++++++++-
+ 7 files changed, 457 insertions(+), 17 deletions(-)
+ create mode 100644 tools/launcher_voices.cpp
+ create mode 100644 tools/launcher_voices.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3a51549..fe0b45c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -821,6 +821,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         tools/launcher_music.cpp
+         tools/launcher_online.cpp
+         tools/launcher_preview_video.cpp
++        tools/launcher_voices.cpp
+         tools/launcher_process.cpp
+         tools/launcher_update.cpp
+         tools/windows_firewall.cpp
+diff --git a/tools/launcher_online.cpp b/tools/launcher_online.cpp
+index d897da6..56d0da3 100644
+--- a/tools/launcher_online.cpp
++++ b/tools/launcher_online.cpp
+@@ -244,6 +244,81 @@ std::string Fingerprint(const fs::path& file)
+   return text;
+ }
+ 
++std::vector<std::string> MatchFileMods(const std::vector<fs::path>& mod_folders,
++                                       std::vector<std::string> enabled)
++{
++  std::error_code ec;
++  const bool labels_there = std::ranges::any_of(
++      mod_folders, [&](const fs::path& folder) { return fs::is_directory(folder / "srnp_etiquettes", ec); });
++  if (labels_there && std::ranges::find(enabled, "srnp_etiquettes") == enabled.end())
++    enabled.insert(enabled.begin(), "srnp_etiquettes");
++  return enabled;
++}
++
++std::string ModsFingerprint(const std::vector<fs::path>& mod_folders, const std::vector<std::string>& mods)
++{
++  std::uint64_t hash = 0xCBF29CE484222325ull;
++  const auto add = [&hash](std::string_view text) {
++    for (const char c : text)
++    {
++      hash ^= static_cast<unsigned char>(c);
++      hash *= 0x100000001B3ull;
++    }
++    hash ^= 0xFF;
++    hash *= 0x100000001B3ull;
++  };
++  std::error_code ec;
++  for (const std::string& id : mods)
++  {
++    // The first folder that has it, as the runner looks (its own Mods, then the user's).
++    fs::path folder;
++    for (const fs::path& mods_folder : mod_folders)
++    {
++      if (folder.empty() && fs::is_regular_file(mods_folder / id / "mod.ini", ec))
++        folder = mods_folder / id;
++    }
++    add(id);
++    if (folder.empty())
++    {
++      add("(missing)");
++      continue;
++    }
++    std::ifstream ini(folder / "mod.ini", std::ios::binary);
++    std::stringstream text;
++    text << ini.rdbuf();
++    add(text.str());
++    std::vector<std::string> entries;
++    for (const char* part : {"files", "patches.ini"})
++    {
++      const fs::path root = folder / part;
++      if (fs::is_regular_file(root, ec))
++        entries.push_back(std::string(part) + ":" + std::to_string(fs::file_size(root, ec)));
++      if (!fs::is_directory(root, ec))
++        continue;
++      // Folders reached through links and junctions too (fs::status follows them), as the copy does.
++      const auto list = [&](const auto& self, const fs::path& directory, const std::string& prefix) -> void {
++        for (fs::directory_iterator it(directory, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
++        {
++          const std::u8string name8 = it->path().filename().u8string();
++          const std::string name = prefix + std::string(name8.begin(), name8.end());
++          const fs::file_status status = fs::status(it->path(), ec);
++          if (fs::is_directory(status))
++            self(self, it->path(), name + "/");
++          else if (fs::is_regular_file(status))
++            entries.push_back(name + ":" + std::to_string(fs::file_size(it->path(), ec)));
++        }
++      };
++      list(list, root, std::string(part) + "/");
++    }
++    std::ranges::sort(entries);
++    for (const std::string& entry : entries)
++      add(entry);
++  }
++  char text[17];
++  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
++  return text;
++}
++
+ std::vector<std::pair<AddressKind, std::string>> ThisComputersAddresses(std::uint16_t port)
+ {
+   std::vector<std::pair<AddressKind, std::string>> found;
+@@ -357,6 +432,7 @@ struct Relay::Impl
+     bool ready = false;
+     bool host = false;
+     std::string state = "-";
++    std::string mods = "-";
+     bool playing = false;
+     int match_seat = -1;
+   };
+@@ -472,7 +548,7 @@ struct Relay::Impl
+     {
+       const RoomMember& m = *sorted[i];
+       line += (i ? "," : "") + std::to_string(m.seat) + ":" + (m.tag.empty() ? "-" : m.tag) + ":" +
+-              (m.ready ? "1" : "0") + ":" + m.state + ":" + (m.playing ? "1" : "0");
++              (m.ready ? "1" : "0") + ":" + m.state + ":" + (m.playing ? "1" : "0") + ":" + m.mods;
+     }
+     return line;
+   }
+@@ -503,7 +579,7 @@ struct Relay::Impl
+     {
+       if (member)
+         return;
+-      if (words.size() < 4 || words[1] != PROTOCOL)
++      if (words.size() < 5 || words[1] != PROTOCOL)
+       {
+         Send(id, "REFUSED version");
+         connections[id].closed = true;
+@@ -511,7 +587,7 @@ struct Relay::Impl
+             (words.size() > 1 ? words[1] : std::string("?")) + ")");
+         return;
+       }
+-      const bool host = words.size() > 4 && words[4] == host_key &&
++      const bool host = words.size() > 5 && words[5] == host_key &&
+                         std::ranges::none_of(members, &RoomMember::host);
+       if (in_match || (!host && static_cast<int>(members.size()) >= MAX_PLAYERS))
+       {
+@@ -534,11 +610,12 @@ struct Relay::Impl
+       if (joined.tag.empty())
+         joined.tag = "P" + std::to_string(seat + 1);
+       joined.state = words[3].size() == 16 ? words[3] : "-";
++      joined.mods = words[4].size() == 16 ? words[4] : "-";
+       joined.host = host;
+       joined.ready = host;
+       members.push_back(joined);
+       Log("room: " + joined.tag + " joined as P" + std::to_string(seat + 1) + (host ? " (host)" : "") +
+-          ", start state " + joined.state);
++          ", start state " + joined.state + ", mods " + joined.mods);
+       Send(id, "WELCOME " + std::to_string(seat) + " " + (host ? "1" : "0"));
+       SendLaunchers(MembersLine());
+       SendLaunchers(RulesLine());
+@@ -583,9 +660,10 @@ struct Relay::Impl
+       return;
+     for (const RoomMember& m : members)
+     {
+-      if (!m.ready || m.state != host->state)
++      if (!m.ready || m.state != host->state || m.mods != host->mods)
+       {
+-        Log("room: not started: " + m.tag + (m.ready ? " has another start state" : " is not ready"));
++        Log("room: not started: " + m.tag +
++            (!m.ready ? " is not ready" : m.state != host->state ? " has another start state" : " has other mods"));
+         return;
+       }
+     }
+@@ -1141,6 +1219,7 @@ struct Client::Impl
+   std::uint16_t port = DEFAULT_PORT;
+   std::string tag;
+   std::string state;
++  std::string mods;
+   std::string host_key;
+   std::atomic<bool> stop{false};
+   std::thread thread;
+@@ -1205,6 +1284,7 @@ struct Client::Impl
+           member.ready = fields[2] == "1";
+           member.state = fields[3];
+           member.playing = fields[4] == "1";
++          member.mods = fields.size() > 5 ? fields[5] : "-";
+           view.members.push_back(member);
+         }
+       }
+@@ -1276,7 +1356,7 @@ struct Client::Impl
+       return Fail(RoomView::Link::Lost, "no answer");
+     }
+     std::string in;
+-    std::string pending = "JOIN " + std::string(PROTOCOL) + " " + (tag.empty() ? "-" : tag) + " " + state +
++    std::string pending = "JOIN " + std::string(PROTOCOL) + " " + (tag.empty() ? "-" : tag) + " " + state + " " + mods +
+                           (host_key.empty() ? "" : " " + host_key) + "\n";
+     while (!stop)
+     {
+@@ -1312,13 +1392,14 @@ struct Client::Impl
+ };
+ 
+ Client::Client(std::string host, std::uint16_t port, std::string tag, std::string state,
+-               std::string host_key)
++               std::string mods, std::string host_key)
+     : m_impl(std::make_unique<Impl>())
+ {
+   m_impl->host = std::move(host);
+   m_impl->port = port;
+   m_impl->tag = std::move(tag);
+   m_impl->state = std::move(state);
++  m_impl->mods = std::move(mods);
+   m_impl->host_key = std::move(host_key);
+   Impl* impl = m_impl.get();
+   m_impl->thread = std::thread([impl] { impl->Run(); });
+diff --git a/tools/launcher_online.hpp b/tools/launcher_online.hpp
+index 829689c..f26801d 100644
+--- a/tools/launcher_online.hpp
++++ b/tools/launcher_online.hpp
+@@ -13,14 +13,15 @@
+ // When every game has closed, the room is back for the next race.
+ //
+ // Room lines (text, LF), on the relay's port, from a launcher:
+-//   JOIN <protocol> <tag> <state> [<host key>]   first line; <state>: the start state's fingerprint
++//   JOIN <protocol> <tag> <state> <mods> [<host key>]   first line; <state>: the start state's
++//                                                fingerprint, <mods>: the file mods' (ModsFingerprint)
+ //   LREADY <0|1>                                 ready or not (the host is always ready)
+ //   LRULES <course> <laps> <racers> <delay>      the host's race
+ //   LSTART                                       the host starts the match
+ //   LGONE                                        this launcher's game has closed (or did not start)
+ // to the launchers:
+ //   WELCOME <seat> <host 0|1>  |  REFUSED <why>  (version, full, running)
+-//   MEMBERS <seat>:<tag>:<ready>:<state>:<playing>,...   at every change
++//   MEMBERS <seat>:<tag>:<ready>:<state>:<playing>:<mods>,...   at every change
+ //   LRULES <course> <laps> <racers> <delay>
+ //   MATCH <seats> <seat> <delay>                 start the game: this seat of that many
+ //   ROOM                                         every game has closed: the room again
+@@ -41,7 +42,7 @@
+ 
+ namespace moderngekko::frontend::online
+ {
+-inline constexpr const char* PROTOCOL = "SRNP-ONLINE-1";
++inline constexpr const char* PROTOCOL = "SRNP-ONLINE-2";
+ inline constexpr std::uint16_t DEFAULT_PORT = 7845;
+ inline constexpr int MAX_PLAYERS = 8;
+ inline constexpr int COURSES = 16;
+@@ -79,6 +80,7 @@ struct Member
+   bool ready = false;  // the host always is
+   std::string state;   // the start state's fingerprint, "-" without one
+   bool playing = false;  // its game is open (a match is on)
++  std::string mods;      // the file mods' fingerprint
+ };
+ 
+ // What a launcher knows of the room, read each frame by the lobby.
+@@ -133,7 +135,7 @@ private:
+ class Client
+ {
+ public:
+-  Client(std::string host, std::uint16_t port, std::string tag, std::string state,
++  Client(std::string host, std::uint16_t port, std::string tag, std::string state, std::string mods,
+          std::string host_key = {});
+   ~Client();
+   Client(const Client&) = delete;
+@@ -158,6 +160,15 @@ private:
+ std::string CleanTag(std::string_view text);
+ // FNV-1a 64 of the file, 16 hex digits; "-" when it can't be read.
+ std::string Fingerprint(const std::filesystem::path& file);
++// The file mods a match's game loads: the ones turned on (config.ini's mod= lines, in order) and the
++// labels mod (srnp_etiquettes) when installed: as PrepareGameFolder sets them.
++std::vector<std::string> MatchFileMods(const std::vector<std::filesystem::path>& mod_folders,
++                                       std::vector<std::string> enabled);
++// FNV-1a 64 of those mods: each one's name, mod.ini, and the names and sizes of its files (files/,
++// patches.ini; not textures/, which only change what is drawn). Every player of a room needs the same:
++// a mod's files do not load at the disc's pace (measured with the Japanese voices, 2026-11-25).
++std::string ModsFingerprint(const std::vector<std::filesystem::path>& mod_folders,
++                            const std::vector<std::string>& mods);
+ 
+ // This computer's IPv4 addresses that others may reach, with the kind of network each is on (home
+ // first), as "ip:port".
+diff --git a/tools/launcher_online_ui.hpp b/tools/launcher_online_ui.hpp
+index fc6112f..da007e0 100644
+--- a/tools/launcher_online_ui.hpp
++++ b/tools/launcher_online_ui.hpp
+@@ -321,6 +321,7 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+   for (const online::Member& member : room.members)
+     host_member = member.seat == 0 ? &member : host_member;
+   const std::string host_state = host_member ? host_member->state : info.own_state;
++  const std::string host_mods = host_member ? host_member->mods : std::string();
+   BeginSection("##online_players",
+                Format(Tr("PLAYERS  \xC2\xB7  %d / 8"), static_cast<int>(room.members.size())).c_str());
+   if (ImGui::BeginTable("##online_players_table", 3, ImGuiTableFlags_None))
+@@ -362,6 +363,8 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+       {
+         if (member->state != host_state)
+           DrawStatusPill(Tr("OTHER START STATE"), LOBBY_RED, scale, false);
++        else if (member->mods != host_mods)
++          DrawStatusPill(Tr("OTHER MODS"), LOBBY_RED, scale, false);
+         else if (member->playing)
+           DrawStatusPill(Tr("RACING"), LAUNCHER_ACCENT, scale, false);
+         else if (seat == 0)
+@@ -470,7 +473,7 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+ 
+   // Bottom: Ready or Start, and Leave.
+   const bool everyone_ready = std::ranges::all_of(room.members, [&](const online::Member& m) {
+-    return (m.ready || m.seat == 0) && m.state == host_state;
++    return (m.ready || m.seat == 0) && m.state == host_state && m.mods == host_mods;
+   });
+   const float buttons_height = 46.0f * scale;
+   std::string note = info.status;
+@@ -478,7 +481,8 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+   if (room.match)
+     missing = Tr("A race is on.");
+   else if (info.hosting && !everyone_ready)
+-    missing = Tr("Everyone must be ready, with the same start state, before the race can start.");
++    missing = Tr("Everyone must be ready, with the same start state and the same mods, before the "
++                 "race can start.");
+   else if (!info.hosting)
+     missing = Tr("Press I'M READY, then wait for the host to start.");
+   if (missing)
+diff --git a/tools/launcher_voices.cpp b/tools/launcher_voices.cpp
+new file mode 100644
+index 0000000..a3a729c
+--- /dev/null
++++ b/tools/launcher_voices.cpp
+@@ -0,0 +1,179 @@
++// SR-Source Net Plus: the Japanese voices made from the player's Japanese disc. See launcher_voices.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "launcher_voices.hpp"
++
++#include "text_paths.hpp"
++
++#include "DiscIO/DiscExtractor.h"
++#include "DiscIO/Filesystem.h"
++#include "DiscIO/Volume.h"
++
++#include <algorithm>
++#include <fstream>
++#include <map>
++#include <memory>
++#include <set>
++#include <system_error>
++#include <vector>
++
++namespace moderngekko::frontend::voices
++{
++namespace fs = std::filesystem;
++
++namespace
++{
++constexpr const char* MOD_INI =
++    "name=Japanese voices\n"
++    "game=GXEE8P\n"
++    "version=1.0\n"
++    "author=Gibax\n"
++    "description=The Japanese release's voices, cutscenes and movies (from your own Japanese "
++    "disc).\n";
++
++void Say(BuildState* state, std::string status)
++{
++  std::lock_guard lock(state->mutex);
++  state->status = std::move(status);
++}
++
++bool Fail(BuildState* state, std::string error)
++{
++  std::lock_guard lock(state->mutex);
++  state->error = std::move(error);
++  state->running = false;
++  return false;
++}
++
++// The two files hold the same bytes.
++bool SameFile(const fs::path& a, const fs::path& b)
++{
++  std::error_code ec;
++  if (fs::file_size(a, ec) != fs::file_size(b, ec) || ec)
++    return false;
++  std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
++  std::vector<char> ba(1 << 20), bb(1 << 20);
++  while (fa && fb)
++  {
++    fa.read(ba.data(), static_cast<std::streamsize>(ba.size()));
++    fb.read(bb.data(), static_cast<std::streamsize>(bb.size()));
++    if (fa.gcount() != fb.gcount() ||
++        !std::equal(ba.begin(), ba.begin() + fa.gcount(), bb.begin()))
++      return false;
++  }
++  return true;
++}
++}  // namespace
++
++std::string JapaneseName(std::string_view english)
++{
++  const std::string name(english);
++  if (name.starts_with("10") && name.ends_with(".DAT"))  // 10SONIC.DAT -> 10JSONIC.DAT
++    return "10J" + name.substr(2);
++  if (name == "VOICE_E.AFS")
++    return "VOICE.AFS";
++  if (name.starts_with("E") && name.ends_with("E.ADX"))  // E01E.ADX -> E01J.ADX
++    return name.substr(0, name.size() - 5) + "J.ADX";
++  // OP_E.ADX, OP_EPL2.ADX, TUTO_G_E.SFD, V_CHAO_E.AFS
++  std::string japanese = name;
++  for (std::size_t at = japanese.find("_E"); at != std::string::npos; at = japanese.find("_E", at + 2))
++    japanese.replace(at, 2, "_J");
++  return japanese;
++}
++
++bool Installed(const fs::path& mods_folder)
++{
++  std::error_code ec;
++  return fs::is_regular_file(mods_folder / MOD_ID / "mod.ini", ec) &&
++         fs::is_directory(mods_folder / MOD_ID / "files", ec);
++}
++
++bool BuildJapaneseVoices(const fs::path& japanese_disc, const fs::path& us_files,
++                         const fs::path& mods_folder, BuildState* state)
++{
++  Say(state, "Opening " + text::PathText(japanese_disc.filename()));
++  const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(text::PathText(japanese_disc));
++  if (!volume)
++    return Fail(state, "This file is not a disc image the launcher can read.");
++  const DiscIO::Partition partition = volume->GetGamePartition();
++  const std::string disc_id = volume->GetGameID(partition);
++  if (disc_id != JAPANESE_DISC_ID)
++    return Fail(state, "This is not the Japanese Sonic Riders (" + std::string(JAPANESE_DISC_ID) +
++                           "): the disc says " + (disc_id.empty() ? std::string("nothing") : disc_id) +
++                           ".");
++  const DiscIO::FileSystem* filesystem = volume->GetFileSystem(partition);
++  if (!filesystem || !filesystem->IsValid())
++    return Fail(state, "The disc's files could not be read.");
++
++  // The files at the top of each disc, by name.
++  std::set<std::string> japanese;
++  for (const DiscIO::FileInfo& file : filesystem->GetRoot())
++  {
++    if (!file.IsDirectory())
++      japanese.insert(file.GetName());
++  }
++  std::set<std::string> english;
++  std::error_code ec;
++  for (fs::directory_iterator it(us_files, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
++  {
++    if (it->is_regular_file(ec))
++      english.insert(text::PathText(it->path().filename()));
++  }
++  if (english.empty())
++    return Fail(state, "The US game's files were not found: extract Sonic Riders (GXEE8P) first.");
++
++  // The files only the US disc has, each with its Japanese counterpart.
++  std::vector<std::pair<std::string, std::string>> pairs;
++  for (const std::string& name : english)
++  {
++    if (japanese.contains(name))
++      continue;
++    const std::string counterpart = JapaneseName(name);
++    if (!japanese.contains(counterpart))
++      return Fail(state, "The Japanese disc has no " + counterpart + " for " + name + ".");
++    pairs.emplace_back(name, counterpart);
++  }
++  if (pairs.empty())
++    return Fail(state, "No voice file differs between the two discs.");
++
++  const fs::path folder = mods_folder / MOD_ID;
++  const fs::path files = folder / "files";
++  fs::create_directories(files, ec);
++  if (ec)
++    return Fail(state, "Can't make " + text::PathText(files) + ": " + ec.message());
++  // mod.ini last: until then the folder is no usable mod.
++  fs::remove(folder / "mod.ini", ec);
++  int copied = 0;
++  int same = 0;
++  for (std::size_t i = 0; i < pairs.size(); ++i)
++  {
++    const auto& [name, counterpart] = pairs[i];
++    Say(state, "Copying " + counterpart + " as " + name + " (" + std::to_string(i + 1) + "/" +
++                   std::to_string(pairs.size()) + ")");
++    const fs::path part = files / (name + ".part");
++    if (!DiscIO::ExportFile(*volume, partition, counterpart, text::PathText(part)))
++      return Fail(state, "Could not read " + counterpart + " from the disc.");
++    // A Japanese file identical to the English one changes nothing: left out.
++    if (SameFile(part, us_files / name))
++    {
++      fs::remove(part, ec);
++      fs::remove(files / name, ec);
++      ++same;
++      continue;
++    }
++    fs::rename(part, files / name, ec);
++    if (ec)
++      return Fail(state, "Can't write " + name + ": " + ec.message());
++    ++copied;
++  }
++  std::ofstream ini(folder / "mod.ini", std::ios::binary | std::ios::trunc);
++  ini << MOD_INI;
++  if (!ini)
++    return Fail(state, "Can't write the mod's mod.ini.");
++  ini.close();
++  std::lock_guard lock(state->mutex);
++  state->status = std::to_string(copied) + " files copied, " + std::to_string(same) + " identical left out";
++  state->finished = true;
++  state->running = false;
++  return true;
++}
++}  // namespace moderngekko::frontend::voices
+diff --git a/tools/launcher_voices.hpp b/tools/launcher_voices.hpp
+new file mode 100644
+index 0000000..da15b8c
+--- /dev/null
++++ b/tools/launcher_voices.hpp
+@@ -0,0 +1,51 @@
++#pragma once
++
++// SR-Source Net Plus: the Japanese voices, a file mod made from the player's own Japanese disc.
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// Sonic Riders USA (GXEE8P) and the Japanese release (GXEJ8P) run the same code, and both know both
++// sets of names (10SONIC.DAT and 10JSONIC.DAT, E01E.ADX and E01J.ADX...): the US disc only has the
++// English ones. The mod srnp_voix_jp serves the Japanese files under the English names: voices in the
++// race (10*.DAT), the menus' (VOICE_E.AFS), the Chao's (V_CHAO_E.AFS), the story's cutscenes
++// (E01E-E16E.ADX), the films' sound (OP/ED/INSERT, PL2 too) and the tutorial film (TUTO_G_E.SFD).
++// Nothing of the game's code changes. The files come from the player's disc (any image the launcher
++// reads: ISO, RVZ...): nothing of the game is in this code. Made as tools/srnp's
++// construire_mod_voix_jp.py does: the files only the US disc has, each with its Japanese
++// counterpart; one identical to the English file (10AIAI.DAT, 10ULALA.DAT) is left out.
++//
++// Measured on 2026-11-25: the files of a mod do not load at the disc's pace (a cold start reaches the
++// demo race ~414 frames earlier with the mod), so online every player of a room needs the same mods
++// (the room checks it); a savestate keeps the voices it was made with.
++
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <string_view>
++
++namespace moderngekko::frontend::voices
++{
++inline constexpr const char* MOD_ID = "srnp_voix_jp";
++inline constexpr const char* JAPANESE_DISC_ID = "GXEJ8P";
++
++// The Japanese counterpart's name of a file only the US disc has.
++std::string JapaneseName(std::string_view english);
++
++// Where a build is, read by the launcher's page while it runs on its own thread.
++struct BuildState
++{
++  std::mutex mutex;
++  bool running = false;
++  bool finished = false;  // set once, when it succeeded
++  std::string status;
++  std::string error;
++};
++
++// Makes <mods_folder>/srnp_voix_jp (mod.ini, files/) from the Japanese disc image and the US game's
++// files folder (games/GXEE8P/files). False, with state->error, when it can't.
++bool BuildJapaneseVoices(const std::filesystem::path& japanese_disc,
++                         const std::filesystem::path& us_files,
++                         const std::filesystem::path& mods_folder, BuildState* state);
++
++// The mod is there (its mod.ini and files).
++bool Installed(const std::filesystem::path& mods_folder);
++}  // namespace moderngekko::frontend::voices
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index 8347d53..f0ef511 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -15,6 +15,7 @@
+ #include "launcher_handoff.hpp"
+ #include "launcher_loading.hpp"
+ #include "launcher_online_ui.hpp"
++#include "launcher_voices.hpp"
+ #include "launcher_process.hpp"
+ #include "launcher_transition.hpp"
+ #include "launcher_user_folder.hpp"
+@@ -2701,6 +2702,9 @@ int main(int argc, char** argv)
+   argv = utf8_arguments.Values();
+   bool use_wayland = false;
+   std::optional<fs::path> extract_only;
++  // SR-Source Net Plus: --japanese-voices <Japanese disc image> makes the Japanese voices mod
++  // (launcher_voices.hpp) in the user folder's Mods, without the window, as Mods & expansions does.
++  std::optional<fs::path> japanese_voices_only;
+   for (int i = 1; i < argc; ++i)
+   {
+     if (std::string_view(argv[i]) == "-X11" || std::string_view(argv[i]) == "--x11")
+@@ -2709,6 +2713,8 @@ int main(int argc, char** argv)
+       use_wayland = true;
+     else if (std::string_view(argv[i]) == "--extract" && i + 1 < argc)
+       extract_only = TextPath(argv[++i]);
++    else if (std::string_view(argv[i]) == "--japanese-voices" && i + 1 < argc)
++      japanese_voices_only = TextPath(argv[++i]);
+   }
+ 
+   // A renamed project's players keep their folder: the one of the earlier
+@@ -2740,6 +2746,24 @@ int main(int argc, char** argv)
+       std::cout << extraction.status << ": " << std::quoted(PathText(*extraction.finished_game)) << '\n';
+     return success ? 0 : 1;
+   }
++  if (japanese_voices_only)
++  {
++    // The US game's files: the last game played when it is Sonic Riders, else games/GXEE8P.
++    fs::path us_game = ReadDefaultGame(user_directory, release_directory);
++    if (moderngekko::frontend::ReadDiscId(us_game) != "GXEE8P")
++      us_game = user_directory / "games" / "GXEE8P";
++    moderngekko::frontend::voices::BuildState state;
++    state.running = true;
++    const bool success = moderngekko::frontend::voices::BuildJapaneseVoices(
++        *japanese_voices_only, us_game / "files", user_directory / "Mods", &state);
++    std::lock_guard lock(state.mutex);
++    if (!success)
++      std::cerr << "japanese voices: " << state.error << '\n';
++    else
++      std::cout << "japanese voices: " << state.status << " in "
++                << PathText(user_directory / "Mods" / moderngekko::frontend::voices::MOD_ID) << '\n';
++    return success ? 0 : 1;
++  }
+ 
+   auto config = moderngekko::frontend::LoadConfig(user_directory, true);
+   if (!config)
+@@ -3406,6 +3430,10 @@ int main(int argc, char** argv)
+     online_settings.tag = online::CleanTag(online_settings.tag);
+     online::SaveSettings(user_directory, online_settings);
+     const std::string state = online::Fingerprint(online_settings.start_state);
++    // The file mods the match's game will load: the same for every player (the room checks it).
++    const std::vector<fs::path> online_mod_folders = {release_directory / "Mods", user_directory / "Mods"};
++    const std::string mods = online::ModsFingerprint(
++        online_mod_folders, online::MatchFileMods(online_mod_folders, config.mods));
+     online_client.reset();
+     online_relay.reset();
+     online_info = {};
+@@ -3429,7 +3457,7 @@ int main(int argc, char** argv)
+       }
+       online_info.host_address = "127.0.0.1:" + std::to_string(online_settings.port);
+       online_client = std::make_unique<online::Client>("127.0.0.1", online_settings.port,
+-                                                       online_settings.tag, state,
++                                                       online_settings.tag, state, mods,
+                                                        online_relay->HostKey());
+       online_addresses_at = -1.0e9;
+       return;
+@@ -3442,7 +3470,7 @@ int main(int argc, char** argv)
+       port = split->port;
+     }
+     online_info.host_address = address + ":" + std::to_string(port);
+-    online_client = std::make_unique<online::Client>(address, port, online_settings.tag, state);
++    online_client = std::make_unique<online::Client>(address, port, online_settings.tag, state, mods);
+   };
+   // PLAY page summary, read again whenever the page is opened: the time
+   // played changes while the game runs and mods are added by hand.
+@@ -3457,6 +3485,11 @@ int main(int argc, char** argv)
+   // [Mods] says which are on.
+   std::vector<moderngekko::frontend::FileMod> file_mods;
+   std::vector<moderngekko::frontend::FileModProblem> file_mod_problems;
++  // SR-Source Net Plus: the Japanese voices (launcher_voices.hpp), made from the disc the player
++  // chooses, on a thread of their own (declared after its state, which it uses until it ends).
++  DialogState voices_dialog;
++  moderngekko::frontend::voices::BuildState voices_build;
++  std::jthread voices_thread;
+   const auto open_mods_page = [&] {
+     current_page = LauncherPage::Mods;
+     installed_mods = moderngekko::frontend::ListInstalledMods(mod_folders);
+@@ -6026,6 +6059,86 @@ int main(int argc, char** argv)
+     EndSection();
+     if (mods_columns)
+       NextPageColumn();
++    // SR-Source Net Plus: the Japanese voices (launcher_voices.hpp), a file mod made from the
++    // player's own Japanese disc; once made it shows with the other mods, with its switch.
++    BeginSection("##mods_voices", Tr("JAPANESE VOICES"));
++    {
++      namespace voices = moderngekko::frontend::voices;
++      std::optional<fs::path> japanese_disc;
++      {
++        std::lock_guard lock(voices_dialog.mutex);
++        japanese_disc = std::exchange(voices_dialog.selected, std::nullopt);
++      }
++      bool building = false;
++      bool built = false;
++      std::string build_status;
++      std::string build_error;
++      {
++        std::lock_guard lock(voices_build.mutex);
++        building = voices_build.running;
++        built = std::exchange(voices_build.finished, false);
++        build_status = voices_build.status;
++        build_error = voices_build.error;
++      }
++      const GameSlot* us_game = slot_of("GXEE8P");
++      const bool us_ready = us_game && us_game->metadata;
++      if (japanese_disc && !building && us_ready)
++      {
++        if (voices_thread.joinable())
++          voices_thread.join();
++        {
++          std::lock_guard lock(voices_build.mutex);
++          voices_build.running = true;
++          voices_build.error.clear();
++          voices_build.status.clear();
++        }
++        voices_thread = std::jthread([&voices_build, disc = *japanese_disc,
++                                      files = us_game->root / "files",
++                                      mods = user_directory / "Mods"] {
++          voices::BuildJapaneseVoices(disc, files, mods, &voices_build);
++        });
++        building = true;
++      }
++      if (built)
++      {
++        // The new mod in the list, and on.
++        open_mods_page();
++        set_mod_on(voices::MOD_ID, true);
++      }
++      const bool installed = voices::Installed(user_directory / "Mods");
++      const bool on = std::ranges::find(config.mods, voices::MOD_ID) != config.mods.end();
++      ImGui::PushTextWrapPos(0.0f);
++      ImGui::TextUnformatted(Tr("The voices, story cutscenes and films of the Japanese release, "
++                                "taken from your own Japanese disc (Sonic Riders, Japan, GXEJ8P). "
++                                "Nothing of the game's code changes."));
++      if (installed)
++        ImGui::TextColored(LAUNCHER_ACCENT, "%s",
++                           on ? Tr("Installed and on: its switch is in the list of mods.")
++                              : Tr("Installed and off: its switch is in the list of mods."));
++      ImGui::TextDisabled("%s", Tr("Online, every player of a room needs the same mods (the room "
++                                   "checks it). A savestate keeps the voices it was made with."));
++      if (!us_ready)
++        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
++                           Tr("Extract Sonic Riders (GXEE8P) in Game Files first."));
++      ImGui::BeginDisabled(building || !us_ready);
++      if (ImGui::Button(installed ? Tr("Make them again from a Japanese disc...")
++                                  : Tr("Choose your Japanese disc...")))
++      {
++        static SDL_DialogFileFilter voice_filters[] = {
++            {"", "iso;gcm;rvz;wia;gcz;ciso"}, {"ISO", "iso;gcm"}, {"RVZ", "rvz"}};
++        voice_filters[0].name = Tr("Disc images");
++        const std::string documents = PathText(DocumentsDirectory());
++        SDL_ShowOpenFileDialog(FileDialogCallback, &voices_dialog, window, voice_filters,
++                               static_cast<int>(std::size(voice_filters)), documents.c_str(), false);
++      }
++      ImGui::EndDisabled();
++      if (!build_error.empty() && !building)
++        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", build_error.c_str());
++      else if (!build_status.empty())
++        ImGui::TextDisabled("%s", build_status.c_str());
++      ImGui::PopTextWrapPos();
++    }
++    EndSection();
+     BeginSection("##mods_expansions", Tr("EXPANSIONS"));
+     ImGui::SameLine();
+     DrawStatusPill(Tr("PLANNED"), LAUNCHER_ACCENT, scale, true);
+@@ -6335,7 +6448,7 @@ int main(int argc, char** argv)
+         // ready (pictures of the room).
+         const char* start = std::getenv("SRNP_ONLINE_START");
+         const bool all_ready = std::ranges::all_of(room.members, [&](const online::Member& m) {
+-          return (m.ready || m.seat == 0) && m.state == me->state;
++          return (m.ready || m.seat == 0) && m.state == me->state && m.mods == me->mods;
+         });
+         static double start_when = -1.0;
+         int start_players = 0;
+-- 
+2.34.1.windows.1
+
