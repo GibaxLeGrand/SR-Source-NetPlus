@@ -1,0 +1,82 @@
+From 7a486969de3453bb76ff8b17b0b4137f903bdb59 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 23:22:54 +0100
+Subject: [PATCH] Runner: the racers drawn around this machine's seat
+
+Gibax's test: Knuckles, still at the start, vanished from his own screen once Sonic (racer 0) was far
+ahead. The 1P race's drawing of the racers (0x8040B438) draws racer 0 always and every other racer only
+when its zone (0x80612BD8 + index x 4) is near racer 0's (racer 0's flags +0xBA8 counting too); a racer
+left out gets +0x1000 = 1 (outside the racers' checksum) and no drawing, its animation moving on all
+the same (PatchAnimation). During the race the seat's racer takes racer 0's place there: always drawn,
+its zone and flags the reference (0x8040B574, 0x8040B5AC, 0x8040B5E0, 0x8040B5E4). The seat displays'
+helper now takes four code words.
+Measured on the same race (Sonic driven by the AI far ahead, Knuckles still): Knuckles on his own screen
+at frames 1500, 1900, 2300, where he was missing before; Sonic's screen as before; 43 identical
+checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 7728176..e51c068 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -600,11 +600,11 @@ void PatchZones(bool on)
+ struct SeatDisplay
+ {
+   const char* name;
+-  CodeWord words[3];
++  CodeWord words[4];
+   std::size_t count;
+   std::uint32_t (*patched)(std::size_t i, int seat);
+   bool on = false;
+-  std::uint32_t written[3] = {};
++  std::uint32_t written[4] = {};
+ };
+ 
+ // The item boxes' display (the box picked up, "20" rings...): the racers' function (0x80484A3C) starts
+@@ -658,6 +658,31 @@ SeatDisplay s_level_up{
+       return i == 1 ? words[1] | static_cast<std::uint32_t>(seat) : words[i];
+     }};
+ 
++// The racers drawn (Gibax, 2026-11-25: Knuckles, still at the start, vanished from his own screen once
++// Sonic was far ahead): the 1P race's drawing of the racers (0x8040B438) draws racer 0 always and every
++// other one only when its zone (0x80612BD8 + index x 4) is near racer 0's (and racer 0's flags +0xBA8,
++// read through 196(r1), count too); a racer left out gets +0x1000 = 1 (outside the racers' checksum)
++// and no drawing (its animation moves on all the same: PatchAnimation). Written: cmplwi r16, <seat>
++// (the seat's racer always drawn), addi r5, r3, 0x2BD8 + 4 x seat (its zone the reference), and lis r3,
++// 0x8061; lwz r3, <its +0xBA8>(r3) for the flags.
++SeatDisplay s_racers_drawn{
++    "racers drawn around",
++    {{0x8040B574, 0x28100000},   // cmplwi r16, 0
++     {0x8040B5AC, 0x38A32BD8},   // addi r5, r3, 0x2BD8 (racer 0's zone)
++     {0x8040B5E0, 0x806100C4},   // lwz r3, 196(r1) (racer 0)
++     {0x8040B5E4, 0x80630BA8}},  // lwz r3, 0xBA8(r3)
++    4,
++    [](std::size_t i, int seat) {
++      const std::uint32_t s = static_cast<std::uint32_t>(seat);
++      switch (i)
++      {
++      case 0: return 0x28100000u | s;
++      case 1: return 0x38A32BD8u + 4u * s;
++      case 2: return 0x3C608061u;  // lis r3, 0x8061
++      default: return 0x80630000u | ((0xBA8u - 0x6BC0u + s * 0x1080u) & 0xFFFFu);
++      }
++    }};
++
+ void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+@@ -697,6 +722,7 @@ void PatchSeatDisplays(int seat)
+   PatchSeatDisplay(s_item_boxes, seat);
+   PatchSeatDisplay(s_tricks, seat);
+   PatchSeatDisplay(s_level_up, seat);
++  PatchSeatDisplay(s_racers_drawn, seat);
+ }
+ 
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+-- 
+2.34.1.windows.1
+
