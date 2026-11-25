@@ -166,6 +166,40 @@ CHUNK_EXT="c"
 [[ "$BACKEND" == "llvm" ]] && CHUNK_EXT="o"
 compgen -G "$NEW/chunks/*.$CHUNK_EXT" > /dev/null || die "no chunks/*.$CHUNK_EXT were generated (see $LOG)"
 
+# --- 5b. REL modules the game links at a fixed address ----------------------
+# RELS in the settings file: "<file in the extracted game>@<base> ...", e.g.
+# files/_Main.rel@0x803FBD00. Each is recompiled by DolRecomp at the address
+# the game loads it at, then merged into the DOL's output, so ONE module
+# covers both (see tools/dolrecomp/merge_rel.py). C backend only.
+GAME_ROOT="$(dirname "$(dirname "$DOL_PATH")")"
+REL_STAMP=""
+for REL_ENTRY in ${RELS:-}; do
+  [[ "$BACKEND" == "c" ]] || die "RELS needs the C backend (merge_rel.py merges C chunks)"
+  REL_FILE="$GAME_ROOT/${REL_ENTRY%@*}"
+  REL_BASE="${REL_ENTRY##*@}"
+  [[ -f "$REL_FILE" ]] || die "REL not found: $REL_FILE (from RELS=\"$RELS\" in $CONF)"
+  REL_STAGE="$ROOT/build/dolrecomp-rel-out"
+  rm -rf "$REL_STAGE"
+  mkdir -p "$REL_STAGE"
+  note "REL:       $REL_FILE at $REL_BASE"
+  # EXTRA_ARGS is intentionally word-split.
+  # shellcheck disable=SC2086
+  "$DOLRECOMP_BIN" -j"$JOBS" --backend=c --cpu "$CPU" --rel-base "$REL_BASE" $EXTRA_ARGS \
+      "$REL_FILE" "$GAME_ID" "$REL_STAGE" 2>&1 | tee -a "$LOG"
+  if   [[ -f "$REL_STAGE/${GAME_ID}_generated/${GAME_ID}.h" ]]; then REL_GEN="$REL_STAGE/${GAME_ID}_generated"
+  elif [[ -f "$REL_STAGE/generated/generated.h" ]]; then REL_GEN="$REL_STAGE/generated"
+  else die "DolRecomp produced no recognizable output for $REL_FILE (see $LOG)"
+  fi
+  [[ -f "$REL_GEN/generated.h" ]] || cp "$REL_GEN/${GAME_ID}.h" "$REL_GEN/generated.h"
+  [[ -f "$REL_GEN/generated_smc.txt" ]] || cp "$REL_GEN/${GAME_ID}_smc.txt" "$REL_GEN/generated_smc.txt" 2>/dev/null \
+    || : > "$REL_GEN/generated_smc.txt"
+  command -v python3 > /dev/null || die "python3 is needed (it builds the module too)"
+  python3 -I "$ROOT/tools/dolrecomp/merge_rel.py" --dol-out "$NEW" --rel-out "$REL_GEN" \
+      --rel "$REL_FILE" --base "$REL_BASE" | sed 's/^/[recompile] /'
+  [[ "${PIPESTATUS[0]}" == "0" ]] || die "merging $REL_FILE failed"
+  REL_STAMP="$REL_STAMP ${REL_ENTRY%@*}@$REL_BASE:$(sha256sum "$REL_FILE" | cut -d' ' -f1)"
+done
+
 # C: dcbf, dcbst and dcbi go on in place instead of returning to the
 # dispatcher once per 32-byte line (the LLVM backend's objects already do).
 # LLVM: the dispatcher finds a function's code in a few steps instead of one
@@ -188,6 +222,7 @@ fi
   echo "dolrecomp_sha256=$(sha256sum "$DOLRECOMP_BIN" | cut -d' ' -f1)"
   echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "post=$POST"
+  echo "rels=${REL_STAMP# }"
 } > "$NEW/recomp.stamp"
 
 rm -rf "$FINAL.old"
