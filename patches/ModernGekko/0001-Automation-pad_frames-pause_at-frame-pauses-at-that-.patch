@@ -1,8 +1,8 @@
 From 3173c6ccd527d621b45e7a8b25a868d19930eb2e Mon Sep 17 00:00:00 2001
 From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 02:22:10 +0100
-Subject: [PATCH] Automation: pad_frames pause_at=<frame> pauses at that exact
- frame
+Subject: [PATCH 1/2] Automation: pad_frames pause_at=<frame> pauses at that
+ exact frame
 
 SR-Source Net Plus, phase 0. pad_frames counts frames on the automation
 thread, which reads the presenter's frame counter every millisecond; a

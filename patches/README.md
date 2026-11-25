@@ -20,6 +20,12 @@ git -C <piconet's dolrecomp checkout> am <this repo>/patches/DolRecomp-piconet/*
 ## What they do
 
 **ModernGekko**
+- (phase 1 prototype, branch `srnp/phase1-relais`) a relay client in the runner: with
+  `SRNP_RELAY=<host>:<port> SRNP_SEAT=<k> SRNP_SEATS=<n>`, after every present it sends its input for
+  the frame `SRNP_DELAY` (2) frames ahead to `tools/srnp/relais.py`, waits for the next frame's official
+  inputs and gives seat k's input to the emulated pad of port k (Dolphin's input overrider), on the
+  emulation thread. Checksums of `_Main.rel`'s BSS every 60 frames. Test inputs only
+  (`SRNP_INPUT=random:<seed>`).
 - `pad_frames … pause_at=<frame>`: the automation pauses the emulated CPU exactly when the
   presenter's frame counter reaches `<frame>` (from the emulation thread), instead of some time after
   the automation thread has counted the frames. With it, two runs from the same save state give the

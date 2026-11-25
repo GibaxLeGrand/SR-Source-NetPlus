@@ -20,4 +20,14 @@
   `STATICRECOMP_DISPATCH_SAMPLES=1` (return after a call, function entry, middle of a function with a
   jump table).
 
+Phase 1 prototype (lockstep through a relay):
+- `relais.py --sieges N [--delai-ms 50] [--port 7845] [--journal file]`: closes each frame when every
+  seat has sent its input, or `--delai-ms` after its first input (a late seat's last input is
+  repeated, so a slow machine does not hold the others back); compares the seats' checksums.
+  (`--cadence` closes frames on a fixed clock instead; it fell behind its own start-up and is not
+  used.)
+- `lockstep_local.sh <seats> natif|jit [pause frame]`: starts the relay and N runners on one PC from
+  the same save state, pauses them all at the same frame and compares their MEM1 (paths are the
+  measurement PC's).
+
 Comments and output are in French.

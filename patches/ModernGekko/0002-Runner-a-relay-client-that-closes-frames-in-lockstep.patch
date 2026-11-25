@@ -1,0 +1,488 @@
+From fa3e340d414a727450f462f1024cbab5ccd13f7f Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 05:06:45 +0100
+Subject: [PATCH 2/2] Runner: a relay client that closes frames in lockstep
+ (phase 1 prototype)
+
+SR-Source Net Plus, phase 1. With SRNP_RELAY=<host>:<port>, SRNP_SEAT and
+SRNP_SEATS, the runner joins a relay (tools/srnp/relais.py of the fork):
+after every present, on the emulation thread, it sends its input for the
+frame SRNP_DELAY (2) frames ahead and waits for the next frame's official
+inputs, then hands seat k's input to the emulated pad of port k through
+Dolphin's input overrider, so every runner reads the same inputs at the
+same emulated moment. Every SRNP_CHECK (60) frames it sends an FNV-1a
+hash of Sonic Riders' _Main.rel BSS, which the relay compares.
+SRNP_INPUT=random:<seed> gives reproducible test inputs (no real pad
+yet); SRNP_TRACE=1 traces the first frames. Text protocol, blocking TCP
+(winsock on Windows). Nothing changes without SRNP_RELAY.
+
+Four runners on one PC, the demo race's save state, native core: the
+same MEM1 bit for bit at the pause and equal checksums; a runner at half
+speed does not slow the three others down. Two JIT64 runners: the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                  |   3 +-
+ src/runtime/dolphin_runtime.cpp |   4 +
+ src/runtime/srnp_relay.cpp      | 379 ++++++++++++++++++++++++++++++++
+ src/runtime/srnp_relay.hpp      |  19 ++
+ 4 files changed, 404 insertions(+), 1 deletion(-)
+ create mode 100644 src/runtime/srnp_relay.cpp
+ create mode 100644 src/runtime/srnp_relay.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a1ff852..51a3f90 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -435,6 +435,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/memory_watch.cpp
+         src/runtime/mod_sounds.cpp
+         src/runtime/mod_hud.cpp
++        src/runtime/srnp_relay.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+@@ -456,7 +457,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     if(WIN32)
+         target_sources(moderngekko PRIVATE
+             src/platform/PlatformWin32.cpp)
+-        target_link_libraries(moderngekko PRIVATE dwmapi)
++        target_link_libraries(moderngekko PRIVATE dwmapi ws2_32)
+     endif()
+     if(APPLE)
+         # Dolphin's windowed backend for macOS
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 4a0c364..689095e 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -13,6 +13,7 @@
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/CPU.h"
++#include "srnp_relay.hpp"
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GCPad.h"
+ #include "Core/HW/Memmap.h"
+@@ -1464,6 +1465,9 @@ RuntimeRunResult Runtime::Run() {
+       GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
+         m_impl->automation_state.frame_count.store(info.frame_count,
+                                                    std::memory_order_relaxed);
++        // SR-Source Net Plus, phase 1 prototype: the next frame's inputs closed by a relay
++        // (SRNP_RELAY; nothing without it), on this thread, before the game polls its pads.
++        srnp::RelayOnFrame(info.frame_count);
+         // SR-Source Net Plus: an exact pause (pad_frames pause_at=<frame>), on this thread.
+         const std::uint64_t pause_at =
+             m_impl->automation_state.pause_at_frame.load(std::memory_order_relaxed);
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+new file mode 100644
+index 0000000..6cb1931
+--- /dev/null
++++ b/src/runtime/srnp_relay.cpp
+@@ -0,0 +1,379 @@
++// SR-Source Net Plus, phase 1 prototype: frames closed by a relay, in lockstep. See srnp_relay.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// Protocol (text lines, LF): client -> relay
++//   HELLO <seat> <seats> <delay>     delay: the first <delay> frames have no inputs (neutral)
++//   IN <frame> <seat> <pad>          pad: 16 hex digits (below)
++//   CK <frame> <seat> <hash>         hash: 16 hex digits (FNV-1a 64 of the game's state)
++// relay -> client
++//   OF <frame> <pad seat 0> <pad seat 1> ...
++// A pad is 8 bytes: buttons (16 bits: A B X Y Z Start Up Down Left Right L R), main stick X, Y,
++// C-stick X, Y (signed, -127..127), L, R (0..255).
++#if defined(_WIN32)
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
++#include <netdb.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++#endif
++
++#include "srnp_relay.hpp"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <thread>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "Core/HW/Memmap.h"
++#include "Core/System.h"
++#include "InputCommon/ControllerInterface/Touch/InputOverrider.h"
++
++namespace srnp
++{
++namespace
++{
++#if defined(_WIN32)
++using Socket = SOCKET;
++constexpr Socket kNoSocket = INVALID_SOCKET;
++void CloseSocket(Socket s) { closesocket(s); }
++#else
++using Socket = int;
++constexpr Socket kNoSocket = -1;
++void CloseSocket(Socket s) { close(s); }
++#endif
++
++using Pad = std::array<std::uint8_t, 8>;
++
++struct Relay
++{
++  bool tried = false;
++  bool on = false;
++  Socket socket = kNoSocket;
++  int seat = 0;
++  int seats = 1;
++  int check_every = 60;
++  int delay = 2;  // SRNP_DELAY: frames between a local input and the frame it is for
++  std::string input_mode = "neutral";
++  std::uint64_t seed = 1;
++  std::string buffer;                         // received bytes not yet split into lines
++  std::map<std::uint64_t, std::vector<Pad>> official;  // frames received ahead of need
++  std::uint64_t frames = 0;
++  double wait_ms = 0.0;
++  double wait_max_ms = 0.0;
++};
++
++Relay s_relay;
++
++void Off(const char* why)
++{
++  std::fprintf(stderr, "[srnp relay] off: %s\n", why);
++  if (s_relay.socket != kNoSocket)
++    CloseSocket(s_relay.socket);
++  s_relay.socket = kNoSocket;
++  s_relay.on = false;
++}
++
++bool SendLine(const std::string& line)
++{
++  const std::string text = line + "\n";
++  std::size_t sent = 0;
++  while (sent < text.size())
++  {
++    const int n = send(s_relay.socket, text.data() + sent, static_cast<int>(text.size() - sent), 0);
++    if (n <= 0)
++      return false;
++    sent += static_cast<std::size_t>(n);
++  }
++  return true;
++}
++
++// One line from the relay (without its LF); false on error or after the receive time limit.
++bool ReadLine(std::string* line)
++{
++  for (;;)
++  {
++    const std::size_t end = s_relay.buffer.find('\n');
++    if (end != std::string::npos)
++    {
++      *line = s_relay.buffer.substr(0, end);
++      s_relay.buffer.erase(0, end + 1);
++      return true;
++    }
++    char chunk[4096];
++    const int n = recv(s_relay.socket, chunk, sizeof(chunk), 0);
++    if (n <= 0)
++      return false;
++    s_relay.buffer.append(chunk, static_cast<std::size_t>(n));
++  }
++}
++
++std::string Hex(const std::uint8_t* bytes, std::size_t size)
++{
++  static const char digits[] = "0123456789abcdef";
++  std::string out;
++  for (std::size_t i = 0; i < size; ++i)
++  {
++    out += digits[bytes[i] >> 4];
++    out += digits[bytes[i] & 15];
++  }
++  return out;
++}
++
++bool ParsePad(const std::string& text, Pad* pad)
++{
++  if (text.size() != 16)
++    return false;
++  for (std::size_t i = 0; i < 8; ++i)
++  {
++    char* end = nullptr;
++    const std::string byte = text.substr(i * 2, 2);
++    (*pad)[i] = static_cast<std::uint8_t>(std::strtoul(byte.c_str(), &end, 16));
++  }
++  return true;
++}
++
++// Test inputs (no real pad yet): neutral, or a deterministic sequence per seat and frame.
++Pad LocalInput(std::uint64_t frame)
++{
++  Pad pad{};
++  if (s_relay.input_mode == "random")
++  {
++    std::uint64_t x = s_relay.seed * 0x9E3779B97F4A7C15ull ^ (frame / 15) * 0xBF58476D1CE4E5B9ull ^
++                      static_cast<std::uint64_t>(s_relay.seat) * 0x94D049BB133111EBull;
++    x ^= x >> 31;
++    x *= 0xD6E8FEB86659FD39ull;
++    x ^= x >> 29;
++    const std::uint16_t buttons = static_cast<std::uint16_t>(x & 0x0E1F);  // no Start, no D-pad
++    pad[0] = static_cast<std::uint8_t>(buttons >> 8);
++    pad[1] = static_cast<std::uint8_t>(buttons);
++    pad[2] = static_cast<std::uint8_t>(x >> 16);
++    pad[3] = static_cast<std::uint8_t>(x >> 24);
++    pad[6] = static_cast<std::uint8_t>(x >> 32);
++  }
++  return pad;
++}
++
++void ApplyPad(int port, const Pad& pad)
++{
++  using ciface::Touch::ControlID;
++  using ciface::Touch::SetControlState;
++  const unsigned buttons = (static_cast<unsigned>(pad[0]) << 8) | pad[1];
++  static constexpr ControlID kButtons[] = {
++      ControlID::GCPAD_A_BUTTON,  ControlID::GCPAD_B_BUTTON,     ControlID::GCPAD_X_BUTTON,
++      ControlID::GCPAD_Y_BUTTON,  ControlID::GCPAD_Z_BUTTON,     ControlID::GCPAD_START_BUTTON,
++      ControlID::GCPAD_DPAD_UP,   ControlID::GCPAD_DPAD_DOWN,    ControlID::GCPAD_DPAD_LEFT,
++      ControlID::GCPAD_DPAD_RIGHT, ControlID::GCPAD_L_DIGITAL,   ControlID::GCPAD_R_DIGITAL};
++  for (std::size_t i = 0; i < std::size(kButtons); ++i)
++    SetControlState(port, kButtons[i], (buttons >> i) & 1 ? 1.0 : 0.0);
++  const auto axis = [](std::uint8_t v) {
++    const int s = static_cast<std::int8_t>(v);
++    return s < -127 ? -1.0 : s / 127.0;
++  };
++  SetControlState(port, ControlID::GCPAD_MAIN_STICK_X, axis(pad[2]));
++  SetControlState(port, ControlID::GCPAD_MAIN_STICK_Y, axis(pad[3]));
++  SetControlState(port, ControlID::GCPAD_C_STICK_X, axis(pad[4]));
++  SetControlState(port, ControlID::GCPAD_C_STICK_Y, axis(pad[5]));
++  SetControlState(port, ControlID::GCPAD_L_ANALOG, pad[6] / 255.0);
++  SetControlState(port, ControlID::GCPAD_R_ANALOG, pad[7] / 255.0);
++}
++
++// FNV-1a 64 of the game's state: _Main.rel's BSS for Sonic Riders (GXEE8P), racers included.
++std::uint64_t StateHash()
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  const std::uint8_t* ram = memory.GetRAM();
++  const std::uint32_t start = 0x805FB080u - 0x80000000u;
++  const std::uint32_t end = 0x806B5774u - 0x80000000u;
++  std::uint64_t hash = 0xCBF29CE484222325ull;
++  if (!ram || end > memory.GetRamSizeReal())
++    return 0;
++  for (std::uint32_t i = start; i < end; ++i)
++  {
++    hash ^= ram[i];
++    hash *= 0x100000001B3ull;
++  }
++  return hash;
++}
++
++bool Connect()
++{
++  const char* address = std::getenv("SRNP_RELAY");
++  if (!address || !*address)
++    return false;
++  if (const char* v = std::getenv("SRNP_SEAT"))
++    s_relay.seat = std::atoi(v);
++  if (const char* v = std::getenv("SRNP_SEATS"))
++    s_relay.seats = std::max(1, std::atoi(v));
++  if (const char* v = std::getenv("SRNP_CHECK"))
++    s_relay.check_every = std::max(0, std::atoi(v));
++  if (const char* v = std::getenv("SRNP_DELAY"))
++    s_relay.delay = std::clamp(std::atoi(v), 0, 30);
++  if (const char* v = std::getenv("SRNP_INPUT"))
++  {
++    std::string mode = v;
++    const std::size_t colon = mode.find(':');
++    if (colon != std::string::npos)
++    {
++      s_relay.seed = std::strtoull(mode.c_str() + colon + 1, nullptr, 0);
++      mode.resize(colon);
++    }
++    s_relay.input_mode = mode;
++  }
++  std::string host = address;
++  std::string port = "7845";
++  if (const std::size_t colon = host.rfind(':'); colon != std::string::npos)
++  {
++    port = host.substr(colon + 1);
++    host.resize(colon);
++  }
++#if defined(_WIN32)
++  WSADATA wsa;
++  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
++    return false;
++#endif
++  addrinfo hints{};
++  hints.ai_family = AF_UNSPEC;
++  hints.ai_socktype = SOCK_STREAM;
++  addrinfo* found = nullptr;
++  if (getaddrinfo(host.c_str(), port.c_str(), &hints, &found) != 0 || !found)
++    return false;
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
++  bool connected = false;
++  while (!connected && std::chrono::steady_clock::now() < deadline)
++  {
++    for (addrinfo* a = found; a && !connected; a = a->ai_next)
++    {
++      s_relay.socket = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
++      if (s_relay.socket == kNoSocket)
++        continue;
++      if (connect(s_relay.socket, a->ai_addr, static_cast<int>(a->ai_addrlen)) == 0)
++        connected = true;
++      else
++      {
++        CloseSocket(s_relay.socket);
++        s_relay.socket = kNoSocket;
++      }
++    }
++    if (!connected)
++      std::this_thread::sleep_for(std::chrono::milliseconds(200));
++  }
++  freeaddrinfo(found);
++  if (!connected)
++    return false;
++  // A seat waits for the other seats' inputs: give the relay time (start-up of every runner, a
++  // seat that never comes back), then give up rather than hang the game.
++#if defined(_WIN32)
++  const DWORD timeout_ms = 60000;
++  setsockopt(s_relay.socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms),
++             sizeof(timeout_ms));
++#else
++  timeval tv{60, 0};
++  setsockopt(s_relay.socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++#endif
++  int one = 1;
++  setsockopt(s_relay.socket, IPPROTO_TCP, 1 /* TCP_NODELAY */, reinterpret_cast<const char*>(&one),
++             sizeof(one));
++  return SendLine("HELLO " + std::to_string(s_relay.seat) + " " + std::to_string(s_relay.seats) +
++                  " " + std::to_string(s_relay.delay));
++}
++}  // namespace
++
++void RelayOnFrame(std::uint64_t frame)
++{
++  if (!s_relay.tried)
++  {
++    s_relay.tried = true;
++    s_relay.on = Connect();
++    if (s_relay.on)
++      std::fprintf(stderr,
++                   "[srnp relay] seat %d of %d, input %s, delay %d frames, checksum every %d frames\n",
++                   s_relay.seat, s_relay.seats, s_relay.input_mode.c_str(), s_relay.delay,
++                   s_relay.check_every);
++    else if (std::getenv("SRNP_RELAY"))
++      Off("cannot reach the relay");
++  }
++  if (!s_relay.on)
++    return;
++
++  if (s_relay.check_every > 0 && frame % static_cast<std::uint64_t>(s_relay.check_every) == 0)
++  {
++    char hash[17];
++    std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(StateHash()));
++    if (!SendLine("CK " + std::to_string(frame) + " " + std::to_string(s_relay.seat) + " " + hash))
++      return Off("send failed");
++  }
++
++  // The input of the frame SRNP_DELAY frames after the next (so that it reaches the relay before
++  // that frame is due), then the next frame's official inputs before it runs.
++  const std::uint64_t next = frame + 1;
++  const std::uint64_t ahead = next + static_cast<std::uint64_t>(s_relay.delay);
++  const Pad local = LocalInput(ahead);
++  if (!SendLine("IN " + std::to_string(ahead) + " " + std::to_string(s_relay.seat) + " " +
++                Hex(local.data(), local.size())))
++    return Off("send failed");
++  static const bool trace = std::getenv("SRNP_TRACE") != nullptr;
++  static int traced = 0;
++  if (trace && traced < 40)
++  {
++    ++traced;
++    std::fprintf(stderr, "[srnp relay] present %llu: sent IN %llu, waiting for OF %llu (%zu ahead)\n",
++                 static_cast<unsigned long long>(frame), static_cast<unsigned long long>(ahead),
++                 static_cast<unsigned long long>(next), s_relay.official.size());
++  }
++
++  const auto t0 = std::chrono::steady_clock::now();
++  while (s_relay.official.find(next) == s_relay.official.end())
++  {
++    std::string line;
++    if (!ReadLine(&line))
++      return Off("no official frame from the relay (time limit or connection lost)");
++    if (line.rfind("OF ", 0) != 0)
++      continue;
++    std::vector<std::string> parts;
++    for (std::size_t p = 0; p < line.size();)
++    {
++      const std::size_t q = line.find(' ', p);
++      parts.push_back(line.substr(p, q == std::string::npos ? std::string::npos : q - p));
++      p = q == std::string::npos ? line.size() : q + 1;
++    }
++    if (parts.size() < 2)
++      continue;
++    const std::uint64_t f = std::strtoull(parts[1].c_str(), nullptr, 10);
++    std::vector<Pad> pads;
++    for (std::size_t i = 2; i < parts.size(); ++i)
++    {
++      Pad pad{};
++      if (ParsePad(parts[i], &pad))
++        pads.push_back(pad);
++    }
++    s_relay.official[f] = std::move(pads);
++  }
++  const double waited =
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++  s_relay.wait_ms += waited;
++  s_relay.wait_max_ms = std::max(s_relay.wait_max_ms, waited);
++
++  const std::vector<Pad>& pads = s_relay.official[next];
++  for (std::size_t port = 0; port < pads.size() && port < 4; ++port)
++    ApplyPad(static_cast<int>(port), pads[port]);
++  s_relay.official.erase(s_relay.official.begin(), s_relay.official.upper_bound(next));
++
++  if (++s_relay.frames % 600 == 0)
++  {
++    std::fprintf(stderr, "[srnp relay] frame %llu: waited %.2f ms a frame on average, %.1f at most\n",
++                 static_cast<unsigned long long>(frame), s_relay.wait_ms / 600.0,
++                 s_relay.wait_max_ms);
++    s_relay.wait_ms = 0.0;
++    s_relay.wait_max_ms = 0.0;
++  }
++}
++}  // namespace srnp
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+new file mode 100644
+index 0000000..eb63c77
+--- /dev/null
++++ b/src/runtime/srnp_relay.hpp
+@@ -0,0 +1,19 @@
++// SR-Source Net Plus, phase 1 prototype: frames closed by a relay, in lockstep.
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// With SRNP_RELAY=<host>:<port> in the environment, the runner joins a relay (tools/srnp/relais.py)
++// as seat SRNP_SEAT of SRNP_SEATS. After every present (the presenter's frame counter, on the
++// emulation thread), it sends its input for the next frame and waits for that frame's official
++// inputs, which the relay closes when every seat has sent one (or, past its time limit, with a late
++// seat's last input). Seat k's input goes to the emulated GameCube pad of port k (k < 4) through
++// Dolphin's input overrider, so every machine reads the same inputs at the same emulated moment.
++// Every SRNP_CHECK frames it sends a checksum of the game's state, which the relay compares.
++#pragma once
++
++#include <cstdint>
++
++namespace srnp
++{
++// Called after each present on the emulation thread; does nothing without SRNP_RELAY.
++void RelayOnFrame(std::uint64_t frame);
++}  // namespace srnp
+-- 
+2.34.1.windows.1
+
