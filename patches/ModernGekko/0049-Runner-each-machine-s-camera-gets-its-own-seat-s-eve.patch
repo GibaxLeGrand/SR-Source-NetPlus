@@ -1,0 +1,231 @@
+From a0b11e16b48026d7bff624448714c4178e649da0 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:29:04 +0100
+Subject: [PATCH] Runner: each machine's camera gets its own seat's events
+
+The game has 9 cameras (0x80601D28 + n x 0x25C) and sends a racer's events
+(jumps, tricks, boosts, dash panels) to the camera of its index (+0x1029).
+View 0 shows camera 0, which followed this machine's seat, but racer 0's
+events still went to it: on Knuckles's screen the camera took Sonic's jump
+angle and effects (Gibax, 6"00 on Metal City).
+
+The 258 reads of the index that only address a camera now read +0x106C during
+the race, a racer byte the game never uses, written each frame: camera 0 for
+this machine's seat, camera 1 for a second seat, the seat's own camera for the
+racer that had them. Every racer keeps a camera of its own. +0x106C is left out
+of the checksum. SRNP_CAMERAS=0 keeps the game's reads.
+
+Also: the effect drawn from the player's camera at 0x8054E644 reads the
+shifted index, and the index caves use addic for r0.
+
+Measured in the 2-player race (both AI-driven): Knuckles's camera at 6"00 is
+behind him again; his own trick camera on the big jump is unchanged; 31
+identical checksums, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 145 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 138 insertions(+), 7 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 50fc012..3e43a7a 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -210,11 +210,15 @@ constexpr IndexRead kIndexReads[] = {
+     {0x8045390C, 0x88FF1029, true},  // lbz r7, 0x1029(r31)
+     // 0x805735EC: two bytes of the player's view camera (0x80601D28 + index x 0x25C: +0x24A, +0x24B).
+     {0x80574608, 0x889C1029, true},  // lbz r4, 0x1029(r28)
+-    // Left as the game has them until understood: 0x80484A3C (0x804874FC: the player's task
+-    // 0x80604784[index], state 5 to 4; redirected on 2026-11-25, the tricks' "RANK"/"LEVEL UP!!" still
+-    // showed one racer's on every screen: not it, or not alone) and 0x8054E644 (0x8054E714, 0x8054E820:
+-    // an effect drawn from the player's camera, then [0x80604428] + index x 0x30).
++    // 0x8054E644 (per racer): for a racer with +0xBAC 0x1000 that is a player, an effect drawn from the
++    // player's camera ([0x80604428] + index x 0x30): Sonic's on Knuckles's screen (Gibax, 2026-11-25:
++    // "pk y'a TJR ces soucis de caméra").
++    {0x8054E714, 0x8B9D1029, false},  // lbz r28, 0x1029(r29)
++    {0x8054E820, 0x881D1029, false},  // lbz r0, 0x1029(r29)
++    // Left as the game has them: 0x80484A3C (0x804874FC: the player's task 0x80604784[index], state 5
++    // to 4; redirected on 2026-11-25, nothing visible; that table stays empty in our races).
+ };
++static_assert(std::size(kIndexReads) <= 5, "the 6th cave is the 1P labels'");
+ constexpr std::uint32_t kIndexCaves = 0x80002D80;  // 12 bytes each, up to 0x80002DC8 (5 for these
+                                                     // reads, the 6th for the 1P labels, PatchHud)
+ int s_hud_seat = 0;
+@@ -243,8 +247,10 @@ void PatchIndexReads(int seat)
+     }
+     const std::uint32_t rd = (read.original >> 21) & 31u;
+     Put32(c, read.original);
+-    Put32(c + 4, 0x38000000u | rd << 21 | rd << 16 |
+-                     ((0u - static_cast<std::uint32_t>(seat)) & 0xFFFFu));  // addi rD, rD, -seat
++    // addi rD, rD, -seat; for r0, addic (addi takes rA = r0 as 0; the carry it sets is not read after
++    // these reads)
++    Put32(c + 4, (rd == 0 ? 0x30000000u : 0x38000000u) | rd << 21 | rd << 16 |
++                     ((0u - static_cast<std::uint32_t>(seat)) & 0xFFFFu));
+     Put32(c + 8, 0x4E800020u);                                              // blr
+     jit.InvalidateICache(cave, 12, true);
+     Put32(p, seat ? call : read.original);  // seat 0: the game's own lbz
+@@ -593,6 +599,126 @@ void PatchZones(bool on)
+                on ? "camera 0's, from racer 0's path only" : "the game's");
+ }
+ 
++// The cameras (2026-11-26, Gibax: "la cam de knuckles a 6"00 ... copie l'angle et l'effet de celle
++// de Sonic"). The game has 9 cameras (0x80601D28 + n x 0x25C) and a racer's events (jumps, tricks,
++// boosts, dash panels...) go to the camera of its index (+0x1029): these 258 reads of the index serve
++// only to address a camera (x 0x25C, at most a test < 9 before), found in the REL's code (lbz rD,
++// 0x1029(rA) whose register goes nowhere else). View 0 shows camera 0, which follows this machine's
++// seat (kCameraRacer), but racer 0's events still went to it. During the race these reads take
++// +0x106C instead, a byte no code of the game uses (zero in every racer through whole races, dumps of
++// 2026-11-25), written each frame: the camera of each racer's events, camera 0 for this machine's
++// seat (camera 1 for its second seat) and the seat's own for the racer that had camera 0. Every racer
++// keeps a camera of its own; only which one is shown differs between machines. The read at 0x80574608
++// (kIndexReads) already sends the seat's racer to camera 0. SRNP_CAMERAS=0 keeps the game's.
++constexpr std::uint32_t kCameraSlot = 0x106C;
++constexpr std::uint32_t kCameraIndexReads[] = {
++    0x803FEE8C, 0x80401438, 0x8040E1C0, 0x8040E1EC, 0x8045204C, 0x8045265C, 0x80452828,
++    0x80452E40, 0x804533C8, 0x804533D8, 0x8045343C, 0x80453484, 0x80454A60, 0x80455A3C,
++    0x8045B8B8, 0x8045BB44, 0x8045E8AC, 0x80469FF8, 0x8046A18C, 0x8046B5F8, 0x8046B9B0,
++    0x8046BDA8, 0x8046E0AC, 0x8046E0C8, 0x8046E100, 0x8046E140, 0x8046E408, 0x8046E444,
++    0x8046FBF4, 0x804708D8, 0x8047134C, 0x80478420, 0x804785A4, 0x804785D4, 0x80478D0C,
++    0x80478D54, 0x804798F4, 0x80479F1C, 0x8047CF28, 0x8047D8DC, 0x8047E424, 0x8047E584,
++    0x8048D7BC, 0x8048E440, 0x8048E470, 0x8048E770, 0x8048E904, 0x8048E9F8, 0x8048ECF0,
++    0x8048ED28, 0x8048F684, 0x8048F980, 0x80491AA0, 0x80491B10, 0x80491EE4, 0x804920D8,
++    0x80492638, 0x8049295C, 0x80492B18, 0x804938A4, 0x80493930, 0x804BFA8C, 0x804BFB48,
++    0x804C0708, 0x804C0768, 0x804C0864, 0x804C08C4, 0x804C0B50, 0x804C0BB0, 0x804C0CCC,
++    0x804C0D2C, 0x804C0FC4, 0x804C1024, 0x804C1144, 0x804C11A4, 0x804C2AA4, 0x804C2B04,
++    0x804C2C30, 0x804C2C90, 0x804C2F60, 0x804C2FC0, 0x804C30E0, 0x804C3140, 0x804C33E4,
++    0x804C3444, 0x804C3564, 0x804C35C4, 0x804C4B18, 0x804C4B78, 0x804C4D44, 0x804C4DA4,
++    0x804C50E4, 0x804C5144, 0x804C5268, 0x804C52C8, 0x804C6C90, 0x804C6CF0, 0x804C6DEC,
++    0x804C6E4C, 0x804C7104, 0x804C7164, 0x804C72AC, 0x804C730C, 0x804CDAB0, 0x804D053C,
++    0x804DB3C4, 0x804DF828, 0x804E000C, 0x804E0760, 0x804E07D8, 0x804E08DC, 0x804E0954,
++    0x804E0B94, 0x804E0C0C, 0x804E0D10, 0x804E0D88, 0x804E0FC4, 0x804E103C, 0x804E1130,
++    0x804E11A8, 0x804E1B2C, 0x804E2820, 0x804E2880, 0x804E29B8, 0x804E2A18, 0x804E2CC8,
++    0x804E2D28, 0x804E2E5C, 0x804E2EB8, 0x804E3174, 0x804E31D4, 0x804E32F4, 0x804E3354,
++    0x804E4E20, 0x804E4E80, 0x804E4F9C, 0x804E4FFC, 0x804E5290, 0x804E52F0, 0x804E5420,
++    0x804E5480, 0x804E56F4, 0x804E5754, 0x804E5858, 0x804E58B8, 0x804E70D8, 0x804E7138,
++    0x804E72DC, 0x804E733C, 0x804E75D8, 0x804E7638, 0x804E7740, 0x804E77A0, 0x804E7A40,
++    0x804E7AA0, 0x804E7BD0, 0x804E7C30, 0x804E891C, 0x804E92D4, 0x804E9334, 0x804E9464,
++    0x804E94C4, 0x804E97A8, 0x804E9808, 0x804E9938, 0x804E9998, 0x804E9C3C, 0x804E9C9C,
++    0x804E9E74, 0x804E9ED4, 0x80506FEC, 0x805070A8, 0x80507D7C, 0x80507DDC, 0x80507F34,
++    0x80507F94, 0x8050832C, 0x8050838C, 0x80516D20, 0x80517964, 0x80546A58, 0x80546CB8,
++    0x805470E0, 0x80547104, 0x8054EBD4, 0x8054FBE8, 0x805512A8, 0x805514D4, 0x80551534,
++    0x80551634, 0x80551694, 0x80551794, 0x805517F4, 0x80553BA8, 0x80553C08, 0x805541E4,
++    0x80554640, 0x805546A0, 0x805547B8, 0x80554818, 0x8055AA50, 0x8055ACC0, 0x8055AD20,
++    0x8055ADCC, 0x8055AE2C, 0x8055AED8, 0x8055AF38, 0x8055E520, 0x8055EA10, 0x8055EA70,
++    0x8055EB24, 0x8055EB84, 0x8055EC30, 0x8055EC90, 0x8055EDC8, 0x8055EE44, 0x8055EEA0,
++    0x80563068, 0x805630C8, 0x805725E4, 0x80572640, 0x80572A24, 0x80572AF4, 0x80574050,
++    0x805740A8, 0x805745D4, 0x80574C74, 0x80575008, 0x8058271C, 0x80582750, 0x80583320,
++    0x80583BF0, 0x80587A9C, 0x80587AFC, 0x80587BB0, 0x80587C10, 0x80587CB4, 0x80587D14,
++    0x80588FB4, 0x80589014, 0x805890C0, 0x80589120, 0x80589360, 0x805893C0, 0x80589DD4,
++    0x80589E34, 0x80589FD4, 0x8058A034, 0x8058A900, 0x8058A960, 0x8058AA04, 0x8058AA64,
++    0x8058AB08, 0x8058AB68, 0x8058CAEC, 0x8058CB08, 0x80597A80, 0x805A0BE8,
++};
++std::array<std::uint8_t, 8> s_camera_of{0, 1, 2, 3, 4, 5, 6, 7};
++bool s_cameras_patched = false;
++
++// The camera of each racer's events: the seat's racer's camera 0, the second seat's camera 1, each by
++// a swap with the racer that had it.
++std::array<std::uint8_t, 8> CameraOf(int seat, int seat2)
++{
++  std::array<std::uint8_t, 8> of{0, 1, 2, 3, 4, 5, 6, 7};
++  const auto place = [&of](int racer, std::uint8_t camera) {
++    if (racer < 0 || racer >= 8)
++      return;
++    for (std::size_t k = 0; k < of.size(); ++k)
++      if (of[k] == camera)
++      {
++        std::swap(of[k], of[static_cast<std::size_t>(racer)]);
++        return;
++      }
++  };
++  place(seat, 0);
++  if (seat2 != seat)
++    place(seat2, 1);
++  return of;
++}
++
++void WriteCameraSlots(std::uint8_t* racers)
++{
++  for (std::size_t k = 0; k < 8; ++k)
++    racers[k * kRacerSize + kCameraSlot] = s_cameras_patched ? s_camera_of[k] : 0;
++}
++
++// seat < 0: the game's reads back.
++void PatchCameras(std::uint8_t* racers, int seat, int seat2)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_CAMERAS");
++    return v && *v == '0';
++  }();
++  const std::array<std::uint8_t, 8> of = CameraOf(seat, seat2);
++  const bool on = !off && seat >= 0 && of != CameraOf(0, 0);  // seat 0 alone: the game's own reads
++  if (on == s_cameras_patched)
++    return;
++  const std::uint32_t from = on ? 0x1029u : kCameraSlot, to = on ? kCameraSlot : 0x1029u;
++  for (const std::uint32_t address : kCameraIndexReads)
++  {
++    const std::uint32_t word = Read32(address);
++    if ((word >> 26) != 34u || (word & 0xFFFFu) != from)  // lbz rD, from(rA)
++    {
++      std::fprintf(stderr, "[srnp racers] cameras: 0x%08X holds %08X, not lbz 0x%X: left alone\n",
++                   address, word, from);
++      return;
++    }
++  }
++  s_camera_of = of;
++  s_cameras_patched = on;
++  WriteCameraSlots(racers);  // before the code reads them
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  for (const std::uint32_t address : kCameraIndexReads)
++  {
++    if (std::uint8_t* p = Guest(address, 4))
++      Put32(p, (Get32(p) & 0xFFFF0000u) | to);
++    jit.InvalidateICache(address, 4, true);
++  }
++  if (on)
++    std::fprintf(stderr, "[srnp racers] cameras: racer events to cameras %u %u %u %u %u %u %u %u\n", of[0],
++                 of[1], of[2], of[3], of[4], of[5], of[6], of[7]);
++  else
++    std::fprintf(stderr, "[srnp racers] cameras: the game's\n");
++}
++
+ // Displays the game starts for its players only (racer index under the player count, 0x8021B8C8: 1 in
+ // the 1P race), so racer 0's on every screen: during the race the runner starts them for its seat's racer
+ // instead. Each is a few code words, checked against the game's before they are written and put back
+@@ -870,6 +996,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchAnimation(true);
+     PatchZones(true);
+     PatchSeatDisplays(camera_seat);
++    PatchCameras(racers, camera_seat, camera_seat2);
+     PatchTest(true);
+     // SRNP_BD5=<address>,... (test, hexadecimal): those reads of the CPUs' flag (lbz rD, 0xBD(rA))
+     // see racer 5 as a CPU, through code in free low memory (0x80001810-0x80002C00, zero in races):
+@@ -946,6 +1073,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchAnimation(false);
+     PatchZones(false);
+     PatchSeatDisplays(-1);
++    PatchCameras(racers, -1, -1);
+     PatchTest(false);
+     std::fprintf(stderr, "[srnp racers] race over (0x%X, loading %u, scene %u): racers back to the game\n",
+                  phase, Read32(kRaceLoading), Read32(kRaceScene));
+@@ -1005,6 +1133,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     racer[kCpuFlag] = cpu_rules ? 1 : 0;
+     seat.written = 0;
+   }
++  WriteCameraSlots(racers);  // the camera of each racer's events (PatchCameras)
+   if (camera_seat >= 0 && camera_seat < 8)
+     if (std::uint8_t* camera = Guest(kCameraRacer, 1))
+       *camera = static_cast<std::uint8_t>(camera_seat);
+@@ -1036,7 +1165,9 @@ std::uint64_t RacersHash()
+       // when the displays shown for this machine's seat alone have taken slots (measured with Gibax,
+       // Amy, 2026-11-25: 0x803DFD08 against 0x803DFC48, one 0xC0 slot apart; the race the same); and
+       // +0x894, the same for the display task 0x804A4F2C started for this machine's seat alone.
+-      {0x894, 0x89C}};
++      {0x894, 0x89C},
++      // The camera of the racer's events, this machine's (PatchCameras).
++      {0x106C, 0x106D}};
+   // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
+   // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+-- 
+2.34.1.windows.1
+
