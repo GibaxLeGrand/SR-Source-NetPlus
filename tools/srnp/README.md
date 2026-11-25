@@ -67,6 +67,10 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   2 s while a seat is missing) and sends `GO` once every seat is there; the runners wait at their first
   frame. Until every seat has sent an input, no frame is closed without it. `ECART=<s>` in the lockstep
   script launches the runners that many seconds apart.
+- The waiting screen (patch 0016, Gibax's mockup): `WAIT` carries each seat's state (O expected, V
+  there, X left); a seat that leaves before the start no longer holds it: `GO` names it with a character
+  the relay drew at random, and the AI races it. `test_attente.sh`: four seats, one leaves, photos of the
+  real window (`capture_fenetre.ps1`, PrintWindow: the runner's own screenshots leave out its interface).
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
 - `compare_ab.py <run A> <run B> [runner] [--tout]`: the racers of two runs, frame by frame (the same

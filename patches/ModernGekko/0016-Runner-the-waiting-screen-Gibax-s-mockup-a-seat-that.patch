@@ -1,0 +1,437 @@
+From 94bd7a4140bf491a455bbfa0e00829fba431ce02 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:36:09 +0100
+Subject: [PATCH] Runner: the waiting screen (Gibax's mockup); a seat that
+ leaves is the AI's
+
+- The relay's WAIT line now carries each seat's state (O expected,
+  V there, X left before the start). A seat that leaves no longer holds
+  the start: GO comes once no seat is expected, with seat:character/gear
+  for each seat that left, a character the relay drew at random (the
+  same on every machine; decision of 2026-11-25). The runner sets it
+  for the race (srnp::SetSeatChoice) and the relay gives that seat the
+  AI flag as its input.
+- The waiting screen (srnp_waiting_screen.cpp), from Gibax's mockup:
+  "<n> Players", "<n> Racers", "<n>/<n> Ready", then for each seat its
+  label (nP, or COM for a seat that left), its character (the name for
+  now: the game's heads are not in this repository) and its state (blue
+  circle on the way, green tick there, red cross left), "YOU" under this
+  machine's seat. While the runner waits for GO in the relay's hook, the
+  last frame is presented again with the screen over it, as the menu
+  does over a paused game.
+
+Measured: 4 seats, one runner each; seat 1 arrives then is killed:
+VOOO, VVOO, VXOO, VXVO, then GO with 1:6/0 (Wave), applied by the three
+runners, racer 1 given to the AI; 24 checksums equal, 0 divergences,
+0 late inputs. The screen photographed in the real window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |   1 +
+ src/runtime/srnp_racers.cpp         |  18 +++-
+ src/runtime/srnp_racers.hpp         |   5 +
+ src/runtime/srnp_relay.cpp          |  67 ++++++++++--
+ src/runtime/srnp_relay.hpp          |  19 ++++
+ src/runtime/srnp_waiting_screen.cpp | 162 ++++++++++++++++++++++++++++
+ 6 files changed, 260 insertions(+), 12 deletions(-)
+ create mode 100644 src/runtime/srnp_waiting_screen.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5500f3f..4dfc9f4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -438,6 +438,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/srnp_relay.cpp
+         src/runtime/srnp_racers.cpp
+         src/runtime/srnp_labels.cpp
++        src/runtime/srnp_waiting_screen.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 9a62fc2..110f0bd 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -291,9 +291,9 @@ struct Choice
+ {
+   int character = -1, gear = -1;
+ };
+-const std::array<Choice, 8>& Lobby()
++std::array<Choice, 8>& Lobby()
+ {
+-  static const std::array<Choice, 8> lobby = [] {
++  static std::array<Choice, 8> lobby = [] {
+     std::array<Choice, 8> out{};
+     const char* v = std::getenv("SRNP_PERSOS");
+     for (std::size_t k = 0; v && *v && k < 8; ++k)
+@@ -399,6 +399,20 @@ void SetUpRace(std::uint8_t* racers)
+ }
+ }  // namespace
+ 
++void SetSeatChoice(int seat, int character, int gear)
++{
++  if (seat < 0 || seat >= 8)
++    return;
++  Lobby()[static_cast<std::size_t>(seat)] = {character, gear};
++  std::fprintf(stderr, "[srnp racers] seat %d: character %d, gear %d (set by the relay)\n", seat,
++               character, gear);
++}
++
++int SeatCharacter(int seat)
++{
++  return seat >= 0 && seat < 8 ? Lobby()[static_cast<std::size_t>(seat)].character : -1;
++}
++
+ long long RaceFrame()
+ {
+   return s_race ? static_cast<long long>(s_frames - s_race_start) : -1;
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 604454b..f748d99 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -41,6 +41,11 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+ // Frames since the runner took the race (the first frame it drove the racers), or -1.
+ long long RaceFrame();
+ 
++// A seat's character and gear for the race to be set up (as SRNP_PERSOS gives them; the relay's
++// choice for a seat the AI takes over), and the character known for a seat (-1: the game's choice).
++void SetSeatChoice(int seat, int character, int gear);
++int SeatCharacter(int seat);
++
+ // FNV-1a 64 of the 8 racers, without the fields that follow the camera (measured on 2026-11-25).
+ std::uint64_t RacersHash();
+ 
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index b127b76..e886b20 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -6,8 +6,10 @@
+ //   IN <frame> <seat> <pad>          pad: 16 hex digits (below)
+ //   CK <frame> <seat> <hash>         hash: 16 hex digits (FNV-1a 64 of the game's state)
+ // relay -> client
+-//   WAIT <present> <seats>           at each arrival and every 2 s until every seat is there
+-//   GO                               every seat is there: the runners leave their first frame
++//   WAIT <present> <seats> <states>  at each arrival and every 2 s until no seat is expected; one
++//                                    letter a seat: O expected, V there, X left before the start
++//   GO [<seat>:<character>/<gear>]   the runners leave their first frame; each seat that left is the
++//                                    AI's, with a character the relay drew at random
+ //   OF <frame> <pad seat 0> <pad seat 1> ...
+ // A pad is 8 bytes: buttons (16 bits: A B X Y Z Start Up Down Left Right L R), main stick X, Y,
+ // C-stick X, Y (signed, -127..127), L, R (0..255).
+@@ -29,6 +31,7 @@
+ #include <array>
+ #include <atomic>
+ #include <chrono>
++#include <mutex>
+ #include <thread>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -81,6 +84,8 @@ Relay s_relay;
+ std::atomic<bool> s_waiting{false};
+ std::atomic<int> s_wait_present{0};
+ std::atomic<int> s_wait_seats{0};
++std::mutex s_wait_mutex;
++std::string s_wait_states;  // one letter a seat: O expected, V there, X left
+ 
+ void Off(const char* why)
+ {
+@@ -357,14 +362,20 @@ bool Connect()
+ }
+ 
+ // The start together: after HELLO, the runner waits at its first frame until every seat is there. The
+-// relay says WAIT <present> <seats> at each arrival and every 2 s (which keeps the connection alive past
+-// the receive time limit), then GO.
++// relay says WAIT <present> <seats> <states> at each arrival and every 2 s (which keeps the connection
++// alive past the receive time limit), then GO, with the characters of the seats the AI takes over.
++// Meanwhile the waiting screen is drawn over the last frame (RedrawWhileWaiting).
+ void WaitForGo()
+ {
+   s_wait_seats = s_relay.seats;
++  {
++    std::lock_guard lock(s_wait_mutex);
++    s_wait_states = std::string(static_cast<std::size_t>(s_relay.seats), 'O');
++  }
+   s_waiting = true;
++  RedrawWhileWaiting();
+   const auto t0 = std::chrono::steady_clock::now();
+-  int shown = -1;
++  std::string shown;
+   for (;;)
+   {
+     std::string line;
+@@ -373,18 +384,39 @@ void WaitForGo()
+       s_waiting = false;
+       return Off("relay lost while waiting for the other seats");
+     }
+-    if (line == "GO")
++    if (line == "GO" || line.rfind("GO ", 0) == 0)
++    {
++      // Each seat that left before the start: the AI's, with the relay's character.
++      for (std::size_t p = 3; p < line.size();)
++      {
++        int seat = -1, character = -1, gear = 0;
++        if (std::sscanf(line.c_str() + p, "%d:%d/%d", &seat, &character, &gear) == 3)
++          SetSeatChoice(seat, character, gear);
++        const std::size_t next = line.find(' ', p);
++        p = next == std::string::npos ? line.size() : next + 1;
++      }
+       break;
++    }
+     int present = 0, seats = 0;
+-    if (std::sscanf(line.c_str(), "WAIT %d %d", &present, &seats) == 2)
++    char states[16] = {};
++    const int read = std::sscanf(line.c_str(), "WAIT %d %d %15s", &present, &seats, states);
++    if (read >= 2)
+     {
+       s_wait_present = present;
+       s_wait_seats = seats;
+-      if (present != shown)
++      const std::string now = read == 3 ? std::string(states)
++                                        : std::string(static_cast<std::size_t>(seats), 'O');
+       {
+-        shown = present;
+-        std::fprintf(stderr, "[srnp relay] waiting for the other seats: %d/%d\n", present, seats);
++        std::lock_guard lock(s_wait_mutex);
++        s_wait_states = now;
+       }
++      if (now != shown)
++      {
++        shown = now;
++        std::fprintf(stderr, "[srnp relay] waiting for the other seats: %d/%d %s\n", present, seats,
++                     now.c_str());
++      }
++      RedrawWhileWaiting();
+     }
+   }
+   s_waiting = false;
+@@ -394,6 +426,21 @@ void WaitForGo()
+ }
+ }  // namespace
+ 
++WaitView RelayWaitView()
++{
++  WaitView view;
++  view.waiting = s_waiting;
++  view.seats = s_wait_seats;
++  {
++    std::lock_guard lock(s_wait_mutex);
++    view.states = s_wait_states;
++  }
++  view.local = s_relay.local;
++  for (int k = 0; k < view.seats && k < 8; ++k)
++    view.characters[static_cast<std::size_t>(k)] = SeatCharacter(k);
++  return view;
++}
++
+ bool RelayWaiting(int* present, int* seats)
+ {
+   if (present)
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 46ed01e..2a115c0 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -10,7 +10,10 @@
+ // Every SRNP_CHECK frames it sends a checksum of the game's state, which the relay compares.
+ #pragma once
+ 
++#include <array>
+ #include <cstdint>
++#include <string>
++#include <vector>
+ 
+ #include "moderngekko/cpu_state.h"
+ 
+@@ -28,6 +31,22 @@ bool RelayConfigured();
+ // WAIT <present> <seats>, until GO), with how many are there. For a waiting screen (any thread).
+ bool RelayWaiting(int* present, int* seats);
+ 
++// What the waiting screen shows: one letter a seat (O expected, V there, X left: the AI's), this
++// machine's seats, and the characters known (SRNP_PERSOS; -1 when not known).
++struct WaitView
++{
++  bool waiting = false;
++  int seats = 0;
++  std::string states;
++  std::vector<int> local;
++  std::array<int, 8> characters{-1, -1, -1, -1, -1, -1, -1, -1};
++};
++WaitView RelayWaitView();
++
++// The waiting screen (srnp_waiting_screen.cpp, Gibax's mockup): while the runner waits for GO, the last
++// frame is presented again with the screen over it. Called from the emulation thread.
++void RedrawWhileWaiting();
++
+ // Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
+ // Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
+ // drawn), through a StaticRecomp host hook. Inputs are then applied, and checksums taken, at the same
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+new file mode 100644
+index 0000000..4e11196
+--- /dev/null
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -0,0 +1,162 @@
++// SR-Source Net Plus: the waiting screen, while the runner waits for the relay's GO. See srnp_relay.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// Gibax's mockup (2026-11-25): at the top, "<n> Players", "<n> Racers", "<n>/<n> Ready"; then one
++// column a seat: its label ("1P".."8P", "COM" for a seat that left and that the AI takes over), its
++// character, and its state: a blue circle while the player is still on their way (the character drawn
++// faded), a green tick once there, a red cross for a seat that left. The labels and the characters'
++// heads are the game's own pictures: they are not in this repository, so this first version draws the
++// labels in the game's colours and the characters' names.
++//
++// The emulation thread waits in the relay's hook, so the game presents no frame: like the runner's menu
++// over a paused game, the last frame is presented again, on the video thread, with the screen over it.
++
++#include "srnp_relay.hpp"
++
++#include <imgui.h>
++
++#include "VideoCommon/AsyncRequests.h"
++#include "VideoCommon/Present.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <string>
++
++namespace srnp
++{
++namespace
++{
++constexpr const char* kCharacters[] = {"Sonic",  "Tails",       "Knuckles", "Amy",  "Jet",    "Storm",
++                                       "Wave",   "Eggman",      "Cream",    "Rouge", "Shadow", "Super Sonic",
++                                       "NiGHTS", "AiAi",        "Ulala",    "E-10000G", "E-10000R"};
++
++std::atomic<bool> s_redraw_queued{false};
++
++ImU32 Rgba(int r, int g, int b, float a = 1.0f)
++{
++  return IM_COL32(r, g, b, static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f));
++}
++
++void TextCentred(ImDrawList* list, ImFont* font, float size, ImVec2 centre, ImU32 colour,
++                 const char* text)
++{
++  const ImVec2 extent = font->CalcTextSizeA(size, 1e6f, 0.0f, text);
++  const ImVec2 at(centre.x - extent.x * 0.5f, centre.y - extent.y * 0.5f);
++  // A dark outline first, as the game's HUD text has.
++  for (const ImVec2 d : {ImVec2(-2, 0), ImVec2(2, 0), ImVec2(0, -2), ImVec2(0, 2)})
++    list->AddText(font, size, ImVec2(at.x + d.x, at.y + d.y), Rgba(8, 16, 48, 0.9f), text);
++  list->AddText(font, size, at, colour, text);
++}
++
++// The label over a racer, as the game draws it: a dark blue plate, white letters, an arrow under it.
++void Label(ImDrawList* list, ImFont* font, ImVec2 centre, float unit, const char* text, bool com)
++{
++  const float w = unit * 2.2f, h = unit * 1.15f;
++  const ImVec2 a(centre.x - w * 0.5f, centre.y - h * 0.5f), b(centre.x + w * 0.5f, centre.y + h * 0.5f);
++  const ImU32 top = com ? Rgba(70, 76, 96) : Rgba(36, 70, 160);
++  const ImU32 bottom = com ? Rgba(30, 32, 44) : Rgba(12, 26, 80);
++  list->AddRectFilledMultiColor(a, b, top, top, bottom, bottom);
++  list->AddRect(a, b, Rgba(230, 236, 255), unit * 0.25f, 0, unit * 0.08f);
++  const float t = unit * 0.32f;
++  list->AddTriangleFilled(ImVec2(centre.x - t, b.y), ImVec2(centre.x + t, b.y),
++                          ImVec2(centre.x, b.y + t * 1.2f), Rgba(230, 236, 255));
++  TextCentred(list, font, unit * 0.85f, centre, Rgba(255, 255, 255), text);
++}
++
++void Draw(const WaitView& view)
++{
++  ImDrawList* list = ImGui::GetForegroundDrawList();
++  ImFont* font = ImGui::GetFont();
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  if (!list || !font || display.x <= 0.0f || display.y <= 0.0f || view.seats <= 0)
++    return;
++  const int seats = std::min(view.seats, 8);
++  const auto state = [&](int k) {
++    return k < static_cast<int>(view.states.size()) ? view.states[static_cast<std::size_t>(k)] : 'O';
++  };
++  int left = 0, ready = 0;
++  for (int k = 0; k < seats; ++k)
++  {
++    left += state(k) == 'X';
++    ready += state(k) == 'V';
++  }
++  const int players = seats - left;
++
++  list->AddRectFilled(ImVec2(0, 0), display, Rgba(6, 10, 28, 0.78f));
++  const float unit = std::min(display.y / 16.0f, display.x / (seats * 3.2f + 1.0f));
++  char line[64];
++  std::snprintf(line, sizeof(line), "%d Players", players);
++  TextCentred(list, font, unit * 1.1f, ImVec2(display.x * 0.5f, display.y * 0.14f), Rgba(255, 255, 255), line);
++  std::snprintf(line, sizeof(line), "%d Racers", seats);
++  TextCentred(list, font, unit * 1.1f, ImVec2(display.x * 0.5f, display.y * 0.22f), Rgba(255, 255, 255), line);
++  std::snprintf(line, sizeof(line), "%d/%d Ready", ready, players);
++  TextCentred(list, font, unit * 1.1f, ImVec2(display.x * 0.5f, display.y * 0.30f), Rgba(255, 214, 64), line);
++
++  const float column = unit * 3.2f;
++  const float x0 = display.x * 0.5f - column * (seats - 1) * 0.5f;
++  const double now = ImGui::GetTime();
++  for (int k = 0; k < seats; ++k)
++  {
++    const char s = state(k);
++    const float x = x0 + column * k;
++    const bool mine = std::find(view.local.begin(), view.local.end(), k) != view.local.end();
++    // The label: "nP", or "COM" for a seat the AI takes over.
++    char label[8];
++    std::snprintf(label, sizeof(label), s == 'X' ? "COM" : "%dP", k + 1);
++    Label(list, font, ImVec2(x, display.y * 0.45f), unit, label, s == 'X');
++    // The character: its name for now (the game's heads come later), faded while on the way.
++    const int character = view.characters[static_cast<std::size_t>(k)];
++    const char* name = s == 'X' ? "?" :
++                       character >= 0 && character < static_cast<int>(std::size(kCharacters)) ?
++                                         kCharacters[character] :
++                                         "...";
++    const float alpha = s == 'O' ? 0.45f : 1.0f;
++    const ImVec2 head(x, display.y * 0.60f);
++    list->AddCircleFilled(head, unit * 1.0f, s == 'O' ? Rgba(90, 140, 230, 0.35f) : Rgba(30, 40, 80, 0.85f));
++    list->AddCircle(head, unit * 1.0f, Rgba(230, 236, 255, alpha), 0, unit * 0.06f);
++    TextCentred(list, font, unit * 0.45f, head, Rgba(255, 255, 255, alpha), name);
++    // The state: blue circle (on the way, pulsing), green tick (there), red cross (left).
++    const ImVec2 mark(x, display.y * 0.76f);
++    const float r = unit * 0.45f;
++    if (s == 'V')
++    {
++      list->AddPolyline(std::array<ImVec2, 3>{ImVec2(mark.x - r, mark.y), ImVec2(mark.x - r * 0.3f, mark.y + r * 0.7f),
++                                              ImVec2(mark.x + r, mark.y - r * 0.8f)}.data(),
++                        3, Rgba(40, 200, 80), 0, unit * 0.22f);
++    }
++    else if (s == 'X')
++    {
++      list->AddLine(ImVec2(mark.x - r, mark.y - r), ImVec2(mark.x + r, mark.y + r), Rgba(230, 40, 40), unit * 0.22f);
++      list->AddLine(ImVec2(mark.x - r, mark.y + r), ImVec2(mark.x + r, mark.y - r), Rgba(230, 40, 40), unit * 0.22f);
++    }
++    else
++    {
++      const float pulse = 0.6f + 0.4f * static_cast<float>(std::sin(now * 4.0));
++      list->AddCircle(mark, r, Rgba(30, 150, 240, pulse), 0, unit * 0.2f);
++    }
++    if (mine)
++      TextCentred(list, font, unit * 0.5f, ImVec2(x, display.y * 0.86f), Rgba(255, 214, 64), "YOU");
++  }
++}
++}  // namespace
++
++void RedrawWhileWaiting()
++{
++  // One redraw queued at a time: the relay's lines come every 2 s at most, the video thread keeps up.
++  if (s_redraw_queued.exchange(true))
++    return;
++  AsyncRequests::GetInstance()->PushEvent([] {
++    s_redraw_queued = false;
++    const WaitView view = RelayWaitView();
++    if (!view.waiting || !g_presenter)
++      return;
++    Draw(view);
++    g_presenter->Present();
++    static int drawn = 0;
++    if (++drawn == 1 || drawn % 10 == 0)
++      std::fprintf(stderr, "[srnp relay] waiting screen drawn (%d): %s\n", drawn, view.states.c_str());
++  });
++}
++}  // namespace srnp
+-- 
+2.34.1.windows.1
+
