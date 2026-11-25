@@ -44,10 +44,12 @@ lance() {  # lance <siège>
   cp -a "$W/userdir_modele" "$D/userdir"
   sed -i "s/^\[Core\]\$/[Core]\nEmulationSpeed = 1.0/" "$D/userdir/Config/Dolphin.ini"
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$D/userdir/Config/Dolphin.ini"
-  mkdir -p "$D/userdir/Mods/srnp_etiquettes"
-  printf 'name=srnp_etiquettes\ngame=GXEE8P\n' > "$D/userdir/Mods/srnp_etiquettes/mod.ini"
-  powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
-  printf 'mod=srnp_etiquettes\n' >> "$D/userdir/config.ini"
+  if [[ "${ETIQ:-1}" != 0 ]]; then  # ETIQ=0 : sans le mod des étiquettes 5P-8P
+    mkdir -p "$D/userdir/Mods/srnp_etiquettes"
+    printf 'name=srnp_etiquettes\ngame=GXEE8P\n' > "$D/userdir/Mods/srnp_etiquettes/mod.ini"
+    powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
+    printf 'mod=srnp_etiquettes\n' >> "$D/userdir/config.ini"
+  fi
   local SON=--mute; [[ "$r" == "${SON_RUNNER:-0}" ]] && SON=
   (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU="${TOUS_CPU:-1}" \
      SRNP_PERSOS="$PERSOS" SRNP_INPUT=ia SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_CKDUMP="$(w "$D/ck")" \

@@ -1,0 +1,230 @@
+From 2964ee869a17e7728da1b9495c2569aaadaea268 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:04:27 +0100
+Subject: [PATCH] Runner: the scenery's zones come from camera 0 alone (the
+ missing roads with a human racer 5)
+
+Each frame the racers' update (0x8040E644) reads +0xBD: a CPU stores the zone of its position at
+0x80612BD8 + index x 4; a human also stores the zone of "its" camera's eye (0x80601A08 + index x 0xC)
+at 0x80612BC8 + index x 4 and a byte at 0x80612BC4 + index. Those tables hold 4 cameras: a human
+racer 4-7 writes over the next ones, racer 5 over the zone of camera 0, which the stage's drawing goes
+by (roads, tubes and buildings missing from ~14", characters too); with no human at all, camera 0's
+zone is never updated. Found by redirecting the game's 128 reads of +0xBD for racer 5 and halving
+(SRNP_BD5), with MEM1 and ARAM dumps (ram_masque.sh, SRNP_ARAMDUMP) to rule out the rest.
+
+During races, racer 0 alone now takes the humans' path there, whoever drives it, and every other
+racer the CPUs': camera 0's zones always come from this machine's camera (view 0 follows the seat)
+and nothing writes past the tables, as in a 1P game; the same code on every machine. SRNP_ZONES=0
+keeps the game's. Measured: whole scenery with racers 0 and 5 human, all 8 human, no human; the
+8-player demo with 8 simulated players, 8 views whole, 98 checksums equal, the race unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 105 +++++++++++++++++++++++++++++++++---
+ src/runtime/srnp_relay.cpp  |  43 ++++++++++++++-
+ 2 files changed, 141 insertions(+), 7 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index b1f5050..34277d6 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -333,12 +333,8 @@ bool GearAllows(int gear, int character)
+ // get the CPUs' flag when the race is set up (+0xBD = 1: the game then makes their AI's data) but stay
+ // driven as humans (+0xBC = 0); the AI takes them at the start. With +0xBD = 0 at setup, the AI reads
+ // data the game did not make and crashes (0x80472A30). SRNP_TOUS_CPU=ancien: both bytes at 1 at setup.
+-// Measured 2026-11-25, the scenery (roads, tubes, buildings missing after ~14"): it does not depend on
+-// these bytes at setup but on the humans' flag during the race. Missing as soon as racer 5 is a human
+-// (+0xBD = 0), whatever its character (SRNP_HUMAINS=21: racers 0 and 5 only, Ulala or Knuckles), and
+-// with no human at all; whole with racers 6 or 7 human (41, 81), or any humans among racers 0-4. For
+-// a human racer 4 the game sets up a lot of the DOL's BSS (0x801B7380, 0x801D76B0...), for racer 5
+-// nothing of it. Not understood yet.
++// The scenery that went missing in these tests (racer 5 a human, or no human at all) came from the
++// zones of the cameras: see PatchZones.
+ int AllCpuMode()
+ {
+   static const int mode = [] {
+@@ -474,6 +470,53 @@ void PatchAnimation(bool on)
+                on ? "moved on (every machine alike)" : "the game's");
+ }
+ 
++// The scenery's zones (found 2026-11-25: roads, tubes, buildings missing as soon as racer 5 was a
++// human, or with no human at all). Each frame, 0x8040E644 (in the racers' update) reads +0xBD: a CPU
++// stores the zone of its position at 0x80612BD8 + index x 4; a human also stores the zone of "its"
++// camera's eye (0x80601A08 + index x 0xC) at 0x80612BC8 + index x 4 and a byte at 0x80612BC4 + index:
++// tables of 4 cameras, so a human racer 4-7 writes over the next ones, racer 5 over the zone of camera
++// 0, which the stage's drawing goes by (and with no human, camera 0's zone is never updated). Here
++// racer 0 alone takes the humans' path, whoever drives it, and every other racer the CPUs': camera
++// 0's zones always come from this machine's camera (view 0 follows the seat), nothing writes past
++// the tables, as in a 1P game. The same code on every machine. SRNP_ZONES=0 keeps the game's.
++constexpr CodeWord kZoneWords[] = {
++    {0x8040E644, 0x881E00BD},  // lbz r0, 0xBD(r30)   -> lbz r0, 0x1029(r30) (the racer's index)
++    {0x8040E64C, 0x28000001},  // cmplwi r0, 1        -> cmplwi r0, 0
++    {0x8040E650, 0x4082002C},  // bne 0x8040E67C      -> beq 0x8040E67C (the humans' path: racer 0)
++};
++constexpr std::uint32_t kZonePatched[] = {0x881E1029, 0x28000000, 0x4182002C};
++bool s_zones_patched = false;
++
++void PatchZones(bool on)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_ZONES");
++    return v && *v == '0';
++  }();
++  if (off || on == s_zones_patched)
++    return;
++  for (std::size_t i = 0; i < std::size(kZoneWords); ++i)
++  {
++    const std::uint32_t expected = on ? kZoneWords[i].original : kZonePatched[i];
++    if (Read32(kZoneWords[i].address) != expected)
++    {
++      std::fprintf(stderr, "[srnp racers] zones: 0x%08X holds %08X, not %08X: left alone\n",
++                   kZoneWords[i].address, Read32(kZoneWords[i].address), expected);
++      return;
++    }
++  }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  for (std::size_t i = 0; i < std::size(kZoneWords); ++i)
++  {
++    if (std::uint8_t* p = Guest(kZoneWords[i].address, 4))
++      Put32(p, on ? kZonePatched[i] : kZoneWords[i].original);
++  }
++  jit.InvalidateICache(kZoneWords[0].address, 0x10, true);
++  s_zones_patched = on;
++  std::fprintf(stderr, "[srnp racers] scenery zones: %s\n",
++               on ? "camera 0's, from racer 0's path only" : "the game's");
++}
++
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+ // (finding which HUD task shows what); the game's words come back at the end of the race.
+ std::vector<std::pair<std::uint32_t, std::uint32_t>> s_test_patch_saved;
+@@ -588,7 +631,56 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+                  std::min<std::size_t>(pads.size(), count) - 1);
+     PatchHud(camera_seat);
+     PatchAnimation(true);
++    PatchZones(true);
+     PatchTest(true);
++    // SRNP_BD5=<address>,... (test, hexadecimal): those reads of the CPUs' flag (lbz rD, 0xBD(rA))
++    // see racer 5 as a CPU, through code in free low memory (0x80001810-0x80002C00, zero in races):
++    // b cave; cave: save a scratch register below the stack, rS = (racer index == 5), lbz rD,
++    // rD |= rS, restore, b back. To find which read the missing scenery comes from.
++    if (const char* v = std::getenv("SRNP_BD5"); v && *v)
++    {
++      auto& jit = Core::System::GetInstance().GetJitInterface();
++      std::uint32_t cave = 0x80001810u;
++      int patched = 0;
++      for (const char* p = v; p && *p && cave + 36u <= 0x80002C00u;)
++      {
++        char* end = nullptr;
++        const std::uint32_t site = static_cast<std::uint32_t>(std::strtoul(p, &end, 16));
++        p = (end && *end == ',') ? end + 1 : nullptr;
++        std::uint8_t* s = Guest(site, 4);
++        if (!s)
++          continue;
++        const std::uint32_t word = Get32(s);
++        if ((word >> 26) != 34u || (word & 0xFFFFu) != 0xBDu)
++        {
++          std::fprintf(stderr, "[srnp racers] SRNP_BD5: 0x%08X holds %08X, not lbz 0xBD\n", site, word);
++          continue;
++        }
++        const std::uint32_t rd = (word >> 21) & 31u, ra = (word >> 16) & 31u;
++        std::uint32_t rs = 12;
++        while (rs == rd || rs == ra)
++          --rs;
++        std::uint8_t* c = Guest(cave, 36);
++        const std::uint32_t code[9] = {
++            0x90010000u | rs << 21 | 1u << 16 | 0xFFF0u,          // stw rS, -16(r1)
++            0x88000000u | rs << 21 | ra << 16 | 0x1029u,          // lbz rS, 0x1029(rA)
++            0x68000000u | rs << 21 | rs << 16 | 5u,               // xori rS, rS, 5
++            0x7C000034u | rs << 21 | rs << 16,                    // cntlzw rS, rS
++            0x5400D97Eu | rs << 21 | rs << 16,                    // srwi rS, rS, 5
++            word,                                                 // lbz rD, 0xBD(rA)
++            0x7C000378u | rd << 21 | rd << 16 | rs << 11,         // or rD, rD, rS
++            0x80010000u | rs << 21 | 1u << 16 | 0xFFF0u,          // lwz rS, -16(r1)
++            0x48000000u | ((site + 4u - (cave + 32u)) & 0x03FFFFFCu)};  // b site + 4
++        for (int i = 0; i < 9; ++i)
++          Put32(c + 4 * i, code[i]);
++        jit.InvalidateICache(cave, 36, true);
++        Put32(s, 0x48000000u | ((cave - site) & 0x03FFFFFCu));  // b cave
++        jit.InvalidateICache(site, 4, true);
++        cave += 36u;
++        ++patched;
++      }
++      std::fprintf(stderr, "[srnp racers] SRNP_BD5: %d reads of +0xBD see racer 5 as a CPU\n", patched);
++    }
+     // SRNP_HUMAINS=<hex mask> (tests): racer k gets the humans' flag (+0xBD = 0) when bit k is set,
+     // whoever drives it, the CPUs' (1) otherwise: what the stage's scenery makes of the humans.
+     static const int humans = [] {
+@@ -614,6 +706,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     s_race = false;
+     PatchHud(0);
+     PatchAnimation(false);
++    PatchZones(false);
+     PatchTest(false);
+     std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
+     return false;
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 2dbe520..773dd53 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -40,6 +40,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "Core/HW/DSP.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/System.h"
+ #include "Core/HW/GCPad.h"
+@@ -548,9 +549,49 @@ std::uint32_t GameFrameHookAddress()
+   return address;
+ }
+ 
++// SRNP_ARAMDUMP=<frame>,<frame>...:<folder> (tests): the 16 MB of ARAM written to
++// <folder>/aram_<frame>.bin at those frames of the game.
++void AramDump(std::uint64_t frame)
++{
++  static const auto plan = [] {
++    std::pair<std::vector<std::uint64_t>, std::string> p;
++    const char* v = std::getenv("SRNP_ARAMDUMP");
++    if (!v)
++      return p;
++    const std::string text(v);
++    const std::size_t colon = text.find(':', 2);
++    if (colon == std::string::npos)
++      return p;
++    p.second = text.substr(colon + 1);
++    std::size_t at = 0;
++    while (at < colon)
++    {
++      p.first.push_back(std::strtoull(text.c_str() + at, nullptr, 10));
++      const std::size_t comma = text.find(',', at);
++      if (comma == std::string::npos || comma > colon)
++        break;
++      at = comma + 1;
++    }
++    return p;
++  }();
++  if (plan.first.empty() || std::find(plan.first.begin(), plan.first.end(), frame) == plan.first.end())
++    return;
++  const u8* aram = Core::System::GetInstance().GetDSP().GetARAMPtr();
++  const std::string path = plan.second + "/aram_" + std::to_string(frame) + ".bin";
++  if (std::FILE* f = std::fopen(path.c_str(), "wb"))
++  {
++    std::fwrite(aram, 1, DSP::ARAM_SIZE, f);
++    std::fclose(f);
++    std::fprintf(stderr, "[srnp relay] ARAM written at frame %llu: %s\n",
++                 static_cast<unsigned long long>(frame), path.c_str());
++  }
++}
++
+ void GameFrameHook(CPUState*)
+ {
+-  RelayStep(s_game_frames.fetch_add(1, std::memory_order_relaxed) + 1);
++  const std::uint64_t frame = s_game_frames.fetch_add(1, std::memory_order_relaxed) + 1;
++  AramDump(frame);
++  RelayStep(frame);
+ }
+ 
+ std::uint64_t RelayGameFrames()
+-- 
+2.34.1.windows.1
+

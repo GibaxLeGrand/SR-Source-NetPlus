@@ -89,11 +89,18 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
     leaves them driven as humans (`+0xBC` = 0); the AI takes them at the start (with `+0xBD` = 0 at
     setup, the AI crashes). `SRNP_TOUS_CPU=ancien`: the old way;
   - test switches: `SRNP_IA_JOUEURS=<n>` (seats 0 to n-1 simulated players), `SRNP_HUMAINS=<hex mask>`
-    (the humans' flag at the start). Measured with them: **the stage's scenery goes missing (roads,
-    tubes, buildings after ~14") as soon as racer 5 is a human**, whatever its character, and with no
-    human at all; racers 6 or 7 human, or any humans among racers 0-4, keep it whole. Not understood
-    yet: a real 8-player game has a human racer 5. `ram_masque.sh <mask> <frames>`: MEM1 at frames of
-    the game, one runner, for such comparisons.
+    (the humans' flag at the start). With them: the stage's scenery went missing (roads, tubes,
+    buildings after ~14") as soon as racer 5 was a human, whatever its character, and with no human at
+    all. `ram_masque.sh <mask> <frames>`: MEM1 at frames of the game, one runner, for such comparisons.
+- Patch 0026, the missing scenery fixed: the racers' update (0x8040E644) stores, for each human racer,
+  the zone of "its" camera in tables of 4 cameras (0x80612BC8, 0x80612BC4); a human racer 4-7 wrote
+  past them, racer 5 over camera 0's zone, which the drawing goes by (and with no human, camera 0's zone
+  was never updated). During races racer 0 alone takes the humans' path there, every other racer the
+  CPUs': camera 0's zones come from the machine's own camera, as in a 1P game, the same code on every
+  machine (`SRNP_ZONES=0` keeps the game's). Found with `SRNP_BD5=<addresses>` (those reads of `+0xBD`
+  see racer 5 as a CPU, through code in free low memory) by halving the game's 128 reads, after MEM1
+  and ARAM dumps (`SRNP_ARAMDUMP=<frames>:<folder>`). 8-player demo, 8 simulated players: the 8 views
+  whole, 0 divergences, the race unchanged.
 - `demo_8.sh [frame 1] [frame 2] [frame 3]`: the 8-player demo on one PC (leftovers of an earlier demo
   are stopped, other sessions' runners waited for; `N=<seats>`, `TOUS_CPU`): the waiting screen fills up, then the race, photos of the 8 windows at
   three frames of the game, and contact sheets.
