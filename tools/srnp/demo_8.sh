@@ -125,10 +125,25 @@ vide_ram() {  # vide_ram <frame>
   commande 0 "$nom" "command=read_memory\naddress=0x80000000\nsize=16777216\npath=$(w "$f" | sed 's/\\/\\\\/g')\n"
   for i in $(seq 1 120); do [[ -f "$RUN/runner0/auto/processed/$nom.txt" ]] && break; sleep 0.5; done
 }
+# ECRIT="<frame>=<adresse>:<hex>,..." : à la pause de cette frame, ces octets écrits sur TOUS les runners
+#    (la même frame partout : la course reste la même pour tous ; pour tester une situation donnée).
+ecrit() {  # ecrit <frame>
+  local e
+  for e in ${ECRIT//,/ }; do
+    [[ "${e%%=*}" == "$1" ]] || continue
+    local a="${e#*=}"; a="${a%%:*}" h="${e##*:}"
+    for r in $(seq 0 $((N - 1))); do commande $r "e$1$r" "command=write_memory\naddress=$a\ndata=$h\n"; done
+    for r in $(seq 0 $((N - 1))); do
+      for i in $(seq 1 60); do [[ -f "$RUN/runner$r/auto/processed/e$1$r.txt" ]] && break; sleep 0.25; done
+    done
+    echo "$(date +%T) frame $1 : $h écrit en $a sur les $N runners"
+  done
+}
 for c in "${CAPTS[@]}"; do
   pause_a "$c"
   for r in $(seq 0 $((N - 1))); do fenetre $r "course_f$c"; done
   [[ "${VIDAGE:-0}" == 1 ]] && vide_ram "$c"
+  [[ -n "${ECRIT:-}" ]] && ecrit "$c"
   echo "$(date +%T) photos à la frame $c"
   reprise "$c"
 done

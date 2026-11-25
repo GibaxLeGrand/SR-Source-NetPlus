@@ -1,0 +1,63 @@
+From 08fb6a138242a822af7725365a01f1f5e07ee260 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 22:10:18 +0100
+Subject: [PATCH] Runner: "LEVEL UP!!" for this machine's seat
+
+The level is worked out for every racer on every machine (0x80431CD0, called from the HUD's code):
+measured by giving racer 0 forty rings on all runners at one paused frame, level 3 everywhere and no
+divergence. Its display task (0x804205C4) is made for every racer alike and, in its first state, goes
+on to the 1P drawing whenever the player count is 1: every racer's level change showed on every screen
+(seen: Sonic's "LEVEL UP!!" over Shadow's and Tails's HUD). During the race the task's racer index is
+compared with the seat (0x8042065C, 0x80420660) and the other racers' tasks go to their end (state 1,
+0x80420678) instead of the multi-screen drawing: the task, its sound and bookkeeping stay the same
+everywhere; only its table entry (a display pointer, outside the racers' checksum) is cleared sooner.
+Measured on the same race: "LEVEL UP!!" on Sonic's screen alone, Shadow's and Tails's HUD whole; 36
+identical checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 30d1bb7..4d00d22 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -638,6 +638,26 @@ SeatDisplay s_tricks{
+       return i == 0 ? 0x28000000u | static_cast<std::uint32_t>(seat + 1) : 0x40820790u;
+     }};
+ 
++// "LEVEL UP!!" (and the level down): the level is worked out for every racer on every machine
++// (0x80431CD0; measured on 2026-11-25: 40 rings given to racer 0 on all runners, level 3 everywhere,
++// no divergence), and its display task (0x804205C4) is made for every racer alike, kept at
++// 0x80612984[index]; in its first state (0x80420638) the task goes on to the 1P drawing (state 3) when the
++// player count is 1, so every racer's level change showed on every screen. Written: lbz r0, 0x1029(r19)
++// (the task's racer index); cmplwi r0, <seat>; and the other racers' tasks go to state 1 (their end:
++// the table entry cleared, the task deleted) instead of 5. The task, its sound and its bookkeeping stay
++// the same everywhere; only that table entry (a display task's pointer, outside the racers' checksum,
++// RacersHash) is cleared sooner on the other machines.
++SeatDisplay s_level_up{
++    "level up",
++    {{0x8042065C, 0x8003B8C8},   // lwz r0, -0x4738(r3) (the player count)
++     {0x80420660, 0x28000001},   // cmplwi r0, 1
++     {0x80420678, 0x38000005}},  // li r0, 5
++    3,
++    [](std::size_t i, int seat) {
++      constexpr std::uint32_t words[] = {0x88131029u, 0x28000000u, 0x38000001u};
++      return i == 1 ? words[1] | static_cast<std::uint32_t>(seat) : words[i];
++    }};
++
+ void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+@@ -676,6 +696,7 @@ void PatchSeatDisplays(int seat)
+ {
+   PatchSeatDisplay(s_item_boxes, seat);
+   PatchSeatDisplay(s_tricks, seat);
++  PatchSeatDisplay(s_level_up, seat);
+ }
+ 
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+-- 
+2.34.1.windows.1
+
