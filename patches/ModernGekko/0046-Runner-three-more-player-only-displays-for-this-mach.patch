@@ -1,0 +1,81 @@
+From eb1dfac6f537133e292347d3a368c497427a42f0 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 23:31:51 +0100
+Subject: [PATCH] Runner: three more player-only displays for this machine's
+ seat
+
+The game makes three more display tasks for its players only (index under the player count), each
+right after such a test: 0x8040E99C (task 0x804BDC8C, when the racer's +0xB10 state changes),
+0x8059F324 (task 0x805B63F4, given the racer), 0x804E1A78 (task 0x804A4F2C, kept at the racer's +0x894).
+During the race they are made for the seat's racer (li r0, <seat>; bne), like the tricks' display.
++0x894 (a display task's address, made on one machine only now) is left out of the racers' checksum
+with +0x898. What they show is not seen yet: the turbulence prompts Gibax saw on Knuckles's screen (from
+Sonic, racer 0) are not these (still there with them). Measured: same race, 53 identical checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 34 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index e51c068..50fc012 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -683,6 +683,32 @@ SeatDisplay s_racers_drawn{
+       }
+     }};
+ 
++// Three more displays the game starts for its players only (index under the player count), found by
++// their task creations after such a test (2026-11-25; Gibax: Sonic's route icon and stick prompt on
++// Knuckles's screen): 0x8040E99C (task 0x804BDC8C, when the racer's +0xB10 state changes), 0x8059F324
++// (task 0x805B63F4, given the racer), 0x804E1A78 (task 0x804A4F2C, kept at the racer's +0x894: left out
++// of the racers' checksum). Written: li r0, <seat> in place of the player count; bne in place of bge.
++// What follows each test only makes the task.
++constexpr std::uint32_t kPlayerCountLoad = 0x8003B8C8;  // lwz r0, -0x4738(r3) (0x8021B8C8)
++SeatDisplay s_prompts_a{"player displays (0x8040E99C)",
++                        {{0x8040E99C, kPlayerCountLoad}, {0x8040E9A4, 0x40800044}},  // bge 0x8040E9E8
++                        2,
++                        [](std::size_t i, int seat) {
++                          return i == 0 ? 0x38000000u | static_cast<std::uint32_t>(seat) : 0x40820044u;
++                        }};
++SeatDisplay s_prompts_b{"player displays (0x8059F324)",
++                        {{0x8059F324, kPlayerCountLoad}, {0x8059F330, 0x40800024}},  // bge 0x8059F354
++                        2,
++                        [](std::size_t i, int seat) {
++                          return i == 0 ? 0x38000000u | static_cast<std::uint32_t>(seat) : 0x40820024u;
++                        }};
++SeatDisplay s_prompts_c{"player displays (0x804E1A78)",
++                        {{0x804E1A78, kPlayerCountLoad}, {0x804E1A80, 0x4080006C}},  // bge 0x804E1AEC
++                        2,
++                        [](std::size_t i, int seat) {
++                          return i == 0 ? 0x38000000u | static_cast<std::uint32_t>(seat) : 0x4082006Cu;
++                        }};
++
+ void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+@@ -723,6 +749,9 @@ void PatchSeatDisplays(int seat)
+   PatchSeatDisplay(s_tricks, seat);
+   PatchSeatDisplay(s_level_up, seat);
+   PatchSeatDisplay(s_racers_drawn, seat);
++  PatchSeatDisplay(s_prompts_a, seat);
++  PatchSeatDisplay(s_prompts_b, seat);
++  PatchSeatDisplay(s_prompts_c, seat);
+ }
+ 
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+@@ -1005,8 +1034,9 @@ std::uint64_t RacersHash()
+       {0x84C, 0x858}, {0x8BC, 0x8C0}, {0x8DB, 0x8DC},
+       // A task's address (its state byte at +20: 0x80491A2C ends it): the task pool's slot differs
+       // when the displays shown for this machine's seat alone have taken slots (measured with Gibax,
+-      // Amy, 2026-11-25: 0x803DFD08 against 0x803DFC48, one 0xC0 slot apart; the race the same).
+-      {0x898, 0x89C}};
++      // Amy, 2026-11-25: 0x803DFD08 against 0x803DFC48, one 0xC0 slot apart; the race the same); and
++      // +0x894, the same for the display task 0x804A4F2C started for this machine's seat alone.
++      {0x894, 0x89C}};
+   // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
+   // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+-- 
+2.34.1.windows.1
+
