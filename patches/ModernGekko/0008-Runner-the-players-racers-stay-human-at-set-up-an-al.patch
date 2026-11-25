@@ -1,0 +1,68 @@
+From 410807109b66542a26c7490377b2dc6ceaafee29 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:43:54 +0100
+Subject: [PATCH] Runner: the players' racers stay human at set-up; an all-AI
+ test input
+
+- At set-up, only the non-player racers are made CPUs (SRNP_TOUS_CPU=1
+  for all, as before): a race with no human racer at set-up was taken
+  for one with missing scenery; the real cause was the random test
+  inputs, which throw racers off the track (onto the tubes' roofs).
+  Keeping the menu's human is closer to the game anyway.
+- SRNP_INPUT=ia: every seat gives its racer to the AI (seat 0 presses
+  Start in the menus): the game's own race, with the runner's hooks.
+
+Measured: with SRNP_INPUT=ia, camera and HUD on racers 5 and 2, the
+scenery is the game's (tube, roads, buildings) at 14-16 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 11 ++++++++++-
+ src/runtime/srnp_relay.cpp  |  9 +++++++++
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index a3c23cd..61a92f7 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -312,7 +312,16 @@ void SetUpRace(std::uint8_t* racers)
+       if (fallback >= 0)
+         racer[0xBB] = static_cast<std::uint8_t>(fallback);
+     }
+-    racer[kControl] = racer[0xBD] = 1;
++    // The players' racers (the menu's humans) stay human: with no human racer when the race is set
++    // up, the stage's scenery stops loading around the racers (they ride on roads that are not
++    // drawn; 2026-11-25). Only the others are made CPUs (the AI can take their seats back);
++    // SRNP_TOUS_CPU=1 makes every racer a CPU, as before.
++    static const bool all_cpu = [] {
++      const char* v = std::getenv("SRNP_TOUS_CPU");
++      return v && *v == '1';
++    }();
++    if (all_cpu || k >= Read32(kPlayerCount))
++      racer[kControl] = racer[0xBD] = 1;
+   }
+ }
+ }  // namespace
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 1c3069f..5d50a9d 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -154,6 +154,15 @@ std::uint64_t Mix(std::uint64_t x)
+ Pad LocalInput(std::uint64_t frame, int seat)
+ {
+   Pad pad{};
++  if (s_relay.input_mode == "ia")
++  {
++    // Every seat gives its racer to the AI (seat 0 presses Start in the menus, as in "course").
++    if (RaceFrame() < 0 && seat == 0 && frame % 120 < 5)
++      pad[1] = 0x20;
++    else if (RaceFrame() >= 0)
++      pad[0] = static_cast<std::uint8_t>(kSeatAI >> 8);
++    return pad;
++  }
+   if (s_relay.input_mode == "course")
+   {
+     // Racing test input: outside races, seat 0 presses Start for 5 frames every 120 (menus);
+-- 
+2.34.1.windows.1
+
