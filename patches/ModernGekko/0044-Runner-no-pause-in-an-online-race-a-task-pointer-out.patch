@@ -1,0 +1,63 @@
+From 44a4eeb4825d61d96ee07d86508ac4395eef2106 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 23:02:16 +0100
+Subject: [PATCH] Runner: no pause in an online race; a task pointer out of the
+ racers' checksum
+
+Gibax's tests: the game's pause opened on his machine alone while the other went on; Start no longer
+leaves a seat while its racer is driven (the menus before and after the race keep it).
+The racers' field +0x898 holds a task's address: the task pool's slot differs when the displays shown
+for this machine's seat alone have taken slots (5 "divergences" in one of his races, one 0xC0 slot
+apart, the race itself the same): left out of RacersHash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp |  6 +++++-
+ src/runtime/srnp_relay.cpp  | 13 +++++++++++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 4d00d22..7728176 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -976,7 +976,11 @@ std::uint64_t RacersHash()
+       // Written by the characters' own drawing functions (the tables around 0x805E3FF0, for the racers
+       // the camera sees) and read by the drawing only; the race logic resets them (0x8049195C):
+       // measured in the 8-player demo, Shadow seen close up (2026-11-25).
+-      {0x84C, 0x858}, {0x8BC, 0x8C0}, {0x8DB, 0x8DC}};
++      {0x84C, 0x858}, {0x8BC, 0x8C0}, {0x8DB, 0x8DC},
++      // A task's address (its state byte at +20: 0x80491A2C ends it): the task pool's slot differs
++      // when the displays shown for this machine's seat alone have taken slots (measured with Gibax,
++      // Amy, 2026-11-25: 0x803DFD08 against 0x803DFC48, one 0xC0 slot apart; the race the same).
++      {0x898, 0x89C}};
+   // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
+   // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index bed3122..8800ede 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -274,7 +274,20 @@ Pad RealPad()
+   return pad;
+ }
+ 
++Pad LocalInputOf(std::uint64_t frame, int seat);
++
++// No pause in an online race (Gibax, 2026-11-25: the game's pause opened on his machine alone, the
++// other went on): Start never leaves a seat while its racer is driven (the game's menus before and
++// after keep it).
+ Pad LocalInput(std::uint64_t frame, int seat)
++{
++  Pad pad = LocalInputOf(frame, seat);
++  if (RaceFrame() >= 0)
++    pad[1] = static_cast<std::uint8_t>(pad[1] & ~0x20u);  // Start
++  return pad;
++}
++
++Pad LocalInputOf(std::uint64_t frame, int seat)
+ {
+   Pad pad{};
+   // The lobby through the game's menus: everyone has chosen already; from the start state, seat 0
+-- 
+2.34.1.windows.1
+
