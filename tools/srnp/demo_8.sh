@@ -9,9 +9,10 @@
 #   - photos des 8 fenêtres aux frames du jeu CAPT1, CAPT2, CAPT3 (pause à la même frame partout :
 #     SRNP_PAUSE_JEU=1) ; sommes de contrôle du relais ; SRNP_IA_JOUEUR=1 : racers « nP » conduits par l IA ;
 #   - planches (une par moment) dans le dossier du run.
-#   demo_8.sh [CAPT1] [CAPT2] [CAPT3]
+#   demo_8.sh [CAPT...]   (frames du jeu, défaut 1900 3125 5650 ; au moins ~400 frames d'écart : sinon la
+#   pause arrive après la frame visée et chaque runner s'arrête où il en est)
 set -uo pipefail
-C1="${1:-1900}"; C2="${2:-3125}"; C3="${3:-5650}"   # frames du jeu (SRNP_PAUSE_JEU)
+CAPTS=("${@:-}"); [[ -z "${CAPTS[0]:-}" ]] && CAPTS=(1900 3125 5650)   # frames du jeu (SRNP_PAUSE_JEU)
 N="${N:-8}"
 W=/d/_SonicRidersSource/work
 CHASSIS="${CHASSIS:-$W/chassis_p2}"
@@ -118,7 +119,7 @@ for s in ${PHOTOS_ATTENTE:-}; do
   echo "$(date +%T) photos de l'attente à ${s} s"
 done
 # 3. La course : trois moments, les 8 fenêtres.
-for c in "$C1" "$C2" "$C3"; do
+for c in "${CAPTS[@]}"; do
   pause_a "$c"
   for r in $(seq 0 $((N - 1))); do fenetre $r "course_f$c"; done
   echo "$(date +%T) photos à la frame $c"
