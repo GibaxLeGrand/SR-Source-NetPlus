@@ -1,0 +1,320 @@
+From ab3db7668c958ff0e244de24665f516646d8e3b1 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:07:46 +0100
+Subject: [PATCH] Runner: each seat's HUD, lobby characters, racer count (phase
+ 2)
+
+- The 1P HUD task shows the local seat's racer: on this machine only,
+  three words of its code are changed (the racer it reads; the player's
+  level function it calls keeps racer 0, as on every machine, since it
+  writes the racer's level, air and top speed). The native core runs
+  that function from RAM. Rank and lap still show racer 0's.
+- SRNP_PERSOS=<character>/<gear>,...: between the menu's writing of the
+  racers (after Start) and the start of the race, every present writes
+  the seats' characters and gears (duplicates allowed) and makes every
+  racer a CPU, so that the AI can take any seat's racer back.
+- SRNP_NB_RACERS=<n>: the race is set up with n racers (the menu only
+  makes 8, or 4 with 3 players or more).
+- The race is taken at phase 0xE only (0x10 while it loads: the game
+  still writes the racers then). Outside races, seat 0 drives the menus
+  through pad 0; in a race, pad 0 stays neutral.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 165 ++++++++++++++++++++++++++++++++++--
+ src/runtime/srnp_racers.hpp |  14 ++-
+ src/runtime/srnp_relay.cpp  |  23 +++--
+ 3 files changed, 187 insertions(+), 15 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 76a5673..fb6d3f4 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -3,12 +3,14 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #include "srnp_racers.hpp"
+ 
++#include <algorithm>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <utility>
+ 
+ #include "Core/HW/Memmap.h"
++#include "Core/PowerPC/JitInterface.h"
+ #include "Core/System.h"
+ 
+ namespace srnp
+@@ -148,30 +150,175 @@ struct SeatState
+ std::array<SeatState, 8> s_seats;
+ bool s_race = false;
+ std::uint64_t s_frames = 0;
++
++// The 1P HUD (0x8042D42C, a task, called through a pointer) shows racer 0: its address is set once
++// (0x8042D440) and kept in r26. The same function calls the player's level function (0x80431CD0:
++// level, air, top speed of the racer it is given) with r26 and the racer's rings: that call must
++// stay on racer 0 on every machine. So, on this machine only, the display reads racer `seat` and
++// the call is given racer 0 back (r26 - seat x 0x1080). The function then runs from RAM (the native
++// core hands a chunk whose code changed to its fallback JIT). SRNP_HUD=0 leaves the HUD alone.
++struct CodeWord
++{
++  std::uint32_t address, original;
++};
++constexpr CodeWord kHudCode[] = {
++    {0x8042D440, 0x39049440},  // addi r8, r4, -0x6BC0 (racer 0)
++    {0x8042EEF4, 0x7F43D378},  // mr r3, r26
++    {0x8042EEF8, 0x809A0B98},  // lwz r4, 0xB98(r26)
++    {0x8042BC10, 0x39C49440},  // addi r14, r4, -0x6BC0: racer 0 in the HUD task 0x8042BBEC (rank?)
++};
++int s_hud_seat = 0;
++
++void PatchHud(int seat)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_HUD");
++    return v && *v == '0';
++  }();
++  if (off || seat < 0 || seat > 7 || seat == s_hud_seat)
++    return;
++  const std::uint32_t shift = static_cast<std::uint32_t>(seat) * kRacerSize;
++  const std::uint32_t patched[] = {
++      0x39040000u | ((0x9440u + shift) & 0xFFFFu),           // addi r8, r4, -0x6BC0 + shift
++      seat ? 0x387A0000u | ((0u - shift) & 0xFFFFu) : 0x7F43D378u,  // addi r3, r26, -shift
++      0x809A0000u | ((0x0B98u - shift) & 0xFFFFu),           // lwz r4, 0xB98 - shift(r26)
++      0x39C40000u | ((0x9440u + shift) & 0xFFFFu),           // addi r14, r4, -0x6BC0 + shift
++  };
++  if (s_hud_seat == 0)  // the game's code must be there (same game, same version)
++  {
++    for (const CodeWord& word : kHudCode)
++    {
++      if (Read32(word.address) != word.original)
++      {
++        std::fprintf(stderr, "[srnp racers] HUD: 0x%08X holds %08X, not %08X: left alone\n",
++                     word.address, Read32(word.address), word.original);
++        return;
++      }
++    }
++  }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  for (std::size_t i = 0; i < std::size(kHudCode); ++i)
++  {
++    if (std::uint8_t* p = Guest(kHudCode[i].address, 4))
++      Put32(p, patched[i]);  // seat 0: the game's own words
++    jit.InvalidateICache(kHudCode[i].address, 4, true);
++  }
++  s_hud_seat = seat;
++  std::fprintf(stderr, "[srnp racers] HUD shows racer %d\n", seat);
++}
++
++// SRNP_PERSOS: the seats' characters and gears (-1: the game's choice).
++struct Choice
++{
++  int character = -1, gear = -1;
++};
++const std::array<Choice, 8>& Lobby()
++{
++  static const std::array<Choice, 8> lobby = [] {
++    std::array<Choice, 8> out{};
++    const char* v = std::getenv("SRNP_PERSOS");
++    for (std::size_t k = 0; v && *v && k < 8; ++k)
++    {
++      char* end = nullptr;
++      out[k].character = static_cast<int>(std::strtol(v, &end, 0));
++      if (*end == '/')
++        out[k].gear = static_cast<int>(std::strtol(end + 1, &end, 0));
++      v = *end == ',' ? end + 1 : end;
++    }
++    return out;
++  }();
++  return lobby;
++}
++bool HasLobby()
++{
++  for (const Choice& c : Lobby())
++    if (c.character >= 0)
++      return true;
++  return false;
++}
++std::uint32_t s_last_count = 0;
++bool s_setting_up = false;
++std::uint64_t s_race_start = 0;
++
++// SRNP_NB_RACERS=<n>: the number of racers the race is set up with (the menu only makes 8, or 4
++// with 3 or more players).
++int NbRacers()
++{
++  static const int n = [] {
++    const char* v = std::getenv("SRNP_NB_RACERS");
++    const int x = v ? std::atoi(v) : 0;
++    return x >= 1 && x <= 8 ? x : 0;
++  }();
++  return n;
++}
++
++// Between the menu's writing of the racers (after Start, the racer count leaves 1, the Player
++// Entry's) and the start of the race, at every present: the lobby's characters and gears, the
++// racer count, and the racers as CPUs. Measured on 2026-11-25: written at the present after the
++// menu's, they are what the race loads (racer 1 stays Sonic; 8 CPUs: same grid, a whole race).
++void SetUpRace(std::uint8_t* racers)
++{
++  const std::uint32_t count = Read32(kRacerCount);
++  if (count != 1 && s_last_count == 1 && (HasLobby() || NbRacers()))
++  {
++    s_setting_up = true;
++    std::fprintf(stderr, "[srnp racers] race being set up: lobby characters, %d racers, all CPUs\n",
++                 NbRacers() ? NbRacers() : static_cast<int>(count));
++  }
++  s_last_count = count;
++  if (!s_setting_up || racers[kRacerSize + 0xBA] == 0xFF)
++    return;
++  if (NbRacers())
++    if (std::uint8_t* p = Guest(kRacerCount, 4))
++      Put32(p, static_cast<std::uint32_t>(NbRacers()));
++  for (std::size_t k = 0; k < 8; ++k)
++  {
++    std::uint8_t* racer = racers + k * kRacerSize;
++    const Choice& c = Lobby()[k];
++    if (c.character >= 0)
++      racer[0xBA] = racer[0xBF] = static_cast<std::uint8_t>(c.character);
++    if (c.gear >= 0)
++      racer[0xBB] = static_cast<std::uint8_t>(c.gear);
++    racer[kControl] = racer[0xBD] = 1;
++  }
++}
+ }  // namespace
+ 
+-void DriveRacers(const std::vector<Pad>& pads, int camera_seat)
++long long RaceFrame()
++{
++  return s_race ? static_cast<long long>(s_frames - s_race_start) : -1;
++}
++
++bool DriveRacers(const std::vector<Pad>& pads, int camera_seat)
+ {
+   ++s_frames;
+   std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
+   std::uint8_t* seat_pads = Guest(kSeatPads, 8 * kPadSize);
+   if (!racers || !seat_pads)
+-    return;
++    return false;
++  if (!s_race)
++    SetUpRace(racers);
+   const std::uint32_t phase = Read32(kRacePhase);
+-  const bool racing = Read32(kRacerCount) == 8 && (phase == 0x10 || phase == 0xE);
++  const std::uint32_t count = Read32(kRacerCount);
++  // 0xE: the race is set up (0x10 while it loads: the game still writes the racers then).
++  const bool racing = count >= 2 && count <= 8 && phase == 0xE;
+   if (racing && !s_race && Get32(racers) == kGamePads)
+   {
+     // A race the game has set up (racer 0 points to port 0's structure), not taken yet.
+     s_race = true;
++    s_setting_up = false;
++    s_race_start = s_frames;
+     s_seats = {};
+     for (std::size_t k = 0; k < 8; ++k)
+       s_seats[k].cpu_at_start = racers[k * kRacerSize + kControl] == 1;
+     std::memset(seat_pads, 0, 8 * kPadSize);
+-    std::fprintf(stderr, "[srnp racers] race (phase 0x%X): %zu seats drive racers 0-%zu\n", phase,
+-                 pads.size(), pads.size() - 1);
++    std::fprintf(stderr, "[srnp racers] race of %u racers: %zu seats drive racers 0-%zu\n", count,
++                 std::min<std::size_t>(pads.size(), count),
++                 std::min<std::size_t>(pads.size(), count) - 1);
++    PatchHud(camera_seat);
+   }
+   if (!s_race)
+-    return;
++    return false;
+   if (!racing)
+   {
+     // Race over: the AI finishes for the seats still driven (the game's CPUs only: the AI of a
+@@ -180,10 +327,11 @@ void DriveRacers(const std::vector<Pad>& pads, int camera_seat)
+       if (!s_seats[k].released && s_seats[k].written == 0 && s_seats[k].cpu_at_start)
+         racers[k * kRacerSize + kControl] = 1;
+     s_race = false;
++    PatchHud(0);
+     std::fprintf(stderr, "[srnp racers] race phase 0x%X: racers back to the game\n", phase);
+-    return;
++    return false;
+   }
+-  for (std::size_t k = 0; k < pads.size() && k < 8; ++k)
++  for (std::size_t k = 0; k < pads.size() && k < count; ++k)
+   {
+     std::uint8_t* racer = racers + k * kRacerSize;
+     SeatState& seat = s_seats[k];
+@@ -218,6 +366,7 @@ void DriveRacers(const std::vector<Pad>& pads, int camera_seat)
+   if (camera_seat >= 0 && camera_seat < 8)
+     if (std::uint8_t* camera = Guest(kCameraRacer, 1))
+       *camera = static_cast<std::uint8_t>(camera_seat);
++  return true;
+ }
+ 
+ std::uint64_t RacersHash()
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 9d0a9bc..62b9464 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -23,8 +23,18 @@ namespace srnp
+ using Pad = std::array<std::uint8_t, 8>;
+ constexpr std::uint16_t kSeatAI = 0x8000;
+ 
+-// On the emulation thread, after a present, with the official inputs of the next frame.
+-void DriveRacers(const std::vector<Pad>& pads, int camera_seat);
++// On the emulation thread, after a present, with the official inputs of the next frame. Returns
++// false outside races (the caller then gives seat 0's input to pad 0: seat 0 drives the menus).
++//
++// SRNP_PERSOS=<character>/<gear>,... (one per seat, as the racer's +0xBA and +0xBB: 0 Sonic,
++// 1 Tails, 2 Knuckles, 3 Amy, 4 Jet, 5 Storm, 6 Wave, 16 E-10000R...; gear 0 = the character's
++// own): once the menu has set the race up (racer count 8) and until the race starts, every present
++// writes them to the racers, duplicates allowed, and makes the 8 racers CPUs (so that the AI can
++// take any seat's racer back).
++bool DriveRacers(const std::vector<Pad>& pads, int camera_seat);
++
++// Frames since the runner took the race (the first frame it drove the racers), or -1.
++long long RaceFrame();
+ 
+ // FNV-1a 64 of the 8 racers, without the fields that follow the camera (measured on 2026-11-25).
+ std::uint64_t RacersHash();
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 3467cbc..6a165da 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -156,10 +156,17 @@ Pad LocalInput(std::uint64_t frame, int seat)
+   Pad pad{};
+   if (s_relay.input_mode == "course")
+   {
+-    // Racing test input: forward with a steer that changes every 20 frames, A now and then; seat k
+-    // drives for 600 + 300 k frames from the first input, then gives its racer to the AI for good.
+-    static const std::uint64_t first = frame;
+-    if (frame - first >= 600u + 300u * static_cast<std::uint64_t>(seat))
++    // Racing test input: outside races, seat 0 presses Start for 5 frames every 120 (menus);
++    // in a race, forward with a steer that changes every 20 frames, A now and then; seat k drives
++    // for 600 + 300 k frames from the start of the race, then gives its racer to the AI for good.
++    const long long race = RaceFrame();
++    if (race < 0)
++    {
++      if (seat == 0 && frame % 120 < 5)
++        pad[1] = 0x20;  // Start
++      return pad;
++    }
++    if (race >= 600 + 300 * seat)
+     {
+       pad[0] = static_cast<std::uint8_t>(kSeatAI >> 8);
+       return pad;
+@@ -439,7 +446,13 @@ void RelayOnFrame(std::uint64_t frame)
+ 
+   const std::vector<Pad>& pads = s_relay.official[next];
+   if (s_relay.racers)
+-    DriveRacers(pads, s_relay.camera);
++  {
++    // Outside races, seat 0 drives the menus through pad 0 (the same frames on every machine); in
++    // a race, pad 0 is left neutral (the racers have their own structures; no pause).
++    const bool racing = DriveRacers(pads, s_relay.camera);
++    if (!pads.empty())
++      ApplyPad(0, racing ? Pad{} : pads[0]);
++  }
+   else
+     for (std::size_t port = 0; port < pads.size() && port < 4; ++port)
+       ApplyPad(static_cast<int>(port), pads[port]);
+-- 
+2.34.1.windows.1
+

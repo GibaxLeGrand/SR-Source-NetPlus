@@ -12,13 +12,13 @@
 # Env : DELAI_MS (relais, 100), VITESSE (EmulationSpeed, 0.0 = libre), RUNNER (exe), ETIQUETTE.
 set -uo pipefail
 N="${1:?runners}"; MODE="${2:?natif ou jit}"; CAPT="${3:-10800}"; FIN="${4:-14400}"
-SIEGES=8; K=$((SIEGES / N))
+SIEGES="${SIEGES:-8}"; K=$((SIEGES / N))
 W=/d/_SonicRidersSource/work
 CHASSIS=/d/_SonicRidersSource/SR-Source-NetPlus/build/chassis
 PY="/c/Program Files/Python313/python.exe"
 RELAIS=/d/_SonicRidersSource/SR-Source-NetPlus/tools/srnp/relais.py
 STATE="${ETAT:-$W/states/gxee8p_course8cpu_metal_1tour_jit.sav}"
-RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-lockstep2-$N-$MODE${ETIQUETTE:+-$ETIQUETTE}"
+RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-lockstepn-$N-$MODE${ETIQUETTE:+-$ETIQUETTE}"
 mkdir -p "$RUN"
 w() { cygpath -w "$1"; }
 bash "$W/scripts/run/attendre_poste.sh" "${ATTENTE_MAX:-1800}" > "$RUN/poste.txt" || { echo "!! poste occupé"; exit 3; }
@@ -93,5 +93,5 @@ for r in $(seq 0 $((N - 1))); do
   echo "runner $r : $(grep -h "srnp relay\] seat\|srnp racers\|paused at\|waited" "$RUN/runner$r/runner.log" | tr '\n' ' ' | cut -c1-600)"
 done
 tail -3 "$RUN/relais.out"
-"$PY" -I "$W/phase2/compare_racers.py" "$RUN" "$N"
+"$PY" -I "$W/phase2/compare_racers.py" "$RUN" "$N"; "$PY" -I "$W/phase2/compare_ck.py" "$RUN" "$N" | tail -3
 echo "RUN=$RUN"

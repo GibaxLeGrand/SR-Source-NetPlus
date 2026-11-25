@@ -33,12 +33,17 @@ Phase 1 prototype (lockstep through a relay):
 Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACERS=1`, see
 `src/runtime/srnp_racers.hpp` in the ModernGekko patch):
 - `relais.py` takes one or two seats per connection (`SRNP_SEAT=3,4`).
-- `lockstep8_local.sh <runners> natif|jit [capture frame] [end frame]`: 8 seats on N runners of one PC
-  (8: one seat each, 4: two each) from a race save state, test inputs `SRNP_INPUT=course:1` (forward,
-  random steering, then the AI takes the racer), each runner's camera on its seat; screenshots at the
-  capture frame and at the end, MEM1 compared (measurement PC's paths).
+- `lockstep8_local.sh <runners> natif|jit [capture frame] [end frame]`: `SIEGES` seats (8 by default)
+  on N runners of one PC (8: one seat each, 4: two each) from a save state (`ETAT`: a race, or the
+  "Are you ready?" menu: seat 0 then presses Start through the relay; with `SRNP_PERSOS` and
+  `SRNP_NB_RACERS` the race is set up with the lobby's characters and that many racers), test inputs
+  `SRNP_INPUT=course:1` (forward, random steering, then the AI takes the racer), each runner's camera
+  on its seat; screenshots at the capture frame and at the end, MEM1 compared (measurement PC's
+  paths).
 - `compare_racers.py <run> <runners>`, `compare_ck.py <run> <runners>`: the racers of the runners at
   the end, and at every checksum (`SRNP_CKDUMP`), without the fields that follow the camera.
+- `depart_8cpu.sh`: makes the save state of a race whose 8 racers are CPUs when it is set up (from the
+  "Are you ready?" menu, with `pilote.sh`).
 - `pilote.sh`: keeps one runner open and sends it automation commands one by one (how the menus were
   crossed to make the race save states; measurement PC's paths).
 - `desas.py`: a disassembler of the combined DOL (`SRNP_DOL`; main.dol plus `_Main.rel` relocated to
