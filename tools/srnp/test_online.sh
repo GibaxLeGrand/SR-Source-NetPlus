@@ -75,8 +75,15 @@ pid_de() {  # pid_de <nom d'exe> <motif de la ligne de commande ou de l'environn
 # Windows sert de marque dans la ligne de commande pour les retrouver.
 lance() {  # lance <pc> <auto> <touches> [variables...]
   local pc=$1 auto=$2 keys=$3; shift 3
+  # VIDAGE=1 : les 8 racers à chaque somme de contrôle (SRNP_CKDUMP), dans runner<siège>/ck comme
+  # lockstepn.sh, pour work\phase2\compare_ck.py.
+  local ck=""
+  if [[ "${VIDAGE:-0}" == 1 ]]; then
+    local k=0; [[ "$pc" == pcB ]] && k=1
+    mkdir -p "$RUN/runner$k/ck"; ck="$(w "$RUN/runner$k/ck")"
+  fi
   (cd "$L" && env LOCALAPPDATA="$(w "$RUN/$pc")" SRNP_RUNNER="$(w "$RUNNER")" SRNP_ONLINE_AUTO="$auto" \
-     SRNP_LOBBY_KEYS="$keys" "$@" "$EXE" --x11 "$pc-$(basename "$RUN")" > "$RUN/$pc/launcher.out" 2>&1) &
+     SRNP_LOBBY_KEYS="$keys" SRNP_CKDUMP="$ck" "$@" "$EXE" --x11 "$pc-$(basename "$RUN")" > "$RUN/$pc/launcher.out" 2>&1) &
   echo "$(date +%T) launcher $pc lancé ($auto)"
 }
 lance pcA host "${TOUCHES_A-RAAS}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}"
