@@ -1,0 +1,115 @@
+From fa0f5325d03e041015bde642d8c9e171b76bdc96 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:13:12 +0100
+Subject: [PATCH] Runner: Tournament Edition's new characters' heads in the 1P
+ HUD (texture 7, as in its split screen)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_labels.cpp | 86 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
+
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 1722731..76f8153 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -1045,10 +1045,96 @@ void TeLabelColours()
+   std::fprintf(stderr, "[srnp labels] labels' colours from TE's table of 23 characters\n");
+ }
+ 
++// Tournament Edition: the 1P HUD's heads (the racers close behind, at the bottom of the screen; the same
++// function as the 1P labels, US 0x8042F47C, TE 0x800DA98C) take the head and the silhouette of character c
++// from the US rectangles (r26 + 16 x (c + 5), r26 + 16 x (c + 22), texture 5 of the HUD's list): for TE's
++// new characters (17-22) those are the silhouettes of characters 0-5 and small icons, a white blob on a
++// coloured one (Gibax, 2026-11-26; the code is TE's own, the same in RAM as in its main.dol). TE's split-screen
++// function (0x800D5AD0) and its results (0x801D4150) have the code for them: texture 7 of the same list
++// ([0x8052CDD4]), pairs head/silhouette of 32 x 32 at 0x803737B0 + 32 x (c - 17). The same goes into the 1P
++// function, in free low memory (0x80002880-0x80002940, zero through TE's races):
++// - its call to 0x800282F4 just before the heads (TE 0x800DB7BC, racer r30, head r15, silhouette r20) goes to
++//   kHeadCave: the call, then for c > 16: texture (list, 7) (0x80029E74, applied by 0x80006A34(3)), r15 and
++//   r20 on TE's pair;
++// - the loop's step (addi r31, r31, 1 at TE 0x800DBB4C) goes to kStepCave: texture 5 again if it was 7 (the
++//   next racer's label and head are in the HUD's atlas), then the step.
++// Only drawing; SRNP_TETES_TE=0 leaves TE's code alone.
++void TeHeads()
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_TETES_TE");
++    return v && *v == '0';
++  }();
++  if (off)
++    return;
++  constexpr std::uint32_t kHeadCave = 0x80002880u, kStepCave = 0x80002900u;
++  constexpr std::uint32_t kDraw = 0x800282F4u, kSetTexture = 0x80029E74u, kApply = 0x80006A34u;
++  const std::uint32_t head_site = At(0x804302ACu), step_site = At(0x8043063Cu);
++  if (head_site == 0 || step_site == 0)
++    return;
++  const std::array<std::uint32_t, 25> head = {
++      0x9421FFF0, 0x7C0802A6, 0x90010014,
++      Bl(kHeadCave + 0x0C, kDraw),  // the game's call
++      0x887E00BA,                   // lbz r3, 0xBA(r30)
++      0x2C030010,                   // cmpwi r3, 16
++      0x4081003C,                   // ble done
++      0x3C608053, 0x8063CDD4,       // lis r3, 0x8053; lwz r3, -0x322C(r3): the HUD's list
++      0x38800007,                   // li r4, 7
++      Bl(kHeadCave + 0x28, kSetTexture),
++      0x38600003,  // li r3, 3
++      Bl(kHeadCave + 0x30, kApply),
++      0x887E00BA,              // lbz r3, 0xBA(r30)
++      0x3863FFEF,              // addi r3, r3, -17
++      0x54632834,              // slwi r3, r3, 5
++      0x3C808037, 0x388437B0,  // r4 = 0x803737B0
++      0x7DE41A14,              // add r15, r4, r3 (the head)
++      0x38630010,              // addi r3, r3, 16
++      0x7E841A14,              // add r20, r4, r3 (the silhouette)
++      0x80010014, 0x7C0803A6, 0x38210010, 0x4E800020};  // done
++  const std::array<std::uint32_t, 15> step = {
++      0x800D09D8,  // lwz r0, 0x9D8(r13): the texture's index
++      0x2C000007,  // cmpwi r0, 7
++      0x4082002C,  // bne step
++      0x9421FFF0, 0x7C0802A6, 0x90010014,
++      0x38000005, 0x900D09D8,  // its index back to 5
++      0x38600003, Bl(kStepCave + 0x24, kApply),
++      0x80010014, 0x7C0803A6, 0x38210010,
++      0x3BFF0001,  // step: addi r31, r31, 1
++      0x4E800020};
++  const std::uint32_t head_game = Bl(head_site, kDraw), head_ours = Bl(head_site, kHeadCave);
++  const std::uint32_t step_game = 0x3BFF0001u, step_ours = Bl(step_site, kStepCave);
++  const std::uint32_t h = Read32(head_site), s = Read32(step_site);
++  static bool told = false;
++  if ((h != head_game && h != head_ours) || (s != step_game && s != step_ours) ||
++      Read32(head_site + 4) != 0x881E1034u)  // lbz r0, 0x1034(r30)
++  {
++    if (!told)
++      std::fprintf(stderr, "[srnp labels] TE's 1P heads: not TE's code here, left alone\n");
++    told = true;
++    return;
++  }
++  // The caves first (a save state brings back its own low memory), then the two calls.
++  const bool caves = Holds(kHeadCave, head.data(), head.size()) && Holds(kStepCave, step.data(), step.size());
++  if (caves && h == head_ours && s == step_ours)
++    return;
++  if (!caves)
++  {
++    WriteWords(kHeadCave, head.data(), head.size());
++    WriteWords(kStepCave, step.data(), step.size());
++  }
++  if (h != head_ours)
++    WriteWords(head_site, &head_ours, 1);
++  if (s != step_ours)
++    WriteWords(step_site, &step_ours, 1);
++  std::fprintf(stderr, "[srnp labels] TE's 1P heads: its new characters' heads (texture 7) in the 1P HUD\n");
++}
++
+ void LabelsOnFrame()
+ {
+   if (CurrentGame() == Game::Other)
+     return;
++  if (CurrentGame() == Game::TE)
++    TeHeads();  // with or without the labels
+   static const bool off = [] {
+     const char* v = std::getenv("SRNP_ETIQUETTES");
+     return v && *v == '0';
+-- 
+2.34.1.windows.1
+

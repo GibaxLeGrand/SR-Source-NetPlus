@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Phase 2.5 : copie de work/phase2/demo_8.sh pour Tournament Edition (GXSRTE extrait par la session du
-# launcher, runner work	e
-unner, module MODULE_TE=<dll>, state gxsrte_pret1p_metal_jit.sav, sans le mod
+# launcher, runner work\te\runner, module MODULE_TE=<dll>, state gxsrte_pret1p_metal_jit.sav, sans le mod
 # des étiquettes, réglages StaticRecomp de TE par le dossier utilisateur). --- texte d'origine :
 # Démo à 8 joueurs : tout ce que fait SR-Source Net Plus aujourd'hui, en photos des vraies fenêtres.
 #   - avant tout : aucun processus Sonic Riders Source ne doit tourner (restes d'une démo arrêtés,
