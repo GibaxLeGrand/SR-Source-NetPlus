@@ -93,6 +93,23 @@ PROFIL
   mkdir -p "$U/Mods/srnp_etiquettes"
   printf 'name=srnp_etiquettes\ngame=GXEE8P\n' > "$U/Mods/srnp_etiquettes/mod.ini"
   powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$U/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
+  # HD=1 : les packs de textures HD (work\textures : celui de SR ; sur TE, celui de TE avec celui de SR
+  # dessous) en mods reliés par jonctions, comme l'option Textures HD du launcher les fait
+  # (srnp_textures_hd_*), et RES (1920x1080 par défaut) en résolution interne.
+  if [[ "${HD:-0}" == 1 ]]; then
+    sed -i "s/^resolution=.*/resolution=${RES:-1920x1080}/" "$U/config.ini"
+    local m
+    for m in "srnp_textures_hd_GXEE8P:GXEE8P:$W/textures/pack_hd/Vanilla(ECT_Optimized)" \
+             "srnp_textures_hd_GXSRTE_base:GXSRTE:$W/textures/pack_hd/Vanilla(ECT_Optimized)" \
+             "srnp_textures_hd_GXSRTE:GXSRTE:$W/textures/pack_hd_te/GXSRTE"; do
+      local id="${m%%:*}" rest="${m#*:}"
+      local jeu="${rest%%:*}" pack="${rest#*:}"
+      mkdir -p "$U/Mods/$id"
+      printf 'name=%s\ngame=%s\n' "$id" "$jeu" > "$U/Mods/$id/mod.ini"
+      powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$U/Mods/$id/textures")' -Target '$(w "$pack")' | Out-Null"
+      printf 'mod=%s\n' "$id" >> "$U/config.ini"  # [Mods] est la dernière section ; l'ordre : SR sous TE
+    done
+  fi
 }
 prepare pcA HOTE
 prepare pcB AMI
@@ -135,13 +152,14 @@ for i in $(seq 1 60); do
   sleep 1
 done
 echo "$(date +%T) runners : $RA, $RB"
-for t in 12 22 40 70; do
+# PHOTOS="12 22 40 70" : les moments des captures des jeux (s après leur ouverture).
+for t in ${PHOTOS:-12 22 40 70}; do
   sleep $(( t - ${prev:-0} )); prev=$t
   [[ -n "$RA" ]] && photo "$RA" "$RUN/3_jeu_${t}s_hote.png"
   [[ -n "$RB" ]] && photo "$RB" "$RUN/3_jeu_${t}s_ami.png"
   echo "$(date +%T) photos des jeux à ${t} s"
 done
-sleep $(( ${DUREE:-90} - 70 ))
+reste=$(( ${DUREE:-90} - ${prev:-0} )); (( reste > 0 )) && sleep $reste
 # Fin : les runners d'abord (les launchers reviennent au lobby), puis les launchers.
 for p in $RA $RB; do taskkill.exe //F //PID "$p" > /dev/null 2>&1; done
 sleep 6
