@@ -1,0 +1,131 @@
+From c43668570f411a63aad6507da4fc136c4637d0ac Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:20:42 +0100
+Subject: [PATCH] Runner: the waiting screen on Tournament Edition
+
+TE's TSGME has more pictures, the same ones further on (matched by their bytes): Menu() gives their
+index there (ARE YOU READY? 42, the card 156, the unknown head 150...). TE's names texture (its 14th)
+is laid out like the US one but its palette is another: the screens write with their own font on TE
+until the letters are picked again. The 5P-8P labels come from the labels mod's folder (its GTSE's
+SRNPLBL1 block), the mod itself left off on TE.
+
+Measured on 2026-11-26: 8 TE runners, 5366 frames, 88 identical checksums, 0 divergence; 8 US
+runners (regression), 3529 frames, 58 identical, 0 divergence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_game_textures.cpp  |  9 ++++++++-
+ src/runtime/srnp_waiting_screen.cpp | 28 +++++++++++++++++++++++-----
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/src/runtime/srnp_game_textures.cpp b/src/runtime/srnp_game_textures.cpp
+index 1262f75..05e0641 100644
+--- a/src/runtime/srnp_game_textures.cpp
++++ b/src/runtime/srnp_game_textures.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include "srnp_game_textures.hpp"
++#include "srnp_game.hpp"
+ #include "srnp_labels.hpp"
+ 
+ #include "VideoCommon/AbstractGfx.h"
+@@ -245,6 +246,11 @@ Decoded DecodeC8(const std::vector<std::uint8_t>& d, std::size_t palette, std::s
+ // row by row, and its 16 colours.
+ bool NamesTexture(std::vector<std::uint8_t>* indices, std::vector<std::uint32_t>* colours)
+ {
++  // Tournament Edition's names (its 14th texture) are laid out alike but their palette is another: the
++  // letters picked by their colours came out wrong (2026-11-26). The screens write with their own font there
++  // until that is done.
++  if (CurrentGame() == Game::TE)
++    return false;
+   const std::vector<std::uint8_t>& d = File(s_root / "files" / "GTSE");
+   std::size_t at = 0;
+   int k = -1;
+@@ -259,7 +265,8 @@ bool NamesTexture(std::vector<std::uint8_t>* indices, std::vector<std::uint32_t>
+       }
+     if (found == std::string::npos)
+       return false;
+-    if (++k == 6)
++    // (Tournament Edition: the same names, laid out alike, are its 14th texture; 2026-11-26.)
++    if (++k == (CurrentGame() == Game::TE ? 13 : 6))
+     {
+       at = found;
+       break;
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index b22f09d..58f6dc0 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -94,6 +94,24 @@ void Label(ImDrawList* list, ImFont* font, ImVec2 centre, float unit, const char
+ // The game's pictures (srnp_game_textures.hpp): TSGME, the menus ("?" 110, the panel 116, "ARE YOU
+ // READY?" 38), GTSE, the race HUD (the atlas 5: the labels and the characters' heads).
+ constexpr const char* kMenus = "TSGME";
++// A picture of TSGME by its index in Sonic Riders US; Tournament Edition's TSGME has more pictures, the same
++// ones further on (matched by their bytes on 2026-11-26; 28, the rules' words, has changed in TE).
++int Menu(int us_index)
++{
++  if (CurrentGame() != Game::TE)
++    return us_index;
++  switch (us_index)
++  {
++  case 28: return 29;
++  case 29: return 30;
++  case 30: return 31;
++  case 38: return 42;
++  case 110: return 150;
++  case 116: return 156;
++  case 132: return 172;
++  default: return -1;
++  }
++}
+ constexpr const char* kHud = "GTSE";
+ // Each character's head in the HUD atlas, 38x30, as the game's table at 0x805D3DB4 has them (entries
+ // 5 + character): Sonic, Tails, Knuckles, Amy, Jet, Storm, Wave, Eggman, Cream, Rouge, Shadow, Super
+@@ -230,7 +248,7 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+   const float unit = std::min(display.y / 15.0f, display.x / (seats * 3.4f + 1.0f));
+ 
+   // The game's "ARE YOU READY?" (the top of the menus' picture 38), then the counts.
+-  const GamePicture ready_picture = GameTexture(kMenus, 38);
++  const GamePicture ready_picture = GameTexture(kMenus, Menu(38));
+   if (ready_picture.ok)
+   {
+     const float w = display.x * 0.42f, h = w * 40.0f / 256.0f;
+@@ -275,7 +293,7 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+     TextCentred(list, font, unit * 0.95f, ImVec2(display.x * 0.5f, display.y * 0.19f), Rgba(255, 255, 255), line);
+   }
+ 
+-  const GamePicture panel = GameTexture(kMenus, 116);
++  const GamePicture panel = GameTexture(kMenus, Menu(116));
+   const float column = display.x / static_cast<float>(seats + 1);
+   const float card_w = std::min(column * 0.92f, unit * 3.3f), card_h = card_w * 1.75f;
+   const double now = ImGui::GetTime();
+@@ -319,7 +337,7 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+     }
+     else
+     {
+-      const GamePicture unknown = GameTexture(kMenus, 110);
++      const GamePicture unknown = GameTexture(kMenus, Menu(110));
+       const float q = side_h;
+       Picture(list, unknown, ImVec2(x - q * 0.5f, i0.y), ImVec2(x + q * 0.5f, i0.y + q), ImVec2(0, 0), ImVec2(1, 1), tint);
+     }
+@@ -378,7 +396,7 @@ void Draw(const WaitView& view)
+   const ImVec2 display = ImGui::GetIO().DisplaySize;
+   if (!list || !font || display.x <= 0.0f || display.y <= 0.0f || view.seats <= 0)
+     return;
+-  if (GameTexture(kMenus, 132).ok)
++  if (GameTexture(kMenus, Menu(132)).ok)
+     return DrawWithGamePictures(view, list, font, display);
+   const int seats = std::min(view.seats, 8);
+   const auto state = [&](int k) {
+@@ -465,7 +483,7 @@ void DrawRulesRow(int racers, bool selected)
+ {
+   ImDrawList* list = ImGui::GetForegroundDrawList();
+   const ImVec2 display = ImGui::GetIO().DisplaySize;
+-  const GamePicture words = GameTexture(kMenus, 28), plate = GameTexture(kMenus, 29), arrow = GameTexture(kMenus, 30);
++  const GamePicture words = GameTexture(kMenus, Menu(28)), plate = GameTexture(kMenus, Menu(29)), arrow = GameTexture(kMenus, Menu(30));
+   if (!list || display.x <= 0.0f || display.y <= 0.0f || !words.ok || !plate.ok || !arrow.ok)
+     return;
+   const float sx = display.x / 640.0f, sy = display.y / 480.0f;
+-- 
+2.34.1.windows.1
+

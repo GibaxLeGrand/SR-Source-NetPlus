@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Phase 2.5 : copie de work/phase2/demo_8.sh pour Tournament Edition (GXSRTE extrait par la session du
-# launcher, runner work	eunner, module MODULE_TE=<dll>, state gxsrte_pret1p_metal_jit.sav, sans le mod
+# launcher, runner work	e
+unner, module MODULE_TE=<dll>, state gxsrte_pret1p_metal_jit.sav, sans le mod
 # des étiquettes, réglages StaticRecomp de TE par le dossier utilisateur). --- texte d'origine :
 # Démo à 8 joueurs : tout ce que fait SR-Source Net Plus aujourd'hui, en photos des vraies fenêtres.
 #   - avant tout : aucun processus Sonic Riders Source ne doit tourner (restes d'une démo arrêtés,
@@ -64,6 +65,10 @@ lance() {  # lance <siège>
   cp -a "$W/userdir_modele" "$D/userdir"
   mkdir -p "$D/userdir/GameSettings"
   cp /d/_SonicRidersSource/SR-Source-NetPlus/docs/game-settings/GXSRTE.ini "$D/userdir/GameSettings/GXSRTE.ini"
+  # Les étiquettes 5P-8P de l'écran d'attente viennent du mod des étiquettes (le bloc SRNPLBL1 de son GTSE) :
+  # son dossier est posé, mais le mod n'est PAS activé (son GTSE est celui du jeu US, il remplacerait celui de TE).
+  mkdir -p "$D/userdir/Mods/srnp_etiquettes"
+  powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
   sed -i "s/^\[Core\]\$/[Core]\nEmulationSpeed = 1.0/" "$D/userdir/Config/Dolphin.ini"
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$D/userdir/Config/Dolphin.ini"
   if [[ "${ETIQ:-0}" != 0 ]]; then  # ETIQ=0 : sans le mod des étiquettes 5P-8P
