@@ -1,0 +1,282 @@
+From 8d93708e4c3bb6af3ec10eb57f6bcb9d5bffbff1 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:31:37 +0100
+Subject: [PATCH] Launcher: HD textures, Sonic Riders' pack under Tournament
+ Edition's; another pack replaces the mod
+
+Tournament Edition's row has "Sonic Riders' pack under it (the textures TE's pack lacks)": the mod
+srnp_textures_hd_GXSRTE_base, from Sonic Riders' mod (hard links), applied before TE's own so that
+TE's pack wins on duplicates (turning a pack on puts TE's own last again). Choosing another pack
+replaces the mod's textures instead of adding to them. --hd-textures-base <disc ID> <folder>.
+
+Measured 2026-11-26 (no game started): TE's HD pack 3.6 (work\textures\pack_hd_te\GXSRTE), 1562
+textures, all hard-linked, the earlier install's replaced; Sonic Riders' under it, 3197.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/launcher_textures.cpp    | 22 ++++++----
+ tools/launcher_textures.hpp    | 20 ++++++----
+ tools/moderngekko_launcher.cpp | 73 +++++++++++++++++++++++++---------
+ 3 files changed, 83 insertions(+), 32 deletions(-)
+
+diff --git a/tools/launcher_textures.cpp b/tools/launcher_textures.cpp
+index 9b03dd9..11ce875 100644
+--- a/tools/launcher_textures.cpp
++++ b/tools/launcher_textures.cpp
+@@ -51,18 +51,23 @@ std::string ModId(std::string_view game)
+   return "srnp_textures_hd_" + std::string(game);
+ }
+ 
+-bool Installed(const fs::path& mods_folder, std::string_view game)
++std::string BaseModId(std::string_view game)
++{
++  return ModId(game) + "_base";
++}
++
++bool Installed(const fs::path& mods_folder, std::string_view mod_id)
+ {
+   std::error_code ec;
+-  const fs::path mod = mods_folder / ModId(game);
++  const fs::path mod = mods_folder / fs::path(std::string(mod_id));
+   return fs::is_regular_file(mod / "mod.ini", ec) && fs::is_directory(mod / "textures", ec);
+ }
+ 
+ bool InstallPack(const fs::path& pack, const fs::path& mods_folder, const std::string& game,
+-                 const std::string& game_name, InstallState* state)
++                 const std::string& mod_id, const std::string& mod_name, InstallState* state)
+ {
+   std::error_code ec;
+-  const fs::path mod = mods_folder / ModId(game);
++  const fs::path mod = mods_folder / fs::path(mod_id);
+   const fs::path target_root = mod / "textures";
+   if (!fs::is_directory(pack, ec))
+     return Fail(state, "Not a folder: " + Utf8(pack));
+@@ -93,8 +98,12 @@ bool InstallPack(const fs::path& pack, const fs::path& mods_folder, const std::s
+   if (found.empty())
+     return Fail(state, "No texture in this folder (files named tex1_..., .png or .dds).");
+ 
+-  // mod.ini goes last: until it is there, the folder is no mod (a half install loads nothing).
++  // mod.ini goes last: until it is there, the folder is no mod (a half install loads nothing). An
++  // earlier install's textures go first (links to, or copies of, its pack): another pack replaces it.
+   fs::remove(mod / "mod.ini", ec);
++  Say(state, "Removing the earlier pack's textures...");
++  fs::remove_all(target_root, ec);
++  ec.clear();
+   fs::create_directories(target_root, ec);
+   if (ec)
+     return Fail(state, "Can't make " + Utf8(target_root) + ": " + ec.message());
+@@ -106,7 +115,6 @@ bool InstallPack(const fs::path& pack, const fs::path& mods_folder, const std::s
+     const fs::path target = target_root / relative;
+     std::error_code file_ec;
+     fs::create_directories(target.parent_path(), file_ec);
+-    fs::remove(target, file_ec);  // an earlier install's (a link to the old pack, or a copy)
+     file_ec.clear();
+     fs::create_hard_link(found[i], target, file_ec);
+     if (!file_ec)
+@@ -126,7 +134,7 @@ bool InstallPack(const fs::path& pack, const fs::path& mods_folder, const std::s
+   }
+ 
+   std::ofstream ini(mod / "mod.ini", std::ios::binary | std::ios::trunc);
+-  ini << "name=HD textures (" << game_name << ")\n"
++  ini << "name=" << mod_name << "\n"
+       << "game=" << game << "\n"
+       << "author=the pack's authors\n"
+       << "description=" << found.size() << " textures from " << Utf8(pack) << "\n";
+diff --git a/tools/launcher_textures.hpp b/tools/launcher_textures.hpp
+index 8768a87..f64ee95 100644
+--- a/tools/launcher_textures.hpp
++++ b/tools/launcher_textures.hpp
+@@ -23,6 +23,10 @@ namespace moderngekko::frontend::textures
+ {
+ // The mod's folder name for a game: srnp_textures_hd_<disc ID>.
+ std::string ModId(std::string_view game);
++// A second pack under the game's own (another game's, Sonic Riders' under Tournament Edition's: the
++// textures the game's pack lacks), applied before it so that the game's pack wins on duplicates:
++// srnp_textures_hd_<disc ID>_base.
++std::string BaseModId(std::string_view game);
+ 
+ // Where an install is, read by the launcher's page while it runs on its own thread.
+ struct InstallState
+@@ -31,17 +35,19 @@ struct InstallState
+   bool running = false;
+   bool finished = false;  // set once, when it succeeded
+   std::string game;       // the game being installed
++  std::string mod_id;     // and the mod (ModId or BaseModId)
+   std::string status;
+   std::string error;
+ };
+ 
+-// Makes <mods_folder>/srnp_textures_hd_<game> (textures/, then mod.ini) from the pack's folder: every
+-// tex1_*.png or .dds in it and its subfolders, linked or copied. Over an earlier install, the
+-// textures it already has are replaced. False, with state->error, when it can't (no texture in the
+-// folder, no room...).
++// Makes <mods_folder>/<mod_id> (textures/, then mod.ini, game=<game>) from the pack's folder: every
++// tex1_*.png or .dds in it and its subfolders, linked or copied. An earlier install of that mod is
++// replaced (its textures/ goes first: they are links to, or copies of, the pack it came from). False,
++// with state->error, when it can't (no texture in the folder, no room...).
+ bool InstallPack(const std::filesystem::path& pack, const std::filesystem::path& mods_folder,
+-                 const std::string& game, const std::string& game_name, InstallState* state);
++                 const std::string& game, const std::string& mod_id, const std::string& mod_name,
++                 InstallState* state);
+ 
+-// The game's mod is there (its mod.ini and textures/).
+-bool Installed(const std::filesystem::path& mods_folder, std::string_view game);
++// The mod is there (its mod.ini and textures/).
++bool Installed(const std::filesystem::path& mods_folder, std::string_view mod_id);
+ }  // namespace moderngekko::frontend::textures
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index a907c66..9229284 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -2710,6 +2710,7 @@ int main(int argc, char** argv)
+   // (launcher_textures.hpp) in the user folder's Mods, without the window, as Mods & expansions does
+   // (the mod stays off until its switch is turned on).
+   std::optional<std::pair<std::string, fs::path>> hd_textures_only;
++  bool hd_textures_base = false;  // --hd-textures-base: the pack under the game's (BaseModId)
+   for (int i = 1; i < argc; ++i)
+   {
+     if (std::string_view(argv[i]) == "-X11" || std::string_view(argv[i]) == "--x11")
+@@ -2720,8 +2721,10 @@ int main(int argc, char** argv)
+       extract_only = TextPath(argv[++i]);
+     else if (std::string_view(argv[i]) == "--japanese-voices" && i + 1 < argc)
+       japanese_voices_only = TextPath(argv[++i]);
+-    else if (std::string_view(argv[i]) == "--hd-textures" && i + 2 < argc)
++    else if ((std::string_view(argv[i]) == "--hd-textures" ||
++              std::string_view(argv[i]) == "--hd-textures-base") && i + 2 < argc)
+     {
++      hd_textures_base = std::string_view(argv[i]) == "--hd-textures-base";
+       const std::string game = argv[++i];
+       hd_textures_only = std::make_pair(game, TextPath(argv[++i]));
+     }
+@@ -2786,14 +2789,19 @@ int main(int argc, char** argv)
+     }
+     moderngekko::frontend::textures::InstallState state;
+     state.running = true;
+-    const bool success = moderngekko::frontend::textures::InstallPack(
+-        hd_textures_only->second, user_directory / "Mods", game, name, &state);
++    namespace textures = moderngekko::frontend::textures;
++    const std::string mod_id = hd_textures_base ? textures::BaseModId(game) : textures::ModId(game);
++    const std::string mod_name = hd_textures_base
++                                     ? std::string("HD textures (Sonic Riders' pack, under the ") + name + " one)"
++                                     : std::string("HD textures (") + name + ")";
++    const bool success = textures::InstallPack(hd_textures_only->second, user_directory / "Mods", game,
++                                               mod_id, mod_name, &state);
+     std::lock_guard lock(state.mutex);
+     if (!success)
+       std::cerr << "hd textures: " << state.error << '\n';
+     else
+-      std::cout << "hd textures: " << state.status << " in "
+-                << PathText(user_directory / "Mods" / moderngekko::frontend::textures::ModId(game)) << '\n';
++      std::cout << "hd textures: " << state.status << " (" << PathText(user_directory / "Mods" / mod_id)
++                << ")\n";
+     return success ? 0 : 1;
+   }
+ 
+@@ -6238,31 +6246,49 @@ int main(int argc, char** argv)
+         install_status = textures_install.status;
+         install_error = textures_install.error;
+       }
+-      const auto start_install = [&](const fs::path& folder, const std::string& game) {
++      const auto start_install = [&](const fs::path& folder, const std::string& game, bool base) {
+         if (textures_thread.joinable())
+           textures_thread.join();
++        const std::string mod_id = base ? textures::BaseModId(game) : textures::ModId(game);
+         {
+           std::lock_guard lock(textures_install.mutex);
+           textures_install.running = true;
+           textures_install.game = game;
++          textures_install.mod_id = mod_id;
+           textures_install.error.clear();
+           textures_install.status.clear();
+         }
+         const char* game_name = online::OnlineGameName(game);
++        const std::string shown_name = *game_name ? game_name : game;
++        const std::string mod_name = base ? "HD textures (Sonic Riders' pack, under the " + shown_name + " one)"
++                                          : "HD textures (" + shown_name + ")";
+         textures_thread = std::jthread([&textures_install, folder, mods = user_directory / "Mods", game,
+-                                        name = std::string(*game_name ? game_name : game.c_str())] {
+-          textures::InstallPack(folder, mods, game, name, &textures_install);
++                                        mod_id, mod_name] {
++          textures::InstallPack(folder, mods, game, mod_id, mod_name, &textures_install);
+         });
+         installing = true;
+         install_game = game;
+       };
++      // The base pack applies before the game's own (later mods win on duplicates): turning a mod on
++      // puts it last, so the game's own goes last again when it is on.
++      const auto turn_on = [&](const std::string& game, const std::string& mod_id, bool on) {
++        set_mod_on(mod_id, on);
++        const std::string own = textures::ModId(game);
++        if (on && mod_id != own && std::ranges::find(config.mods, own) != config.mods.end())
++          set_mod_on(own, true);
++      };
+       if (pack && !installing && !textures_dialog_game.empty())
+-        start_install(*pack, textures_dialog_game);
++        start_install(*pack, textures_dialog_game, false);
+       if (installed_now)
+       {
+         // The new mod in the list, and on.
++        std::string mod_id;
++        {
++          std::lock_guard lock(textures_install.mutex);
++          mod_id = textures_install.mod_id;
++        }
+         open_mods_page();
+-        set_mod_on(textures::ModId(install_game), true);
++        turn_on(install_game, mod_id, true);
+       }
+       ImGui::PushTextWrapPos(0.0f);
+       ImGui::TextUnformatted(Tr("A texture pack you have (a folder of tex1_ files, PNG or DDS), drawn "
+@@ -6274,7 +6300,7 @@ int main(int argc, char** argv)
+         const GameSlot* slot = slot_of(game);
+         const bool extracted = slot && slot->metadata;
+         const std::string id = textures::ModId(game);
+-        const bool installed = textures::Installed(user_directory / "Mods", game);
++        const bool installed = textures::Installed(user_directory / "Mods", id);
+         bool on = std::ranges::find(config.mods, id) != config.mods.end();
+         ImGui::Spacing();
+         ImGui::AlignTextToFramePadding();
+@@ -6286,7 +6312,7 @@ int main(int argc, char** argv)
+         if (installed)
+         {
+           if (ImGui::Checkbox(Tr("On"), &on))
+-            set_mod_on(id, on);
++            turn_on(game, id, on);
+           ImGui::SameLine();
+         }
+         ImGui::BeginDisabled(installing || !extracted);
+@@ -6297,14 +6323,25 @@ int main(int argc, char** argv)
+           SDL_ShowOpenFolderDialog(FileDialogCallback, &textures_dialog, window, documents.c_str(),
+                                    false);
+         }
+-        // Tournament Edition: Sonic Riders' pack dresses the textures it shares (same names).
+-        if (std::string_view(game) == "GXSRTE" && textures::Installed(user_directory / "Mods", "GXEE8P"))
++        ImGui::EndDisabled();
++        // Tournament Edition: Sonic Riders' pack under its own, for the textures TE's pack lacks (a
++        // pack's textures are named after the ones they replace: Sonic Riders' dresses those TE shares).
++        if (std::string_view(game) == "GXSRTE" &&
++            textures::Installed(user_directory / "Mods", textures::ModId("GXEE8P")))
+         {
+-          ImGui::SameLine();
+-          if (ImGui::Button(Tr("Use Sonic Riders' pack")))
+-            start_install(user_directory / "Mods" / textures::ModId("GXEE8P") / "textures", game);
++          const std::string base = textures::BaseModId(game);
++          const bool base_installed = textures::Installed(user_directory / "Mods", base);
++          bool base_on = base_installed && std::ranges::find(config.mods, base) != config.mods.end();
++          ImGui::BeginDisabled(installing || !extracted);
++          if (ImGui::Checkbox(Tr("Sonic Riders' pack under it (the textures TE's pack lacks)"), &base_on))
++          {
++            if (base_on && !base_installed)
++              start_install(user_directory / "Mods" / textures::ModId("GXEE8P") / "textures", game, true);
++            else
++              turn_on(game, base, base_on);
++          }
++          ImGui::EndDisabled();
+         }
+-        ImGui::EndDisabled();
+         if (!extracted)
+           ImGui::TextDisabled("%s", Tr("Extract this game in Game Files first."));
+         if (install_game == game)
+-- 
+2.34.1.windows.1
+
