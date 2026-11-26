@@ -1,0 +1,37 @@
+From a7df2c19c89a84265881d34818bfc2fe6db294cf Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:48:10 +0100
+Subject: [PATCH] Launcher: more games than the game selection art shows ask
+ with the plain list (Tournament Edition)
+
+SR-Source Net Plus, phase 2.5: the build plays Sonic Riders Tournament Edition (GXSRTE) beside Zero
+Gravity and Sonic Riders (MODERNGEKKO_GAMES in the fork's tools/build_tools.sh). The game selection
+screen's art shows two games, so with more PLAY asks with the plain list, where every game is.
+
+Measured on 2026-11-26: the player's TE ISO (2.4.6.1) extracted by --extract to games/GXSRTE; the PLAY
+page shows the three games; a runner built with the list starts TE with JIT64 (no native module of
+TE yet) at 59.8 frames/s, to its Mode Select.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/moderngekko_launcher.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index f0ef511..805fe66 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -2994,6 +2994,10 @@ int main(int argc, char** argv)
+     const GameSlot* right = slot_of(game_select.Layout().right_game);
+     if (!left || !right)
+       return false;
++    // SR-Source Net Plus: a build of more games than the art shows (Tournament Edition, GXSRTE, beside
++    // the two it pictures) asks with the plain list, where every game is.
++    if (moderngekko::frontend::KnownGames().size() > 2)
++      return false;
+     const std::string current = current_metadata ? current_metadata.metadata->disc_id : "";
+     const GameSelectSide start =
+         current == left->game.disc_id && left->metadata     ? GameSelectSide::Left :
+-- 
+2.34.1.windows.1
+

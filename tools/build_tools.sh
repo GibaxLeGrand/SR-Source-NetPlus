@@ -131,7 +131,7 @@ if [[ "${1:-}" == "--chassis" ]]; then
         -DMODERNGEKKO_PUBLISHER="KnivesDevilish" \
         -DMODERNGEKKO_LAUNCHER_OUTPUT_NAME="SR-Source" \
         -DMODERNGEKKO_REQUIRED_DISC_ID="RS9E8P" \
-        -DMODERNGEKKO_GAMES="RS9E8P=Sonic Riders: Zero Gravity;GXEE8P=Sonic Riders" \
+        -DMODERNGEKKO_GAMES="RS9E8P=Sonic Riders: Zero Gravity;GXEE8P=Sonic Riders;GXSRTE=Sonic Riders Tournament Edition" \
         -DMODERNGEKKO_DEFAULT_WINDOW_TITLE="Sonic Riders: Source" \
         -DMODERNGEKKO_USER_DIRECTORY_NAME="sr-source" \
         -DMODERNGEKKO_PREVIOUS_USER_DIRECTORY_NAMES="sr-zgs" \
