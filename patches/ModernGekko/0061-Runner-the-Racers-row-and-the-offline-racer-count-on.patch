@@ -1,0 +1,47 @@
+From 4b7b70a1770fac6c09f7437e9d1e5ecef51143c1 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:32:48 +0100
+Subject: [PATCH] Runner: the Racers row and the offline racer count only on
+ the US disc (GXEE8P)
+
+RulesMenuOnFrame and OfflineRacersFrame read and write the US game's addresses; Tournament Edition
+(GXSRTE) is another main.dol. Asked by the launcher's session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index f19cbc5..bb47f24 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -44,6 +44,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "Core/Config/ConfigManager.h"
+ #include "Core/HW/DSP.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/State.h"
+@@ -1057,9 +1058,14 @@ bool PauseAtGameFrame()
+ 
+ void RelayOnFrame(std::uint64_t frame)
+ {
+-  RulesMenuOnFrame();
+-  if (!RelayConfigured())
+-    OfflineRacersFrame();
++  // The Racers row and the offline racer count read and write the US game's addresses: only on its
++  // disc (Tournament Edition, GXSRTE, is another main.dol; asked by the launcher's session, 2026-11-26).
++  if (SConfig::GetInstance().GetGameID() == "GXEE8P")
++  {
++    RulesMenuOnFrame();
++    if (!RelayConfigured())
++      OfflineRacersFrame();
++  }
+   PadCheckOnFrame(frame);
+   if (GameFrameHookAddress() != 0)
+     return;  // the relay steps in the game's main loop
+-- 
+2.34.1.windows.1
+
