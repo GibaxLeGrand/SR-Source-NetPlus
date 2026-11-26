@@ -129,5 +129,9 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   crossed to make the race save states; measurement PC's paths).
 - `desas.py`: a disassembler of the combined DOL (`SRNP_DOL`; main.dol plus `_Main.rel` relocated to
   0x803FBD00), with capstone (`pip install capstone`; run without `-I`).
+- `absolus.py`: in a text disassembly of the REL, the instructions that address an absolute address
+  or range (lis then addi/lbz/lwz/stw... on the same register).
+- `zones_objets.py`: the objects' drawing sites that follow racer 0's zone (0x80612BD8) and flags,
+  alone or in a loop over the views: the list behind the runner's `kObjectZoneSites` (2026-11-26).
 
 Comments and output are in French.

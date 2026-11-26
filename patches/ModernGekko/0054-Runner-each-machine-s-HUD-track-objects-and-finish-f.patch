@@ -1,0 +1,285 @@
+From d4c8eebd8690c3b46d50791603ce6f69829f3dc1 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:47:43 +0100
+Subject: [PATCH] Runner: each machine's HUD, track objects and finish fade
+ follow its seat
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gibax (2026-11-26): "le joueur a que son écran du perso sur sa console ...
+tout indiqué SON joueur et aucun autre". A 2-player race, Sonic (seat 0) to
+the AI, Knuckles (seat 1) still at the start, showed on Knuckles's screen:
+- Sonic's route icon and stick prompt: a block of the 1P HUD task drawn for
+  racer 0 written in the code (0x8041EE00, r22); now the seat's racer. The
+  same for the task 0x804250C0 (0x8042653C, r20; no visible change seen);
+- the start gate and its 15 m / 30 m boards only once Sonic came near: the
+  objects' drawing compares each object's zone with racer 0's (0x80612BD8,
+  and its flags +0xBA8), alone or in a loop over the views; 215 sites listed
+  from the REL's disassembly (work/phase2/zones_objets.py) now use the seat's;
+- the time, rank and speed fading out at Sonic's finish: the task 0x804306F0
+  fades them once racer 0 has crossed the line (0x804309C4); now the seat's.
+
+And a desync, older than this: the racers left out of the 1P drawing by
+their zone also skipped their animation (0x8040B630, b past it); since the
+zone of reference is the seat's, racer 6 crossing the line near Knuckles
+moved on one more animation frame on his machine (+0x760 0x4C against 0x4B,
+then +0x8D4 for good). That branch now goes to the animation too.
+
+The racers' sound handles (+0xF44-0xF4B, +0xF50-0xF5F: only the sound
+functions use them) leave the checksum: they follow the order sounds start
+in, which differs once objects sound around each machine's seat.
+
+Measured (SRNP_PAUSE_JEU photos, same race): Knuckles sees the gate from the
+start, no prompt of Sonic's, his time/rank/speed after Sonic's finish;
+Sonic's screen unchanged; 89 identical checksums, 0 divergences (8 before,
+the animation); the mirrored race (Sonic still, Knuckles to the AI): 83
+identical, 0 divergences, Knuckles's tricks and rings on his screen only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 194 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 190 insertions(+), 4 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index decb361..8ec5e46 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -527,6 +527,14 @@ long long RaceFrame()
+ // drawing, 0x8040AA78, does it once per view: not changed yet.)
+ constexpr CodeWord kAnimSkip = {0x8040B6D8, 0x40820514};  // bne 0x8040BBEC (past the animation)
+ constexpr std::uint32_t kAnimKeep = 0x40820500;            // bne 0x8040BBD8 (to the animation)
++// The racers left out by their zone (far from the viewed racer's zone, +0x1000 = 1) skip the animation
++// too, by another branch (found on 2026-11-26: Knuckles immobile at the line, racer 6 crossing it near
++// him at frame 4320 moved on one more animation frame on his machine than on Sonic's, +0x760 0x4C
++// against 0x4B, then +0x8D4 for good; the same sums before this morning's patches). Since the zone of
++// reference is the seat's (s_racers_drawn), that differs from machine to machine: the branch goes to the
++// animation as well.
++constexpr CodeWord kAnimZoneSkip = {0x8040B630, 0x480005BC};  // b 0x8040BBEC (past the animation)
++constexpr std::uint32_t kAnimZoneKeep = 0x480005A8;           // b 0x8040BBD8 (to the animation)
+ bool s_anim_patched = false;
+ 
+ void PatchAnimation(bool on)
+@@ -538,15 +546,20 @@ void PatchAnimation(bool on)
+   if (off || on == s_anim_patched)
+     return;
+   std::uint8_t* p = Guest(kAnimSkip.address, 4);
++  std::uint8_t* q = Guest(kAnimZoneSkip.address, 4);
+   const std::uint32_t expected = on ? kAnimSkip.original : kAnimKeep;
+-  if (!p || Get32(p) != expected)
++  const std::uint32_t expected_zone = on ? kAnimZoneSkip.original : kAnimZoneKeep;
++  if (!p || !q || Get32(p) != expected || Get32(q) != expected_zone)
+   {
+-    std::fprintf(stderr, "[srnp racers] animation: 0x%08X holds %08X, not %08X: left alone\n",
+-                 kAnimSkip.address, Read32(kAnimSkip.address), expected);
++    std::fprintf(stderr, "[srnp racers] animation: 0x%08X holds %08X and 0x%08X %08X, not %08X %08X: left alone\n",
++                 kAnimSkip.address, Read32(kAnimSkip.address), kAnimZoneSkip.address,
++                 Read32(kAnimZoneSkip.address), expected, expected_zone);
+     return;
+   }
+   Put32(p, on ? kAnimKeep : kAnimSkip.original);
++  Put32(q, on ? kAnimZoneKeep : kAnimZoneSkip.original);
+   Core::System::GetInstance().GetJitInterface().InvalidateICache(kAnimSkip.address, 4, true);
++  Core::System::GetInstance().GetJitInterface().InvalidateICache(kAnimZoneSkip.address, 4, true);
+   s_anim_patched = on;
+   std::fprintf(stderr, "[srnp racers] animations of racers out of sight: %s\n",
+                on ? "moved on (every machine alike)" : "the game's");
+@@ -835,6 +848,165 @@ SeatDisplay s_prompts_c{"player displays (0x804E1A78)",
+                           return i == 0 ? 0x38000000u | static_cast<std::uint32_t>(seat) : 0x4082006Cu;
+                         }};
+ 
++// The 1P HUD's own player (Gibax, 2026-11-26: "le joueur a que son écran du perso sur sa console ...
++// tout indiqué SON joueur et aucun autre"). After its loop over the racers, the HUD task (0x8041DD78)
++// draws a block for racer 0 written in the code (r22, 0x8041EE00), skipped once racer 0 has crossed the
++// line (+0xBA8 & 0x80000): on the other machines the time, rank and speed went away at racer 0's finish.
++// The block only reads its racer (+0xBA8, +0xBAC, +0x624, +0x5E6, +0xBC, +0x1034). And the task
++// 0x804250C0 (made at the race's start, 0x8043825C) reads racer 0 the same way (r20, 0x8042653C: +0x9D4,
++// +0xBA8, +0x102E, +0x1029, +0xBC, +0xBA). Written: the seat's racer in place of racer 0.
++constexpr std::uint32_t SeatRacerLow(int seat)
++{
++  return (0x9440u + 0x1080u * static_cast<std::uint32_t>(seat)) & 0xFFFFu;
++}
++SeatDisplay s_hud_player{"HUD player block (0x8041EE00)",
++                         {{0x8041EE00, 0x3AC39440}},  // addi r22, r3, -0x6BC0 (racer 0)
++                         1,
++                         [](std::size_t, int seat) { return 0x3AC30000u | SeatRacerLow(seat); }};
++// The time, rank and speed fading out (2026-11-26: on Knuckles's screen, still in the race, they went
++// at Sonic's finish): the task 0x804306F0 (made at the race's start, 0x8043833C) fades them out (its
++// state 5: three alphas from 255 to 0, measured in RAM dumps of Knuckles's machine before and after) once
++// racer 0, written in the code (0x804309C4, r4), has crossed the line. Written: the seat's racer.
++SeatDisplay s_hud_fade{"HUD fade at the finish (0x804309C4)",
++                       {{0x804309C4, 0x38849440}},  // addi r4, r4, -0x6BC0 (racer 0)
++                       1,
++                       [](std::size_t, int seat) { return 0x38840000u | SeatRacerLow(seat); }};
++SeatDisplay s_hud_804250C0{"HUD task 0x804250C0",
++                           {{0x8042653C, 0x3A839440}},  // addi r20, r3, -0x6BC0 (racer 0)
++                           1,
++                           [](std::size_t, int seat) { return 0x3A830000u | SeatRacerLow(seat); }};
++
++// The track's objects (2026-11-26; Gibax: "tout indiqué SON joueur et aucun autre"): on Knuckles's
++// machine, Knuckles still at the start, the start gate ("START", the 15 m and 30 m boards) only showed once
++// Sonic (racer 0) came near it. The objects' drawing functions compare the object's zone (a byte) with
++// the 3 zones a racer can see (0x80612BD8 + 4 x index, written every frame for every racer) and read
++// its flags (+0xBA8, 0x10000000), either for racer 0 alone or in a loop over the views (0 to the player
++// count, 0x8021B8C8: 1 in the 1P race) along with the view's camera. The decor already follows the
++// view's camera (0x80612BC8, patch 0026). Here those sites address the seat's racer instead of racer 0:
++// the table's base + 4 x seat, the racer's base + 0x1080 x seat. The sites were listed by
++// work/phase2/zones_objets.py from the REL's disassembly: an "addi rZ, (lis 0x8061), 0x2BD8" whose
++// register only feeds "lbz rN, 0..3(rZ)" (plus the step of a loop bounded by the player count), and an
++// "addi rR, (lis 0x8061), -0x6BC0" only feeding "lwz rN, 0xBA8(rR)" in a function that has such a zone
++// site. 0x8040B5AC (the racers drawn) is s_racers_drawn's. SRNP_OBJETS=0 keeps the game's.
++struct ZoneSite
++{
++  std::uint32_t address, original, step;
++};
++constexpr ZoneSite kObjectZoneSites[] = {
++    {0x804448F0, 0x3B462BD8, 4}, {0x804448F4, 0x3B259440, 0x1080}, {0x80444BAC, 0x38A32BD8, 4},
++    {0x80444BE4, 0x38639440, 0x1080}, {0x80451324, 0x3BC52BD8, 4}, {0x80451328, 0x3BA49440, 0x1080},
++    {0x8047BAD8, 0x3B262BD8, 4}, {0x8047BADC, 0x3B059440, 0x1080}, {0x8047BDC8, 0x38A32BD8, 4},
++    {0x8047BE00, 0x38639440, 0x1080}, {0x8047C5A0, 0x3B062BD8, 4}, {0x8047C5A4, 0x3AE59440, 0x1080},
++    {0x8047CA94, 0x38A32BD8, 4}, {0x8047CACC, 0x38639440, 0x1080}, {0x8047EF74, 0x3BC62BD8, 4},
++    {0x8047EF78, 0x3BA59440, 0x1080}, {0x8047F244, 0x38A32BD8, 4}, {0x8047F27C, 0x38639440, 0x1080},
++    {0x8048AB40, 0x38A32BD8, 4}, {0x8048AB78, 0x38639440, 0x1080}, {0x8048BF1C, 0x38A32BD8, 4},
++    {0x8048C07C, 0x3B432BD8, 4}, {0x8048BF54, 0x38639440, 0x1080}, {0x8048C088, 0x3B249440, 0x1080},
++    {0x8048C8A4, 0x38A32BD8, 4}, {0x8048C8DC, 0x38639440, 0x1080}, {0x8049467C, 0x3B662BD8, 4},
++    {0x80494680, 0x3B459440, 0x1080}, {0x80494928, 0x38A32BD8, 4}, {0x80494960, 0x38639440, 0x1080},
++    {0x80494DEC, 0x3B462BD8, 4}, {0x80494DF0, 0x3B259440, 0x1080}, {0x804950A8, 0x38A32BD8, 4},
++    {0x804950E0, 0x38639440, 0x1080}, {0x80495614, 0x3B262BD8, 4}, {0x80495618, 0x3B059440, 0x1080},
++    {0x80495904, 0x38A32BD8, 4}, {0x8049593C, 0x38639440, 0x1080}, {0x804962FC, 0x38A32BD8, 4},
++    {0x80496448, 0x3B232BD8, 4}, {0x80496334, 0x38639440, 0x1080}, {0x80496454, 0x3B049440, 0x1080},
++    {0x80496C1C, 0x38A32BD8, 4}, {0x80496C54, 0x38639440, 0x1080}, {0x80496F10, 0x3B462BD8, 4},
++    {0x80496F14, 0x3B259440, 0x1080}, {0x80497550, 0x3BC52BD8, 4}, {0x80497558, 0x3BA69440, 0x1080},
++    {0x804976EC, 0x38A32BD8, 4}, {0x80497724, 0x38639440, 0x1080}, {0x804A8518, 0x38A32BD8, 4},
++    {0x804A8794, 0x3B662BD8, 4}, {0x804A8550, 0x38639440, 0x1080}, {0x804A8798, 0x3B459440, 0x1080},
++    {0x804A9AEC, 0x38A32BD8, 4}, {0x804A9B24, 0x38639440, 0x1080}, {0x804A9E08, 0x3B662BD8, 4},
++    {0x804A9E0C, 0x3B459440, 0x1080}, {0x804C8158, 0x38A32BD8, 4}, {0x804C8190, 0x38639440, 0x1080},
++    {0x804CBA84, 0x38A32BD8, 4}, {0x804CBABC, 0x38639440, 0x1080}, {0x804CF504, 0x38A32BD8, 4},
++    {0x804CF700, 0x3AE62BD8, 4}, {0x804CF53C, 0x38639440, 0x1080}, {0x804CF704, 0x3AC59440, 0x1080},
++    {0x804D1524, 0x38A32BD8, 4}, {0x804D155C, 0x38639440, 0x1080}, {0x804D1838, 0x3B062BD8, 4},
++    {0x804D183C, 0x3AE59440, 0x1080}, {0x804D1C5C, 0x3B232BD8, 4}, {0x804D1DAC, 0x3B032BD8, 4},
++    {0x804D1EFC, 0x3B032BD8, 4}, {0x804D2080, 0x3B032BD8, 4}, {0x804D1C64, 0x3B049440, 0x1080},
++    {0x804D1DB4, 0x3B249440, 0x1080}, {0x804D1F04, 0x3B249440, 0x1080}, {0x804D2088, 0x3B249440, 0x1080},
++    {0x804D2324, 0x38A32BD8, 4}, {0x804D235C, 0x38639440, 0x1080}, {0x804DD18C, 0x3B662BD8, 4},
++    {0x804DD190, 0x3B459440, 0x1080}, {0x804DD440, 0x38C42BD8, 4}, {0x804DD478, 0x38849440, 0x1080},
++    {0x804DDC5C, 0x3B062BD8, 4}, {0x804DDC60, 0x3AE59440, 0x1080}, {0x804DDF00, 0x38C42BD8, 4},
++    {0x804DDF38, 0x38849440, 0x1080}, {0x804F0338, 0x38A32BD8, 4}, {0x804F0370, 0x38639440, 0x1080},
++    {0x804FB864, 0x38C42BD8, 4}, {0x804FB89C, 0x38849440, 0x1080}, {0x8050C084, 0x3B462BD8, 4},
++    {0x8050C088, 0x3B259440, 0x1080}, {0x8050C3DC, 0x38A32BD8, 4}, {0x8050C414, 0x38639440, 0x1080},
++    {0x8050D2EC, 0x3AA52BD8, 4}, {0x8050D524, 0x3B252BD8, 4}, {0x8050D2F4, 0x3A849440, 0x1080},
++    {0x8050D52C, 0x3B449440, 0x1080}, {0x80514D20, 0x3BE82BD8, 4}, {0x80514D04, 0x3BC79440, 0x1080},
++    {0x8051501C, 0x38A32BD8, 4}, {0x80515054, 0x38639440, 0x1080}, {0x80518518, 0x3AC62BD8, 4},
++    {0x8051851C, 0x3AE59440, 0x1080}, {0x8051D61C, 0x3BC62BD8, 4}, {0x8051D620, 0x3BA59440, 0x1080},
++    {0x8051D8B0, 0x38A32BD8, 4}, {0x8051D8E8, 0x38639440, 0x1080}, {0x8051DBA4, 0x3B262BD8, 4},
++    {0x8051DBAC, 0x3B059440, 0x1080}, {0x80534014, 0x3B262BD8, 4}, {0x80534018, 0x3B059440, 0x1080},
++    {0x805342A8, 0x38A32BD8, 4}, {0x805342E0, 0x38639440, 0x1080}, {0x8053E03C, 0x38A32BD8, 4},
++    {0x8053E074, 0x38639440, 0x1080}, {0x8054B23C, 0x38A32BD8, 4}, {0x8054B464, 0x3B262BD8, 4},
++    {0x8054B274, 0x38639440, 0x1080}, {0x8054B468, 0x3B059440, 0x1080}, {0x8054D510, 0x38A32BD8, 4},
++    {0x8054D548, 0x38639440, 0x1080}, {0x80551C5C, 0x3BE62BD8, 4}, {0x80551C60, 0x3BC59440, 0x1080},
++    {0x8055200C, 0x38A32BD8, 4}, {0x80552044, 0x38639440, 0x1080}, {0x80552AA0, 0x3B262BD8, 4},
++    {0x80552AA4, 0x3B059440, 0x1080}, {0x80552D48, 0x38A32BD8, 4}, {0x80552D80, 0x38639440, 0x1080},
++    {0x8055C234, 0x38A32BD8, 4}, {0x8055C26C, 0x38639440, 0x1080}, {0x8055F898, 0x38A32BD8, 4},
++    {0x8055F8D0, 0x38639440, 0x1080}, {0x80563374, 0x38A32BD8, 4}, {0x805633AC, 0x38639440, 0x1080},
++    {0x80563E24, 0x38A32BD8, 4}, {0x80563E5C, 0x38639440, 0x1080}, {0x805643FC, 0x38A32BD8, 4},
++    {0x80564434, 0x38639440, 0x1080}, {0x80564704, 0x3AC62BD8, 4}, {0x8056470C, 0x3AA59440, 0x1080},
++    {0x80572114, 0x3BE72BD8, 4}, {0x80572118, 0x3BC69440, 0x1080}, {0x8057DCF4, 0x3B262BD8, 4},
++    {0x8057DCF8, 0x3B059440, 0x1080}, {0x8057DFAC, 0x38A32BD8, 4}, {0x8057DFE4, 0x38639440, 0x1080},
++    {0x8057E464, 0x3AA42BD8, 4}, {0x80580FD4, 0x38A32BD8, 4}, {0x8058100C, 0x38639440, 0x1080},
++    {0x8058BA98, 0x3B652BD8, 4}, {0x8058C234, 0x38A32BD8, 4}, {0x8058C26C, 0x38639440, 0x1080},
++    {0x8058D860, 0x3B462BD8, 4}, {0x8058D864, 0x3B259440, 0x1080}, {0x8058DB10, 0x38A32BD8, 4},
++    {0x8058DB48, 0x38639440, 0x1080}, {0x8058DDE4, 0x3BE62BD8, 4}, {0x8058DDE8, 0x3BC59440, 0x1080},
++    {0x8058E428, 0x38A32BD8, 4}, {0x8058E460, 0x38639440, 0x1080}, {0x8058E744, 0x3B062BD8, 4},
++    {0x8058E748, 0x3AE59440, 0x1080}, {0x8058E9F0, 0x38A32BD8, 4}, {0x8058EA28, 0x38639440, 0x1080},
++    {0x8059B45C, 0x38A32BD8, 4}, {0x8059B494, 0x38639440, 0x1080}, {0x8059DACC, 0x38A32BD8, 4},
++    {0x8059DB04, 0x38639440, 0x1080}, {0x8059E4E0, 0x3B262BD8, 4}, {0x8059E4E4, 0x3B059440, 0x1080},
++    {0x8059E784, 0x38A32BD8, 4}, {0x8059E7BC, 0x38639440, 0x1080}, {0x8059ED78, 0x3BC62BD8, 4},
++    {0x8059ED7C, 0x3BA59440, 0x1080}, {0x8059F008, 0x38A32BD8, 4}, {0x8059F040, 0x38639440, 0x1080},
++    {0x805A341C, 0x3AC62BD8, 4}, {0x805A3420, 0x3AA59440, 0x1080}, {0x805A3710, 0x38C42BD8, 4},
++    {0x805A3748, 0x38849440, 0x1080}, {0x805A4F70, 0x38C42BD8, 4}, {0x805A4FA8, 0x38849440, 0x1080},
++    {0x805A7F74, 0x3B042BD8, 4}, {0x805A943C, 0x3A652BD8, 4}, {0x805A9414, 0x3A449440, 0x1080},
++    {0x805A9F78, 0x38A32BD8, 4}, {0x805AA168, 0x3B662BD8, 4}, {0x805A9FB0, 0x38639440, 0x1080},
++    {0x805AA16C, 0x3B459440, 0x1080}, {0x805AB35C, 0x38A32BD8, 4}, {0x805AB394, 0x38639440, 0x1080},
++    {0x805AB920, 0x3BC62BD8, 4}, {0x805AB928, 0x3BA59440, 0x1080}, {0x805ABC04, 0x38A32BD8, 4},
++    {0x805ABC3C, 0x38639440, 0x1080}, {0x805AE650, 0x38A32BD8, 4}, {0x805AE688, 0x38639440, 0x1080},
++    {0x805B1CEC, 0x38A32BD8, 4}, {0x805B1D24, 0x38639440, 0x1080}, {0x805B8778, 0x3B062BD8, 4},
++    {0x805B8ABC, 0x3B062BD8, 4}, {0x805B8780, 0x3B259440, 0x1080}, {0x805B8AC0, 0x3AE59440, 0x1080},
++    {0x805B9464, 0x3B462BD8, 4}, {0x805B98B0, 0x3B862BD8, 4}, {0x805B9468, 0x3B659440, 0x1080},
++    {0x805B98B4, 0x3B059440, 0x1080}, {0x805BA0F8, 0x3B262BD8, 4}, {0x805BA0FC, 0x3B059440, 0x1080},
++    {0x805BAB9C, 0x3BA62BD8, 4}, {0x805BABA0, 0x3AA59440, 0x1080},
++};
++bool s_object_zones_on = false;
++int s_object_zones_seat = 0;
++
++std::uint32_t ZoneSiteWord(const ZoneSite& z, int seat)
++{
++  return (z.original & 0xFFFF0000u) | ((z.original + z.step * static_cast<std::uint32_t>(seat)) & 0xFFFFu);
++}
++
++void PatchObjectZones(int seat)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_OBJETS");
++    return v && *v == '0';
++  }();
++  const bool on = !off && seat >= 0 && seat < 8;
++  if (on == s_object_zones_on)
++    return;
++  const int from = s_object_zones_on ? s_object_zones_seat : 0;
++  const int to = on ? seat : 0;
++  for (const ZoneSite& z : kObjectZoneSites)
++  {
++    if (Read32(z.address) != ZoneSiteWord(z, from))
++    {
++      std::fprintf(stderr, "[srnp racers] objects: 0x%08X holds %08X, not %08X: left alone\n", z.address,
++                   Read32(z.address), ZoneSiteWord(z, from));
++      return;
++    }
++  }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  for (const ZoneSite& z : kObjectZoneSites)
++  {
++    if (std::uint8_t* p = Guest(z.address, 4))
++      Put32(p, ZoneSiteWord(z, to));
++    jit.InvalidateICache(z.address, 4, true);
++  }
++  s_object_zones_on = on;
++  s_object_zones_seat = to;
++  std::fprintf(stderr, "[srnp racers] objects: %zu sites drawn for racer %d's zone\n",
++               std::size(kObjectZoneSites), to);
++}
++
+ void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+@@ -878,6 +1050,13 @@ void PatchSeatDisplays(int seat)
+   PatchSeatDisplay(s_prompts_a, seat);
+   PatchSeatDisplay(s_prompts_b, seat);
+   PatchSeatDisplay(s_prompts_c, seat);
++  static const char* hud = std::getenv("SRNP_HUD_SIEGE");  // "0": both off, "a"/"b": only one (tests)
++  if (!hud || (*hud != '0' && *hud != 'b'))
++    PatchSeatDisplay(s_hud_player, seat);
++  if (!hud || (*hud != '0' && *hud != 'a'))
++    PatchSeatDisplay(s_hud_804250C0, seat);
++  PatchSeatDisplay(s_hud_fade, seat);
++  PatchObjectZones(seat);
+ }
+ 
+ // The level's intro (2026-11-26, Gibax: on his machine "ya que l'animation et le son de Sonic qui sort
+@@ -1395,7 +1574,14 @@ std::uint64_t RacersHash()
+       // +0x894, the same for the display task 0x804A4F2C started for this machine's seat alone.
+       {0x894, 0x89C},
+       // The camera of the racer's events, this machine's (PatchCameras).
+-      {0x106C, 0x106D}};
++      {0x106C, 0x106D},
++      // Sound handles (0x80412xxx: given by 0x8008D78C, played by 0x8008BBCC, tested by 0x8008BC9C,
++      // stopped by 0x8008BDB4, nothing else reads them): +0xF44/+0xF48 a human's, +0xF50 + 4 x view a
++      // CPU's engine for each view. Their values depend on the order the sounds were started in, which
++      // differs once the track's objects show (and sound) around each machine's seat (PatchObjectZones;
++      // measured on 2026-11-26: +0xF50 alone differed, 0x0D against 0x06, from frame 960 on, the race
++      // the same).
++      {0xF44, 0xF4C}, {0xF50, 0xF60}};
+   // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
+   // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+-- 
+2.34.1.windows.1
+
