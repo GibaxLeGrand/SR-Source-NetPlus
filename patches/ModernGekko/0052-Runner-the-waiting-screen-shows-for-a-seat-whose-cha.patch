@@ -1,0 +1,72 @@
+From 052e3f0d5546306e9a96ce233b51513c81050de6 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:10:22 +0100
+Subject: [PATCH] Runner: the waiting screen shows "?" for a seat whose
+ character is not known
+
+Through the game's menus (SRNP_LOBBY=2) a seat's character is only known once
+the relay gives its pick (PICKS, or GO for a seat that left); until then the
+waiting screen drew SRNP_PERSOS's default, faded (Gibax: "en 2P c'est tjr Shadow
+en bleuatre"). It now draws the menus' "?" icon for such a seat, and no gear.
+
+Measured: 2-player demo, runner 0's waiting screen while 2P is still in Player
+Entry shows 1P's Sonic and 2P's "?"; the race after, 26 identical checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 79d609b..8dd4a3a 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -107,6 +107,10 @@ enum class Vanilla
+   Synced,
+ };
+ std::atomic<Vanilla> s_vanilla{Vanilla::Free};
++// Through the game's menus, the seats whose choice the relay has given (PICKS, GO): the others'
++// character is not known yet (SRNP_PERSOS is only a default), so the waiting screen shows the menus'
++// "?" for them (Gibax, 2026-11-26: "en 2P c'est tjr Shadow en bleuâtre").
++std::array<std::atomic<bool>, 8> s_picked{};
+ std::string s_start_state;
+ std::atomic<bool> s_veil{false};  // the waiting screen over the running game (WaitView::veil)
+ bool LobbyVanilla();
+@@ -601,7 +605,10 @@ bool TakePicks(const std::string& line)
+   {
+     int character = -1, gear = 0;
+     if (std::sscanf(line.c_str() + p, "%d/%d", &character, &gear) == 2 && character >= 0)
++    {
+       SetSeatChoice(seat, character, gear);
++      s_picked[static_cast<std::size_t>(seat)] = true;
++    }
+     const std::size_t q = line.find(',', p);
+     if (q == std::string::npos)
+       break;
+@@ -851,7 +858,11 @@ void WaitForGo()
+       {
+         int seat = -1, character = -1, gear = 0;
+         if (std::sscanf(line.c_str() + p, "%d:%d/%d", &seat, &character, &gear) == 3)
++        {
+           SetSeatChoice(seat, character, gear);
++          if (seat >= 0 && seat < 8)
++            s_picked[static_cast<std::size_t>(seat)] = true;
++        }
+         const std::size_t next = line.find(' ', p);
+         p = next == std::string::npos ? line.size() : next + 1;
+       }
+@@ -914,8 +925,9 @@ WaitView RelayWaitView()
+   view.racers = s_rule_racers;
+   for (int k = 0; k < view.seats && k < 8; ++k)
+   {
+-    view.characters[static_cast<std::size_t>(k)] = SeatCharacter(k);
+-    view.gears[static_cast<std::size_t>(k)] = SeatGear(k);
++    const bool known = !view.vanilla || s_picked[static_cast<std::size_t>(k)];
++    view.characters[static_cast<std::size_t>(k)] = known ? SeatCharacter(k) : -1;
++    view.gears[static_cast<std::size_t>(k)] = known ? SeatGear(k) : -1;
+   }
+   return view;
+ }
+-- 
+2.34.1.windows.1
+
