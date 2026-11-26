@@ -3,7 +3,7 @@
 #   - launcher A (hôte, tag HOTE) : ouvre la salle (relais intégré, port $PORT) ;
 #   - launcher B (tag AMI) : s'y connecte, se dit prêt ; l'hôte lance la course DEPART s après ;
 #   - chaque launcher lance son runner (work\chassis_p2) en lobby par les menus du jeu (SRNP_LOBBY=2) :
-#     appuis simulés dans Player Entry (A : RAAS = Tails, B : RRAAS = Knuckles), course à l'IA
+#     appuis simulés dans Player Entry (A : RAAS = Tails, B : RRAAS = Knuckles ; TE : RAA...S, RRAA...S), course à l'IA
 #     (SRNP_INPUT=ia) ; photos des launchers (lobby) et des jeux ;
 #   - fin : runners arrêtés après DUREE s de course, puis les launchers ; bilan du relais (relay.log).
 #   test_online.sh   (RULES=<course>/<laps>/<racers>/<delay>, défaut 1/1/8/2 ; DUREE=90 ; DEPART=6)
@@ -20,11 +20,16 @@ EXE="$L/SR-Source.exe"
 JEU="${JEU:-GXEE8P}"
 if [[ "$JEU" == GXSRTE ]]; then
   RUNNER="${RUNNER:-$W/te/runner/moderngekko-run.exe}"
-  STATE="${ETAT:-$W/states/gxsrte_entree_joueurs_metal_1tour_jit.sav}"
+  # « Are you ready? » de la Free Race (CPUs ON, 1 tour, Sonic Blue Star) : le lobby par les menus y appuie
+  # deux fois B pour revenir au choix des persos (depuis l'Entrée des joueurs, ces B en sortaient, 26/11).
+  STATE="${ETAT:-$W/states/gxsrte_pret1p_metal_1tour_jit.sav}"
+  # Sur TE, le Start n'est pris que ~90 frames après le A de la planche (« . » : 30 frames d'attente).
+  TOUCHES_A_DEFAUT="RAA...S"; TOUCHES_B="RRAA...S"
   export STATICRECOMP_MODULE="$(cygpath -w "${MODULE_TE:-$W/te/module/gGXSRTE_recomp_te.dll}")"
 else
   RUNNER="$W/chassis_p2/moderngekko-run.exe"
   STATE="${ETAT:-$W/states/gxee8p_pret1p_100pc_metal_1tour_jit.sav}"
+  TOUCHES_A_DEFAUT="RAAS"; TOUCHES_B="RRAAS"
 fi
 PORT="${PORT:-7850}"
 RUN="$L/runs/$(date +%Y%m%d-%H%M%S)"
@@ -109,11 +114,11 @@ lance() {  # lance <pc> <auto> <touches> [variables...]
      SRNP_LOBBY_KEYS="$keys" SRNP_CKDUMP="$ck" "$@" "$EXE" --x11 "$pc-$(basename "$RUN")" > "$RUN/$pc/launcher.out" 2>&1) &
   echo "$(date +%T) launcher $pc lancé ($auto)"
 }
-lance pcA host "${TOUCHES_A-RAAS}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}" SRNP_RELAY_PING="${PING:-}" SRNP_FIN_CHOIX="${FIN_A:-}"
+lance pcA host "${TOUCHES_A-$TOUCHES_A_DEFAUT}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}" SRNP_RELAY_PING="${PING:-}" SRNP_FIN_CHOIX="${FIN_A:-}"
 sleep 7
 LA=$(pid_de SR-Source.exe "pcA-$(basename "$RUN")")
 photo "$LA" "$RUN/1_hote_seul.png"
-lance pcB connect RRAAS SRNP_ONLINE_READY=1 SRNP_ONLINE_BACKGROUND="${FOND_B:-}" SRNP_INPUT="${INPUT_B:-ia}" SRNP_FIN_CHOIX="${FIN_B:-}"
+lance pcB connect "$TOUCHES_B" SRNP_ONLINE_READY=1 SRNP_ONLINE_BACKGROUND="${FOND_B:-}" SRNP_INPUT="${INPUT_B:-ia}" SRNP_FIN_CHOIX="${FIN_B:-}"
 sleep 4
 LB=$(pid_de SR-Source.exe "pcB-$(basename "$RUN")")
 photo "$LA" "$RUN/2_lobby_hote.png"
