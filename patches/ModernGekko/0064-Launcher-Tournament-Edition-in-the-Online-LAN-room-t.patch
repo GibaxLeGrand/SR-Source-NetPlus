@@ -1,0 +1,885 @@
+From 5f7f70211a68cbdf5d66baee4038717991273378 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:44:56 +0100
+Subject: [PATCH] Launcher: Tournament Edition in the Online/LAN room (the
+ game, its version, a start state per game)
+
+The Online/LAN play window chooses the game of the matches (Sonic Riders or Sonic Riders Tournament
+Edition, the extracted ones), each with its own start state (online.ini: game=, start_state= for
+Sonic Riders, start_state_GXSRTE=). Room protocol SRNP-ONLINE-3: JOIN and MEMBERS carry the game's
+disc ID and its main.dol's fingerprint (the runner's addresses are those of one version of TE,
+2.4.6.1); the room shows OTHER GAME / OTHER GAME VERSION and the host can't start until everyone
+has the host's. The match starts the room's game, whatever PLAY would start; the labels mod
+(srnp_etiquettes, the US game's GTSE) is never turned on for TE; the mods' fingerprint counts the
+match game's mods only; the player's GameSettings\*.ini go into the match's user folder.
+PrepareGameFolder: probes of folders that may be missing (Load) have their own error code (with
+the labels mod off, a missing Load folder left the error set and the game did not start). A game
+that does not start says why on the launcher's output.
+
+Measured 2026-11-26 (two launchers, TE, runner of work\te\runner, native module): both games
+started from the room, waiting screen, 2228 frames of lockstep, 34 identical checksums, 0
+divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/launcher_online.cpp      | 154 +++++++++++++++++++++++++++------
+ tools/launcher_online.hpp      |  53 +++++++++---
+ tools/launcher_online_ui.hpp   |  92 +++++++++++++++++---
+ tools/moderngekko_launcher.cpp |  69 +++++++++++----
+ 4 files changed, 299 insertions(+), 69 deletions(-)
+
+diff --git a/tools/launcher_online.cpp b/tools/launcher_online.cpp
+index bf05120..08b5add 100644
+--- a/tools/launcher_online.cpp
++++ b/tools/launcher_online.cpp
+@@ -32,6 +32,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cctype>
+ #include <chrono>
+ #include <deque>
+ #include <cstdio>
+@@ -197,6 +198,10 @@ std::string RandomKey()
+   std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(random()));
+   return text;
+ }
++
++// Below, with the settings file.
++std::vector<std::string> Lines(const std::string& text);
++std::string Trimmed(std::string_view text);
+ }  // namespace
+ 
+ Rules Clamped(Rules rules)
+@@ -223,6 +228,24 @@ std::string CleanTag(std::string_view text)
+   return tag;
+ }
+ 
++std::string GameId(std::string_view text)
++{
++  if (text.size() != 6 ||
++      !std::ranges::all_of(text, [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }))
++    return "-";
++  return std::string(text);
++}
++
++const char* OnlineGameName(std::string_view game)
++{
++  for (const auto& [id, name] : ONLINE_GAMES)
++  {
++    if (game == id)
++      return name;
++  }
++  return "";
++}
++
+ std::string Fingerprint(const fs::path& file)
+ {
+   std::ifstream stream(file, std::ios::binary);
+@@ -246,9 +269,14 @@ std::string Fingerprint(const fs::path& file)
+ }
+ 
+ std::vector<std::string> MatchFileMods(const std::vector<fs::path>& mod_folders,
+-                                       std::vector<std::string> enabled)
++                                       std::vector<std::string> enabled, std::string_view game)
+ {
+   std::error_code ec;
++  if (game != "GXEE8P")  // the labels mod is Sonic Riders US's (its GTSE): never on another game
++  {
++    std::erase(enabled, "srnp_etiquettes");
++    return enabled;
++  }
+   const bool labels_there = std::ranges::any_of(
+       mod_folders, [&](const fs::path& folder) { return fs::is_directory(folder / "srnp_etiquettes", ec); });
+   if (labels_there && std::ranges::find(enabled, "srnp_etiquettes") == enabled.end())
+@@ -256,7 +284,8 @@ std::vector<std::string> MatchFileMods(const std::vector<fs::path>& mod_folders,
+   return enabled;
+ }
+ 
+-std::string ModsFingerprint(const std::vector<fs::path>& mod_folders, const std::vector<std::string>& mods)
++std::string ModsFingerprint(const std::vector<fs::path>& mod_folders, const std::vector<std::string>& mods,
++                            std::string_view game)
+ {
+   std::uint64_t hash = 0xCBF29CE484222325ull;
+   const auto add = [&hash](std::string_view text) {
+@@ -287,6 +316,25 @@ std::string ModsFingerprint(const std::vector<fs::path>& mod_folders, const std:
+     std::ifstream ini(folder / "mod.ini", std::ios::binary);
+     std::stringstream text;
+     text << ini.rdbuf();
++    // A mod made for another game: the match's game does not load it (file_mods.hpp EnabledFileMods).
++    std::string mod_game;
++    for (const std::string& line : Lines(text.str()))
++    {
++      const std::size_t equals = line.find('=');
++      if (equals == std::string::npos)
++        continue;
++      std::string key = Trimmed(std::string_view(line).substr(0, equals));
++      for (char& c : key)
++        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++      if (key == "game")
++      {
++        mod_game = Trimmed(std::string_view(line).substr(equals + 1));
++        for (char& c : mod_game)
++          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++      }
++    }
++    if (!game.empty() && mod_game != game)
++      continue;
+     add(text.str());
+     std::vector<std::string> entries;
+     for (const char* part : {"files", "patches.ini"})
+@@ -439,6 +487,8 @@ struct Relay::Impl
+     std::string tag;
+     bool ready = false;
+     bool host = false;
++    std::string game = "-";
++    std::string build = "-";
+     std::string state = "-";
+     std::string mods = "-";
+     bool playing = false;
+@@ -629,7 +679,7 @@ struct Relay::Impl
+     {
+       const RoomMember& m = *sorted[i];
+       line += (i ? "," : "") + std::to_string(m.seat) + ":" + (m.tag.empty() ? "-" : m.tag) + ":" +
+-              (m.ready ? "1" : "0") + ":" + m.state + ":" + (m.playing ? "1" : "0") + ":" + m.mods;
++              (m.ready ? "1" : "0") + ":" + m.state + ":" + (m.playing ? "1" : "0") + ":" + m.mods + ":" + m.game + ":" + m.build;
+     }
+     return line;
+   }
+@@ -660,7 +710,7 @@ struct Relay::Impl
+     {
+       if (member)
+         return;
+-      if (words.size() < 5 || words[1] != PROTOCOL)
++      if (words.size() < 7 || words[1] != PROTOCOL)
+       {
+         Send(id, "REFUSED version");
+         connections[id].closed = true;
+@@ -668,7 +718,7 @@ struct Relay::Impl
+             (words.size() > 1 ? words[1] : std::string("?")) + ")");
+         return;
+       }
+-      const bool host = words.size() > 5 && words[5] == host_key &&
++      const bool host = words.size() > 7 && words[7] == host_key &&
+                         std::ranges::none_of(members, &RoomMember::host);
+       if (in_match || (!host && static_cast<int>(members.size()) >= MAX_PLAYERS))
+       {
+@@ -690,13 +740,15 @@ struct Relay::Impl
+       joined.tag = CleanTag(words[2]);
+       if (joined.tag.empty())
+         joined.tag = "P" + std::to_string(seat + 1);
+-      joined.state = words[3].size() == 16 ? words[3] : "-";
+-      joined.mods = words[4].size() == 16 ? words[4] : "-";
++      joined.game = GameId(words[3]);
++      joined.build = words[4].size() == 16 ? words[4] : "-";
++      joined.state = words[5].size() == 16 ? words[5] : "-";
++      joined.mods = words[6].size() == 16 ? words[6] : "-";
+       joined.host = host;
+       joined.ready = host;
+       members.push_back(joined);
+       Log("room: " + joined.tag + " joined as P" + std::to_string(seat + 1) + (host ? " (host)" : "") +
+-          ", start state " + joined.state + ", mods " + joined.mods);
++          ", game " + joined.game + " (main.dol " + joined.build + "), start state " + joined.state + ", mods " + joined.mods);
+       Send(id, "WELCOME " + std::to_string(seat) + " " + (host ? "1" : "0"));
+       SendLaunchers(MembersLine());
+       SendLaunchers(RulesLine());
+@@ -741,10 +793,15 @@ struct Relay::Impl
+       return;
+     for (const RoomMember& m : members)
+     {
+-      if (!m.ready || m.state != host->state || m.mods != host->mods)
++      if (!m.ready || m.game != host->game || m.build != host->build || m.state != host->state ||
++          m.mods != host->mods)
+       {
+         Log("room: not started: " + m.tag +
+-            (!m.ready ? " is not ready" : m.state != host->state ? " has another start state" : " has other mods"));
++            (!m.ready                  ? " is not ready"
++             : m.game != host->game   ? " plays another game"
++             : m.build != host->build ? " has another version of the game"
++             : m.state != host->state ? " has another start state"
++                                      : " has other mods"));
+         return;
+       }
+     }
+@@ -1460,6 +1517,8 @@ struct Client::Impl
+   std::string host;
+   std::uint16_t port = DEFAULT_PORT;
+   std::string tag;
++  std::string game;
++  std::string build;
+   std::string state;
+   std::string mods;
+   std::string host_key;
+@@ -1527,6 +1586,8 @@ struct Client::Impl
+           member.state = fields[3];
+           member.playing = fields[4] == "1";
+           member.mods = fields.size() > 5 ? fields[5] : "-";
++          member.game = fields.size() > 6 ? fields[6] : "-";
++          member.build = fields.size() > 7 ? fields[7] : "-";
+           view.members.push_back(member);
+         }
+       }
+@@ -1598,7 +1659,7 @@ struct Client::Impl
+       return Fail(RoomView::Link::Lost, "no answer");
+     }
+     std::string in;
+-    std::string pending = "JOIN " + std::string(PROTOCOL) + " " + (tag.empty() ? "-" : tag) + " " + state + " " + mods +
++    std::string pending = "JOIN " + std::string(PROTOCOL) + " " + (tag.empty() ? "-" : tag) + " " + game + " " + build + " " + state + " " + mods +
+                           (host_key.empty() ? "" : " " + host_key) + "\n";
+     while (!stop)
+     {
+@@ -1633,13 +1694,15 @@ struct Client::Impl
+   }
+ };
+ 
+-Client::Client(std::string host, std::uint16_t port, std::string tag, std::string state,
+-               std::string mods, std::string host_key)
++Client::Client(std::string host, std::uint16_t port, std::string tag, std::string game,
++               std::string build, std::string state, std::string mods, std::string host_key)
+     : m_impl(std::make_unique<Impl>())
+ {
+   m_impl->host = std::move(host);
+   m_impl->port = port;
+   m_impl->tag = std::move(tag);
++  m_impl->game = GameId(game);
++  m_impl->build = build.size() == 16 ? std::move(build) : std::string("-");
+   m_impl->state = std::move(state);
+   m_impl->mods = std::move(mods);
+   m_impl->host_key = std::move(host_key);
+@@ -1831,8 +1894,12 @@ Settings LoadSettings(const fs::path& user_directory, std::string_view nickname)
+       settings.address = value;
+     else if (key == "port" && number >= 1 && number <= 65535)
+       settings.port = static_cast<std::uint16_t>(number);
+-    else if (key == "start_state")
+-      settings.start_state = Utf8Path(value);
++    else if (key == "game" && *OnlineGameName(value))
++      settings.game = value;
++    else if (key == "start_state")  // Sonic Riders' (the first online game: no game in its name)
++      settings.start_states["GXEE8P"] = Utf8Path(value);
++    else if (key.starts_with("start_state_") && *OnlineGameName(key.substr(12)))
++      settings.start_states[key.substr(12)] = Utf8Path(value);
+     else if (key == "course")
+       settings.rules.course = number;
+     else if (key == "laps")
+@@ -1846,6 +1913,12 @@ Settings LoadSettings(const fs::path& user_directory, std::string_view nickname)
+   return settings;
+ }
+ 
++fs::path StartState(const Settings& settings)
++{
++  const auto it = settings.start_states.find(settings.game);
++  return it == settings.start_states.end() ? fs::path() : it->second;
++}
++
+ bool SaveSettings(const fs::path& user_directory, const Settings& settings)
+ {
+   std::error_code ignored;
+@@ -1854,8 +1927,16 @@ bool SaveSettings(const fs::path& user_directory, const Settings& settings)
+   text += "tag=" + settings.tag + "\n";
+   text += "address=" + settings.address + "\n";
+   text += "port=" + std::to_string(settings.port) + "\n";
+-  text += "# The game state every match starts from (Player Entry): every player needs the same file\n";
+-  text += "start_state=" + PathUtf8(settings.start_state) + "\n";
++  text += "# The game of the matches: GXEE8P (Sonic Riders) or GXSRTE (Tournament Edition)\n";
++  text += "game=" + settings.game + "\n";
++  text += "# The game state every match starts from (Player Entry), for each game: every player needs the\n";
++  text += "# same file. start_state is Sonic Riders', start_state_<disc ID> another game's.\n";
++  for (const auto& [game, state] : settings.start_states)
++  {
++    if (*OnlineGameName(game) && !state.empty())
++      text += (game == "GXEE8P" ? std::string("start_state") : "start_state_" + game) + "=" +
++              PathUtf8(state) + "\n";
++  }
+   text += "course=" + std::to_string(settings.rules.course) + "\n";
+   text += "laps=" + std::to_string(settings.rules.laps) + "\n";
+   text += "racers=" + std::to_string(settings.rules.racers) + "\n";
+@@ -1863,8 +1944,9 @@ bool SaveSettings(const fs::path& user_directory, const Settings& settings)
+   return WriteText(user_directory / "online.ini", text);
+ }
+ 
+-fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view keyboard_device,
+-                           const std::vector<fs::path>& mod_folders, std::string* error)
++fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view game,
++                           std::string_view keyboard_device, const std::vector<fs::path>& mod_folders,
++                           std::string* error)
+ {
+   const fs::path folder = user_directory / "Online";
+   std::error_code ec;
+@@ -1888,7 +1970,8 @@ fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view keyb
+   if (const char* background = std::getenv("SRNP_ONLINE_BACKGROUND"); background && *background)
+     SetIni(dolphin, "Input", "BackgroundInput", *background == '1' ? "True" : "False");
+   SetIni(dolphin, "Interface", "UsePanicHandlers", "False");
+-  if (fs::is_directory(user_directory / "Load", ec))
++  std::error_code probe;  // folders and files that may be missing: not an error
++  if (fs::is_directory(user_directory / "Load", probe))
+     SetIni(dolphin, "General", "LoadPath", PathUtf8(user_directory / "Load") + "/");
+   // GCPadNew.ini: port 1 a keyboard with no key (a device, so that the relay's presses reach the
+   // menus, but nothing of its own); port 4 the player's controller as they set it up, read by the
+@@ -1906,20 +1989,38 @@ fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view keyb
+   // The rest as the player has it.
+   for (const char* name : {"GFX.ini", "GCKeyNew.ini", "Hotkeys.ini"})
+   {
+-    if (fs::is_regular_file(user_directory / "Config" / name, ec))
++    if (fs::is_regular_file(user_directory / "Config" / name, probe))
+       fs::copy_file(user_directory / "Config" / name, folder / "Config" / name,
+-                    fs::copy_options::overwrite_existing, ec);
++                    fs::copy_options::overwrite_existing, probe);
++  }
++  // The player's per-game settings (GameSettings\<disc ID>.ini: Dolphin reads them in the user
++  // folder too; the StaticRecomp settings of a game the build has none for, Tournament Edition's).
++  if (fs::is_directory(user_directory / "GameSettings", probe))
++  {
++    fs::create_directories(folder / "GameSettings", probe);
++    for (fs::directory_iterator it(user_directory / "GameSettings", probe);
++         !probe && it != fs::directory_iterator(); it.increment(probe))
++    {
++      std::error_code one;
++      if (it->path().extension() == ".ini" && fs::is_regular_file(it->path(), one))
++        fs::copy_file(it->path(), folder / "GameSettings" / it->path().filename(),
++                      fs::copy_options::overwrite_existing, one);
++    }
+   }
+   // config.ini: the player's; the labels of SR-Source Net Plus (players 5P-8P, the tags: the mod
+   // srnp_etiquettes) on when it is installed. Measured on 2026-11-25: without it, the relay's Start
+   // did not get past the game's Player Entry (0 of 2 games, 2 of 2 with it).
++  // Tournament Edition: the labels mod stays off (its GTSE is the US game's, TE has its own); the
++  // runner still reads its labels from the folder (srnp_labels, the SRNPLBL1 block), through --mods.
+   std::vector<std::string> frontend = Lines(ReadText(user_directory / "config.ini"));
++  if (game != "GXEE8P")
++    std::erase_if(frontend, [](const std::string& line) { return Trimmed(line) == "mod=srnp_etiquettes"; });
+   bool labels_on = false;
+   for (const std::string& line : frontend)
+     labels_on = labels_on || Trimmed(line) == "mod=srnp_etiquettes";
+   bool labels_there = false;
+   for (const fs::path& mods : mod_folders)
+-    labels_there = labels_there || fs::is_directory(mods / "srnp_etiquettes", ec);
++    labels_there = labels_there || (game == "GXEE8P" && fs::is_directory(mods / "srnp_etiquettes", probe));
+   if (labels_there && !labels_on)
+   {
+     bool added = false;
+@@ -1948,8 +2049,9 @@ fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view keyb
+       continue;
+     const std::string name = Trimmed(std::string_view(entry).substr(4));
+     const fs::path source = user_directory / "Mods" / Utf8Path(name);
+-    if (name.empty() || !fs::is_directory(source, ec))
++    if (name.empty() || !fs::is_directory(source, probe))
+       continue;
++    ec.clear();
+     // Folders reached through links and junctions too (fs::status follows them).
+     const auto copy_tree = [&ec](const auto& self, const fs::path& from, const fs::path& to) -> void {
+       fs::create_directories(to, ec);
+@@ -1970,10 +2072,10 @@ fs::path PrepareGameFolder(const fs::path& user_directory, std::string_view keyb
+       return {};
+     }
+   }
+-  if (!written || ec)
++  if (!written)
+   {
+     if (error)
+-      *error = "can't write the settings in " + PathUtf8(folder) + (ec ? ": " + ec.message() : "");
++      *error = "can't write the settings in " + PathUtf8(folder);
+     return {};
+   }
+   return folder;
+diff --git a/tools/launcher_online.hpp b/tools/launcher_online.hpp
+index f26801d..cfbae87 100644
+--- a/tools/launcher_online.hpp
++++ b/tools/launcher_online.hpp
+@@ -12,8 +12,14 @@
+ // Start, the waiting screen shows everyone, then the race runs in lockstep from the same start state.
+ // When every game has closed, the room is back for the next race.
+ //
++// The match's game is the host's: Sonic Riders (GXEE8P) or Tournament Edition (GXSRTE), chosen in the
++// Online/LAN play window with its own start state; a player of another game can't start with it.
++//
+ // Room lines (text, LF), on the relay's port, from a launcher:
+-//   JOIN <protocol> <tag> <state> <mods> [<host key>]   first line; <state>: the start state's
++//   JOIN <protocol> <tag> <game> <build> <state> <mods> [<host key>]   first line; <game>: the disc's
++//                                                ID, <build>: its main.dol's fingerprint (the version: the
++//                                                runner's addresses are those of one version of
++//                                                Tournament Edition, 2.4.6.1), <state>: the start state's
+ //                                                fingerprint, <mods>: the file mods' (ModsFingerprint)
+ //   LREADY <0|1>                                 ready or not (the host is always ready)
+ //   LRULES <course> <laps> <racers> <delay>      the host's race
+@@ -21,7 +27,7 @@
+ //   LGONE                                        this launcher's game has closed (or did not start)
+ // to the launchers:
+ //   WELCOME <seat> <host 0|1>  |  REFUSED <why>  (version, full, running)
+-//   MEMBERS <seat>:<tag>:<ready>:<state>:<playing>:<mods>,...   at every change
++//   MEMBERS <seat>:<tag>:<ready>:<state>:<playing>:<mods>:<game>:<build>,...   at every change
+ //   LRULES <course> <laps> <racers> <delay>
+ //   MATCH <seats> <seat> <delay>                 start the game: this seat of that many
+ //   ROOM                                         every game has closed: the room again
+@@ -33,6 +39,7 @@
+ #include <array>
+ #include <cstdint>
+ #include <filesystem>
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -42,13 +49,24 @@
+ 
+ namespace moderngekko::frontend::online
+ {
+-inline constexpr const char* PROTOCOL = "SRNP-ONLINE-2";
++inline constexpr const char* PROTOCOL = "SRNP-ONLINE-3";
+ inline constexpr std::uint16_t DEFAULT_PORT = 7845;
+ inline constexpr int MAX_PLAYERS = 8;
+ inline constexpr int COURSES = 16;
+ inline constexpr int MAX_LAPS = 9;
+ inline constexpr int MAX_DELAY = 10;
+ 
++// The games a room can play (disc ID, the name the windows show): the online mod's (the runner's
++// srnp_game.hpp knows the same two).
++inline constexpr std::array<std::pair<const char*, const char*>, 2> ONLINE_GAMES = {{
++    {"GXEE8P", "Sonic Riders"},
++    {"GXSRTE", "Sonic Riders Tournament Edition"},
++}};
++// The name of one of them, "" for another.
++const char* OnlineGameName(std::string_view game);
++// The disc ID as the room passes it: 6 of A-Z 0-9, else "-".
++std::string GameId(std::string_view text);
++
+ // The courses by the game's number (1-16), as the game's title cards name them (the runner's waiting
+ // screen has the same list).
+ inline constexpr std::array<const char*, 17> COURSE_NAMES = {
+@@ -78,6 +96,8 @@ struct Member
+   int seat = -1;       // 0 = P1, the host
+   std::string tag;     // up to 8 of A-Z 0-9
+   bool ready = false;  // the host always is
++  std::string game;    // the disc ID of the game it plays, "-" if unknown
++  std::string build;   // that game's main.dol fingerprint (its version), "-" if unknown
+   std::string state;   // the start state's fingerprint, "-" without one
+   bool playing = false;  // its game is open (a match is on)
+   std::string mods;      // the file mods' fingerprint
+@@ -135,8 +155,8 @@ private:
+ class Client
+ {
+ public:
+-  Client(std::string host, std::uint16_t port, std::string tag, std::string state, std::string mods,
+-         std::string host_key = {});
++  Client(std::string host, std::uint16_t port, std::string tag, std::string game, std::string build,
++         std::string state, std::string mods, std::string host_key = {});
+   ~Client();
+   Client(const Client&) = delete;
+   Client& operator=(const Client&) = delete;
+@@ -160,15 +180,17 @@ private:
+ std::string CleanTag(std::string_view text);
+ // FNV-1a 64 of the file, 16 hex digits; "-" when it can't be read.
+ std::string Fingerprint(const std::filesystem::path& file);
+-// The file mods a match's game loads: the ones turned on (config.ini's mod= lines, in order) and the
+-// labels mod (srnp_etiquettes) when installed: as PrepareGameFolder sets them.
++// The file mods a match's game loads: the ones turned on (config.ini's mod= lines, in order) and, on
++// Sonic Riders (GXEE8P) only, the labels mod (srnp_etiquettes) when installed: as PrepareGameFolder
++// sets them. On another game the labels mod is off (its GTSE is the US game's).
+ std::vector<std::string> MatchFileMods(const std::vector<std::filesystem::path>& mod_folders,
+-                                       std::vector<std::string> enabled);
++                                       std::vector<std::string> enabled, std::string_view game);
+ // FNV-1a 64 of those mods: each one's name, mod.ini, and the names and sizes of its files (files/,
+ // patches.ini; not textures/, which only change what is drawn). Every player of a room needs the same:
+-// a mod's files do not load at the disc's pace (measured with the Japanese voices, 2026-11-25).
++// a mod's files do not load at the disc's pace (measured with the Japanese voices, 2026-11-25). Only the
++// mods made for `game` (their mod.ini's game=) count: the runner loads no other.
+ std::string ModsFingerprint(const std::vector<std::filesystem::path>& mod_folders,
+-                            const std::vector<std::string>& mods);
++                            const std::vector<std::string>& mods, std::string_view game);
+ 
+ // This computer's IPv4 addresses that others may reach, with the kind of network each is on (home
+ // first), as "ip:port".
+@@ -180,9 +202,13 @@ struct Settings
+   std::string tag;
+   std::string address = "127.0.0.1";
+   std::uint16_t port = DEFAULT_PORT;
+-  std::filesystem::path start_state;
++  std::string game = "GXEE8P";  // the game of the matches (ONLINE_GAMES)
++  // Each game's start state (a savestate of that game, on Player Entry).
++  std::map<std::string, std::filesystem::path> start_states;
+   Rules rules;
+ };
++// The start state of the settings' game ("" without one).
++std::filesystem::path StartState(const Settings& settings);
+ Settings LoadSettings(const std::filesystem::path& user_directory, std::string_view nickname);
+ bool SaveSettings(const std::filesystem::path& user_directory, const Settings& settings);
+ 
+@@ -190,8 +216,9 @@ bool SaveSettings(const std::filesystem::path& user_directory, const Settings& s
+ // from the player's: Dolphin.ini and config.ini as theirs, with the online changes (the pad on port 4,
+ // which the game does not see, read by the runner and sent to the relay; port 1 a keyboard with no
+ // key, so that only the relay's presses reach the game), the textures of their Load folder, and
+-// the labels mod (srnp_etiquettes) on when one of `mod_folders` has it. Empty, with why, on failure.
+-std::filesystem::path PrepareGameFolder(const std::filesystem::path& user_directory,
++// the labels mod (srnp_etiquettes) on when one of `mod_folders` has it and `game` is Sonic Riders
++// (GXEE8P; on Tournament Edition it stays off). Empty, with why, on failure.
++std::filesystem::path PrepareGameFolder(const std::filesystem::path& user_directory, std::string_view game,
+                                         std::string_view keyboard_device,
+                                         const std::vector<std::filesystem::path>& mod_folders,
+                                         std::string* error);
+diff --git a/tools/launcher_online_ui.hpp b/tools/launcher_online_ui.hpp
+index da007e0..abc217d 100644
+--- a/tools/launcher_online_ui.hpp
++++ b/tools/launcher_online_ui.hpp
+@@ -18,6 +18,7 @@
+ #include <array>
+ #include <cstdio>
+ #include <filesystem>
++#include <map>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -32,7 +33,9 @@ struct OnlineDialog
+   std::array<char, 16> tag{};
+   std::array<char, 256> address{};
+   int port = online::DEFAULT_PORT;
+-  std::array<char, 1024> start_state{};
++  std::string game = "GXEE8P";  // the match's game (online::ONLINE_GAMES)
++  std::array<char, 1024> start_state{};  // its start state (as typed)
++  std::map<std::string, std::string> other_states;  // the other games' start states
+   bool show_address = false;
+ };
+ 
+@@ -49,8 +52,23 @@ inline void OnlineDialogFrom(OnlineDialog& dialog, const online::Settings& setti
+   std::snprintf(dialog.tag.data(), dialog.tag.size(), "%s", settings.tag.c_str());
+   std::snprintf(dialog.address.data(), dialog.address.size(), "%s", settings.address.c_str());
+   dialog.port = settings.port;
++  dialog.game = settings.game;
++  dialog.other_states.clear();
++  for (const auto& [game, state] : settings.start_states)
++    dialog.other_states[game] = text::PathText(state);
+   std::snprintf(dialog.start_state.data(), dialog.start_state.size(), "%s",
+-                text::PathText(settings.start_state).c_str());
++                dialog.other_states[dialog.game].c_str());
++}
++
++// The game of the window becomes `game`: its start state in the field.
++inline void OnlineDialogGame(OnlineDialog& dialog, const std::string& game)
++{
++  if (game == dialog.game)
++    return;
++  dialog.other_states[dialog.game] = dialog.start_state.data();
++  dialog.game = game;
++  std::snprintf(dialog.start_state.data(), dialog.start_state.size(), "%s",
++                dialog.other_states[game].c_str());
+ }
+ 
+ inline void OnlineDialogTo(const OnlineDialog& dialog, online::Settings& settings)
+@@ -58,16 +76,24 @@ inline void OnlineDialogTo(const OnlineDialog& dialog, online::Settings& setting
+   settings.tag = online::CleanTag(dialog.tag.data());
+   settings.address = dialog.address.data();
+   settings.port = static_cast<std::uint16_t>(std::clamp(dialog.port, 1, 65535));
+-  settings.start_state = text::TextPath(dialog.start_state.data());
++  settings.game = dialog.game;
++  settings.start_states.clear();
++  for (const auto& [game, state] : dialog.other_states)
++  {
++    if (!state.empty())
++      settings.start_states[game] = text::TextPath(state);
++  }
++  settings.start_states[dialog.game] = text::TextPath(dialog.start_state.data());
+ }
+ 
+ // The "Online/LAN play" window (a modal popup the caller opened as "Online/LAN play##online"):
+-// HOST or CONNECT, the player's tag, the host's address (CONNECT), the TCP port, and the start state
++// HOST or CONNECT, the player's tag, the host's address (CONNECT), the TCP port, the game (Sonic
++// Riders or Tournament Edition: `ready_games` are the ones extracted, by disc ID) and its start state
+ // (the game state every match starts from: the same file for everyone). `savestates`: the user's,
+ // offered in a list. `firewall` (Windows): the host can let the launcher through.
+ inline OnlineChoice DrawOnlineDialog(OnlineDialog& dialog, std::span<const fs::path> savestates,
+-                                     FirewallRule& firewall, const fs::path& launcher, ImFont* bold,
+-                                     float scale, bool cancel)
++                                     std::span<const std::string> ready_games, FirewallRule& firewall,
++                                     const fs::path& launcher, ImFont* bold, float scale, bool cancel)
+ {
+   OnlineChoice choice = OnlineChoice::None;
+   ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+@@ -96,7 +122,8 @@ inline OnlineChoice DrawOnlineDialog(OnlineDialog& dialog, std::span<const fs::p
+   ImGui::Spacing();
+ 
+   float label_width = 0.0f;
+-  for (const char* label : {Tr("Player tag"), Tr("Host address"), Tr("TCP port"), Tr("Start state")})
++  for (const char* label :
++       {Tr("Player tag"), Tr("Host address"), Tr("TCP port"), Tr("Game"), Tr("Start state")})
+     label_width = std::max(label_width, ImGui::CalcTextSize(label).x);
+   label_width += ImGui::GetStyle().ItemInnerSpacing.x;
+ 
+@@ -127,6 +154,32 @@ inline OnlineChoice DrawOnlineDialog(OnlineDialog& dialog, std::span<const fs::p
+     dialog.port = std::clamp(dialog.port, 1, 65535);
+   }
+ 
++  // The game: every player of the room plays the host's.
++  const auto is_ready = [&](std::string_view game) {
++    return std::ranges::find(ready_games, game) != ready_games.end();
++  };
++  const char* game_name = online::OnlineGameName(dialog.game);
++  ImGui::SetNextItemWidth(-label_width);
++  if (ImGui::BeginCombo(Tr("Game"), *game_name ? game_name : dialog.game.c_str()))
++  {
++    for (const auto& [game, name] : online::ONLINE_GAMES)
++    {
++      ImGui::BeginDisabled(!is_ready(game));
++      const std::string label = is_ready(game) ? std::string(name) : Format(Tr("%s (not extracted)"), name);
++      if (ImGui::Selectable(label.c_str(), dialog.game == game))
++        OnlineDialogGame(dialog, game);
++      ImGui::EndDisabled();
++    }
++    ImGui::EndCombo();
++  }
++  const bool game_ready = is_ready(dialog.game);
++  if (!game_ready)
++  {
++    ImGui::PushTextWrapPos(0.0f);
++    ImGui::TextColored(LOBBY_AMBER, "%s", Tr("This game is not extracted: extract it in Game Files first."));
++    ImGui::PopTextWrapPos();
++  }
++
+   // The start state: one of the user's savestates, or any file.
+   ImGui::SetNextItemWidth(-label_width);
+   const std::string chosen = text::PathText(text::TextPath(dialog.start_state.data()).filename());
+@@ -195,7 +248,7 @@ inline OnlineChoice DrawOnlineDialog(OnlineDialog& dialog, std::span<const fs::p
+ 
+   const std::string tag = online::CleanTag(dialog.tag.data());
+   const bool address_missing = !dialog.hosting && dialog.address[0] == '\0';
+-  const bool can_go = tag.size() >= 3 && state_there && !address_missing;
++  const bool can_go = tag.size() >= 3 && game_ready && state_there && !address_missing;
+   ImGui::Spacing();
+   ImGui::Separator();
+   ImGui::Spacing();
+@@ -219,6 +272,8 @@ struct OnlineLobbyInfo
+   bool hosting = false;
+   std::string host_address;  // the address this launcher connected to
+   std::vector<std::pair<AddressKind, std::string>> addresses;  // the host's, for its friends
++  std::string game;          // this player's game (disc ID)
++  std::string build;         // its main.dol's fingerprint
+   std::string own_state;     // this player's start state fingerprint
+   std::string state_name;    // its file name
+   std::string status;        // the last thing that happened (a game that did not start...)
+@@ -271,8 +326,10 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+   ImGui::SameLine();
+   DrawStatusPill(Tr("DELAY BASED"), LOBBY_FREE_SEAT, scale, false);
+   ImGui::PushTextWrapPos(0.0f);
+-  ImGui::TextDisabled("%s", Format(Tr("Input delay: %d frames  \xC2\xB7  start state: %s"),
+-                                   room.rules.delay, info.state_name.c_str())
++  const char* own_game = online::OnlineGameName(info.game);
++  ImGui::TextDisabled("%s", Format(Tr("%s  \xC2\xB7  input delay: %d frames  \xC2\xB7  start state: %s"),
++                                   *own_game ? own_game : info.game.c_str(), room.rules.delay,
++                                   info.state_name.c_str())
+                                 .c_str());
+   ImGui::PopTextWrapPos();
+   ImGui::Spacing();
+@@ -320,6 +377,8 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+   const online::Member* host_member = nullptr;
+   for (const online::Member& member : room.members)
+     host_member = member.seat == 0 ? &member : host_member;
++  const std::string host_game = host_member ? host_member->game : info.game;
++  const std::string host_build = host_member ? host_member->build : info.build;
+   const std::string host_state = host_member ? host_member->state : info.own_state;
+   const std::string host_mods = host_member ? host_member->mods : std::string();
+   BeginSection("##online_players",
+@@ -361,7 +420,11 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+       ImGui::TableNextColumn();
+       if (member)
+       {
+-        if (member->state != host_state)
++        if (member->game != host_game)
++          DrawStatusPill(Tr("OTHER GAME"), LOBBY_RED, scale, false);
++        else if (member->build != host_build)
++          DrawStatusPill(Tr("OTHER GAME VERSION"), LOBBY_RED, scale, false);
++        else if (member->state != host_state)
+           DrawStatusPill(Tr("OTHER START STATE"), LOBBY_RED, scale, false);
+         else if (member->mods != host_mods)
+           DrawStatusPill(Tr("OTHER MODS"), LOBBY_RED, scale, false);
+@@ -473,7 +536,8 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+ 
+   // Bottom: Ready or Start, and Leave.
+   const bool everyone_ready = std::ranges::all_of(room.members, [&](const online::Member& m) {
+-    return (m.ready || m.seat == 0) && m.state == host_state && m.mods == host_mods;
++    return (m.ready || m.seat == 0) && m.game == host_game && m.build == host_build &&
++           m.state == host_state && m.mods == host_mods;
+   });
+   const float buttons_height = 46.0f * scale;
+   std::string note = info.status;
+@@ -481,8 +545,8 @@ inline OnlineLobbyActions DrawOnlineLobby(const online::RoomView& room, const On
+   if (room.match)
+     missing = Tr("A race is on.");
+   else if (info.hosting && !everyone_ready)
+-    missing = Tr("Everyone must be ready, with the same start state and the same mods, before the "
+-                 "race can start.");
++    missing = Tr("Everyone must be ready, with the same game (and version), start state and mods, before "
++                 "the race can start.");
+   else if (!info.hosting)
+     missing = Tr("Press I'M READY, then wait for the host to start.");
+   if (missing)
+diff --git a/tools/moderngekko_launcher.cpp b/tools/moderngekko_launcher.cpp
+index 805fe66..cb0d743 100644
+--- a/tools/moderngekko_launcher.cpp
++++ b/tools/moderngekko_launcher.cpp
+@@ -3421,6 +3421,7 @@ int main(int argc, char** argv)
+   moderngekko::frontend::FirewallRule online_firewall;
+   double online_addresses_at = -1.0e9;
+   std::vector<fs::path> online_savestates;
++  std::vector<std::string> online_ready_games;
+   // Tests (SRNP_ONLINE_AUTO=host|connect, SRNP_ONLINE_READY=1, SRNP_ONLINE_START=<players>): the
+   // room without clicks; done once each per room.
+   bool online_auto_opened = false;
+@@ -3433,17 +3434,25 @@ int main(int argc, char** argv)
+       return;
+     online_settings.tag = online::CleanTag(online_settings.tag);
+     online::SaveSettings(user_directory, online_settings);
+-    const std::string state = online::Fingerprint(online_settings.start_state);
++    const fs::path start_state = online::StartState(online_settings);
++    const std::string state = online::Fingerprint(start_state);
+     // The file mods the match's game will load: the same for every player (the room checks it).
+     const std::vector<fs::path> online_mod_folders = {release_directory / "Mods", user_directory / "Mods"};
+     const std::string mods = online::ModsFingerprint(
+-        online_mod_folders, online::MatchFileMods(online_mod_folders, config.mods));
++        online_mod_folders, online::MatchFileMods(online_mod_folders, config.mods, online_settings.game),
++        online_settings.game);
+     online_client.reset();
+     online_relay.reset();
+     online_info = {};
+     online_info.hosting = host;
+     online_info.own_state = state;
+-    online_info.state_name = PathText(online_settings.start_state.filename());
++    online_info.game = online_settings.game;
++    // The game's version: its main.dol (the online mod's addresses are those of one version).
++    const GameSlot* room_slot = slot_of(online_settings.game);
++    const std::string build =
++        room_slot ? online::Fingerprint(room_slot->root / "sys" / "main.dol") : std::string("-");
++    online_info.build = build;
++    online_info.state_name = PathText(start_state.filename());
+     online_rules = online_settings.rules;
+     online_rules_sent = false;
+     online_auto_ready = false;
+@@ -3461,7 +3470,8 @@ int main(int argc, char** argv)
+       }
+       online_info.host_address = "127.0.0.1:" + std::to_string(online_settings.port);
+       online_client = std::make_unique<online::Client>("127.0.0.1", online_settings.port,
+-                                                       online_settings.tag, state, mods,
++                                                       online_settings.tag, online_settings.game, build,
++                                                       state, mods,
+                                                        online_relay->HostKey());
+       online_addresses_at = -1.0e9;
+       return;
+@@ -3474,7 +3484,9 @@ int main(int argc, char** argv)
+       port = split->port;
+     }
+     online_info.host_address = address + ":" + std::to_string(port);
+-    online_client = std::make_unique<online::Client>(address, port, online_settings.tag, state, mods);
++    online_client =
++        std::make_unique<online::Client>(address, port, online_settings.tag, online_settings.game, build,
++                                         state, mods);
+   };
+   // PLAY page summary, read again whenever the page is opened: the time
+   // played changes while the game runs and mods are added by hand.
+@@ -3580,7 +3592,8 @@ int main(int argc, char** argv)
+ #endif
+       std::string online_error;
+       game_user_directory =
+-          online::PrepareGameFolder(user_directory, online_keyboard, mod_folders, &online_error);
++          online::PrepareGameFolder(user_directory, online_settings.game, online_keyboard, mod_folders,
++                                    &online_error);
+       if (game_user_directory.empty())
+       {
+         session_error_title = Tr("Launch failed");
+@@ -3592,14 +3605,24 @@ int main(int argc, char** argv)
+     }
+     // UTF-8, as SDL_CreateProcess takes them (the runner reads them back as
+     // UTF-8 too, text_paths.hpp).
++    // Online: the room's game (Sonic Riders or Tournament Edition), whatever PLAY would start.
++    const GameSlot* online_slot = mode == LaunchMode::Online ? slot_of(online_settings.game) : nullptr;
++    if (mode == LaunchMode::Online && (!online_slot || !online_slot->metadata))
++    {
++      session_error_title = Tr("Launch failed");
++      session_error = Format(Tr("The room's game (%s) is not extracted."), online_settings.game.c_str());
++      session_error_log.clear();
++      transition.Back(now);
++      return false;
++    }
+     std::vector<std::string> argument_storage = {PathText(SiblingRunner(argv[0])), "--game",
+-                                                 PathText(current_game), "--user-dir",
+-                                                 PathText(game_user_directory)};
++                                                 PathText(online_slot ? online_slot->root : current_game),
++                                                 "--user-dir", PathText(game_user_directory)};
+     SDL_Environment* environment = nullptr;
+     if (mode == LaunchMode::Online)
+     {
+       argument_storage.emplace_back("--load-state");
+-      argument_storage.emplace_back(PathText(online_settings.start_state));
++      argument_storage.emplace_back(PathText(online::StartState(online_settings)));
+       // The player's mods, as in a game started by PLAY (config.ini says which are on).
+       argument_storage.emplace_back("--mods");
+       argument_storage.emplace_back(PathText(user_directory / "Mods"));
+@@ -3620,10 +3643,10 @@ int main(int argc, char** argv)
+                 << ", relay " << relay_address << ", delay " << online_match.delay << " frames\n";
+     }
+     // With more than one game, the window takes the name of the one chosen.
+-    if (moderngekko::frontend::PlaysSeveralGames() && current_metadata)
++    if (moderngekko::frontend::PlaysSeveralGames() && (online_slot || current_metadata))
+     {
+-      if (const moderngekko::frontend::KnownGame* game =
+-              moderngekko::frontend::FindKnownGame(current_metadata.metadata->disc_id))
++      if (const moderngekko::frontend::KnownGame* game = moderngekko::frontend::FindKnownGame(
++              online_slot ? online_slot->game.disc_id : current_metadata.metadata->disc_id))
+       {
+         argument_storage.emplace_back("--title");
+         argument_storage.emplace_back(game->title);
+@@ -4498,6 +4521,16 @@ int main(int argc, char** argv)
+           {
+             moderngekko::frontend::ui::OnlineDialogFrom(online_dialog, online_settings);
+             online_savestates = PlaySavestates(user_directory);
++            online_ready_games.clear();
++            for (const GameSlot& slot : game_slots)
++            {
++              if (slot.metadata && *online::OnlineGameName(slot.game.disc_id))
++                online_ready_games.push_back(slot.game.disc_id);
++            }
++            // The game of the last match, else the one PLAY starts when the room can play it.
++            if (std::ranges::find(online_ready_games, online_dialog.game) == online_ready_games.end() &&
++                current_metadata && *online::OnlineGameName(current_metadata.metadata->disc_id))
++              moderngekko::frontend::ui::OnlineDialogGame(online_dialog, current_metadata.metadata->disc_id);
+             ImGui::OpenPopup("Online/LAN play##online");
+           }
+           ImGui::SetItemTooltip("%s", Tr("Up to 8 players, one per computer: host a room or connect "
+@@ -4870,7 +4903,8 @@ int main(int argc, char** argv)
+           {
+             const moderngekko::frontend::ui::OnlineChoice choice =
+                 moderngekko::frontend::ui::DrawOnlineDialog(
+-                    online_dialog, online_savestates, online_firewall, ExecutableFile(argv[0]),
++                    online_dialog, online_savestates, online_ready_games, online_firewall,
++                    ExecutableFile(argv[0]),
+                     fonts.bold, scale, popup_cancel);
+             if (choice == moderngekko::frontend::ui::OnlineChoice::Host ||
+                 choice == moderngekko::frontend::ui::OnlineChoice::Connect)
+@@ -6396,8 +6430,8 @@ int main(int argc, char** argv)
+     }
+ 
+     // SR-Source Net Plus, tests: SRNP_ONLINE_AUTO=host|connect opens the room as the Online/LAN play
+-    // window would, with online.ini's choices (SRNP_ONLINE_STATE, SRNP_ONLINE_ADDRESS and
+-    // SRNP_ONLINE_TAG change them); SRNP_ONLINE_RULES=<course>/<laps>/<racers>/<delay> sets the
++    // window would, with online.ini's choices (SRNP_ONLINE_GAME, SRNP_ONLINE_STATE (that game's),
++    // SRNP_ONLINE_ADDRESS and SRNP_ONLINE_TAG change them); SRNP_ONLINE_RULES=<course>/<laps>/<racers>/<delay> sets the
+     // host's race.
+     if (!online_auto_opened && !fading)
+     {
+@@ -6405,8 +6439,10 @@ int main(int argc, char** argv)
+       if (const char* automatic = std::getenv("SRNP_ONLINE_AUTO");
+           automatic && (std::string_view(automatic) == "host" || std::string_view(automatic) == "connect"))
+       {
++        if (const char* game = std::getenv("SRNP_ONLINE_GAME"); game && *online::OnlineGameName(game))
++          online_settings.game = game;
+         if (const auto state = EnvironmentPath("SRNP_ONLINE_STATE"))
+-          online_settings.start_state = *state;
++          online_settings.start_states[online_settings.game] = *state;
+         if (const char* address = std::getenv("SRNP_ONLINE_ADDRESS"))
+           online_settings.address = address;
+         if (const char* tag = std::getenv("SRNP_ONLINE_TAG"))
+@@ -6592,6 +6628,7 @@ int main(int argc, char** argv)
+       if (!start_game(launch_mode, launch_from_black))
+       {
+         result = 1;
++        std::cout << "launcher: the game did not start: " << session_error << "\n";
+         // Online/LAN play: a game that did not start leaves its seat to the AI.
+         if (launch_mode == LaunchMode::Online && online_client)
+           online_client->GameClosed();
+-- 
+2.34.1.windows.1
+

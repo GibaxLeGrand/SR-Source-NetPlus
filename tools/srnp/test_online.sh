@@ -10,12 +10,22 @@
 #   PING=<ms>[~<gigue>] ou <siège>=<ms>[~<gigue>],... : ping simulé par le relais (SRNP_RELAY_PING) ;
 #   INPUT_B=course : entrées de test variées pour l'ami (au lieu de l'IA).
 #   FIN_A, FIN_B=restart|menu|replay : le choix de chaque jeu dans le menu des résultats (SRNP_FIN_CHOIX : manches).
+#   JEU=GXSRTE : la salle joue Tournament Edition (choisi dans la salle, SRNP_ONLINE_GAME) : le jeu de
+#     work\te\lad, le runner de la session phase 2 (work\te\runner, le mod porté sur TE), le module natif de TE
+#     (STATICRECOMP_MODULE) et son state d'Entrée des joueurs (CPUs ON, 1 tour).
 set -uo pipefail
 W=/d/_SonicRidersSource/work
 L=$W/launcher_online
 EXE="$L/SR-Source.exe"
-RUNNER="$W/chassis_p2/moderngekko-run.exe"
-STATE="${ETAT:-$W/states/gxee8p_pret1p_100pc_metal_1tour_jit.sav}"
+JEU="${JEU:-GXEE8P}"
+if [[ "$JEU" == GXSRTE ]]; then
+  RUNNER="${RUNNER:-$W/te/runner/moderngekko-run.exe}"
+  STATE="${ETAT:-$W/states/gxsrte_entree_joueurs_metal_1tour_jit.sav}"
+  export STATICRECOMP_MODULE="$(cygpath -w "${MODULE_TE:-$W/te/module/gGXSRTE_recomp_te.dll}")"
+else
+  RUNNER="$W/chassis_p2/moderngekko-run.exe"
+  STATE="${ETAT:-$W/states/gxee8p_pret1p_100pc_metal_1tour_jit.sav}"
+fi
 PORT="${PORT:-7850}"
 RUN="$L/runs/$(date +%Y%m%d-%H%M%S)"
 w() { cygpath -w "$1"; }
@@ -29,7 +39,17 @@ prepare() {  # prepare <pc> <tag>
   sed -e 's/^music_volume=.*/music_volume=0/' -e 's/^game_volume=.*/game_volume=0/' -e 's/^check_for_updates=.*/check_for_updates=false/' \
       -e 's/^cpu_core=.*/cpu_core=staticrecomp/' "$W/userdir_modele/config.ini" > "$U/config.ini"
   w "$W/games/GXEE8P" > "$U/default-game.txt"
-  printf 'tag=%s\naddress=127.0.0.1:%s\nport=%s\nstart_state=%s\n' "$2" "$PORT" "$PORT" "$(w "$STATE")" > "$U/online.ini"
+  # Les jeux extraits du joueur : Sonic Riders et Tournament Edition (le launcher les cherche dans games\).
+  mkdir -p "$U/games"
+  powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$U/games/GXEE8P")' -Target '$(w "$W/games/GXEE8P")' | Out-Null; New-Item -ItemType Junction -Path '$(w "$U/games/GXSRTE")' -Target '$(w "$W/te/lad/sr-source/games/GXSRTE")' | Out-Null"
+  # Les réglages StaticRecomp de TE (attente de l'OS) : le launcher les copie dans le dossier de la partie.
+  mkdir -p "$U/GameSettings"
+  cp /d/_SonicRidersSource/SR-Source-NetPlus/docs/game-settings/GXSRTE.ini "$U/GameSettings/GXSRTE.ini"
+  if [[ "$JEU" == GXSRTE ]]; then
+    printf 'tag=%s\naddress=127.0.0.1:%s\nport=%s\ngame=GXSRTE\nstart_state_GXSRTE=%s\n' "$2" "$PORT" "$PORT" "$(w "$STATE")" > "$U/online.ini"
+  else
+    printf 'tag=%s\naddress=127.0.0.1:%s\nport=%s\nstart_state=%s\n' "$2" "$PORT" "$PORT" "$(w "$STATE")" > "$U/online.ini"
+  fi
   # La manette de Gibax (INPUT_A=manette) : un profil avec ses boutons, comme la page Controls l'écrit
   # (le modèle ne nomme que l'appareil, sans bouton : la manette n'envoyait rien, essai de 23 h 37).
   if [[ "$1" == pcA && "${INPUT_A:-ia}" == manette ]]; then
