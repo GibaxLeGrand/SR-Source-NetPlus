@@ -152,7 +152,7 @@ if [[ "${1:-}" == "--chassis" ]]; then
         -DMODERNGEKKO_GAME_BORDERS="" \
         -DMODERNGEKKO_COMPLETE_SAVE="$ROOT/docs/complete-save" \
         -DMODERNGEKKO_GAME_SELECT="$ROOT/docs/game-select" \
-        -DMODERNGEKKO_GAME_SETTINGS_OVERRIDE="$ROOT/docs/game-settings/GXEE8P.ini;$ROOT/docs/game-settings/RS9E8P.ini" \
+        -DMODERNGEKKO_GAME_SETTINGS_OVERRIDE="$ROOT/docs/game-settings/GXEE8P.ini;$ROOT/docs/game-settings/RS9E8P.ini;$ROOT/docs/game-settings/GXSRTE.ini" \
         -DMODERNGEKKO_SCREENSHOT_NAME="SR-Source" \
         -DMODERNGEKKO_FRONTEND_VERSION="$SRZGS_VERSION" \
         -DMODERNGEKKO_UPDATE_REPOSITORY="KnivesDevilish/SR-Source" \
