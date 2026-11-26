@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Phase 2.5 (Tournament Edition) : copie de work/phase2/lockstepn.sh pour TE (GXSRTE extrait par la session du
+# launcher dans work\te\lad, runner de work\te\runner, module natif MODULE_TE=<dll>), ETAT obligatoire (pas de
+# state de TE par défaut), comparaison des racers aux adresses de TE.
+# --- texte d'origine :
+# Phase 2, prototype : 8 sièges pilotent les 8 racers d'une vraie course, sur N runners de ce poste
+# (N = 8 : un siège chacun ; N = 4 : deux sièges chacun), en lockstep par le relais.
+#   lockstep2.sh <runners> natif|jit [frame de capture] [frame de fin]
+# Tous chargent le state du départ (Metal City, 1 tour, 1P + 7 CPU) ; SRNP_RACERS=1 : le siège k
+# conduit le racer k par une structure manette remplie comme le jeu le fait ; entrées de test
+# SRNP_INPUT=course:1 (tout droit, direction au hasard, puis l'IA reprend le racer, à un moment
+# différent pour chaque siège) ; la caméra de chaque runner suit son premier siège. Le relais compare
+# une somme des 8 racers (sans les champs qui suivent la caméra) toutes les 60 frames.
+# Pause exacte de tous à la frame de capture (capture d'écran de chacun), puis à la frame de fin :
+# MEM1 lue et comparée au runner 0 (racers et BSS de _Main.rel).
+# Env : DELAI_MS (relais, 100), VITESSE (EmulationSpeed, 0.0 = libre), RUNNER (exe), ETIQUETTE.
+set -uo pipefail
+N="${1:?runners}"; MODE="${2:?natif ou jit}"; CAPT="${3:-10800}"; FIN="${4:-14400}"
+SIEGES="${SIEGES:-8}"; K=$((SIEGES / N))
+# REPARTITION="0,1 2 3 4 5 6 7" : les sièges de chaque runner (N = nombre de groupes).
+GROUPES=(${REPARTITION:-}); (( ${#GROUPES[@]} )) && N=${#GROUPES[@]}
+W=/d/_SonicRidersSource/work
+# CHASSIS=<dossier> : où lancer les runners (exécutable, Sys/, Resources/, module). Par défaut
+# build/chassis, où RUNNER est d'abord posé ; un autre dossier est pris tel quel (rien n'est posé).
+CHASSIS_DEFAUT=/d/_SonicRidersSource/SR-Source-NetPlus/build/chassis
+CHASSIS="${CHASSIS:-$W/te/runner}"  # (TE : jamais build/chassis)
+PY="/c/Program Files/Python313/python.exe"
+RELAIS=/d/_SonicRidersSource/SR-Source-NetPlus/tools/srnp/relais.py
+# Par défaut : « Are you ready? » (sauvegarde 100 %), Start par le relais, les 8 racers en CPU au montage
+# (SRNP_TOUS_CPU=1) : la piste se charge après le state. ⚠️ gxee8p_course8cpu_* a été sauvé pendant le
+# chargement de la piste : après ~17", elle ne s'affiche plus (collisions bonnes). À éviter pour regarder.
+ETAT="${ETAT:?ETAT=<state de TE>}"
+STATE="$ETAT"
+RUN="$W/runs/$(date +%Y%m%d-%H%M%S)-te-lockstep-$N-$MODE${ETIQUETTE:+-$ETIQUETTE}"
+mkdir -p "$RUN"
+w() { cygpath -w "$1"; }
+bash "$W/scripts/run/attendre_poste.sh" "${ATTENTE_MAX:-1800}" > "$RUN/poste.txt" || { echo "!! poste occupé"; exit 3; }
+[[ "$CHASSIS" == "$CHASSIS_DEFAUT" ]] && { echo "!! TE : pas build/chassis"; exit 2; }
+
+"$PY" -I "$RELAIS" --sieges "$SIEGES" --delai-ms "${DELAI_MS:-100}" --journal "$(w "$RUN/relais.log")" > "$RUN/relais.out" 2>&1 &
+RPID=$!
+sleep 1
+PIDS=()
+cd "$CHASSIS" || exit 2
+for r in $(seq 0 $((N - 1))); do
+  D="$RUN/runner$r"; A="$D/auto"
+  mkdir -p "$A/commands"
+  cp -a "$W/userdir_modele" "$D/userdir"
+  # Les réglages StaticRecomp de TE (attente de l'OS) par le dossier utilisateur, comme entrainer_te.sh.
+  mkdir -p "$D/userdir/GameSettings"
+  cp /d/_SonicRidersSource/SR-Source-NetPlus/docs/game-settings/GXSRTE.ini "$D/userdir/GameSettings/GXSRTE.ini"
+  sed -i "s/^\[Core\]\$/[Core]\nEmulationSpeed = ${VITESSE:-0.0}/" "$D/userdir/Config/Dolphin.ini"
+  # Pas de fenêtre d'alerte (elle bloquerait le runner) : le message reste dans runner.log.
+  sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$D/userdir/Config/Dolphin.ini"
+  # PORTS=<n> : des manettes standard sur les ports 1 à n-1 aussi (une course 2P en a besoin).
+  for p in $(seq 1 $(( ${PORTS:-1} - 1 ))); do
+    sed -i "s/^\[Core\]\$/[Core]\nSIDevice$p = 6/" "$D/userdir/Config/Dolphin.ini"
+  done
+  mkdir -p "$D/ck"
+  SEATS=${GROUPES[$r]:-$(seq -s, $((r * K)) $((r * K + K - 1)))}
+  printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$CAPT" > "$A/commands/00_capt.txt"
+  ARGS=(--game "$(w "$W/te/lad/sr-source/games/GXSRTE")" --user-dir "$(w "$D/userdir")" --automation-dir "$(w "$A")"
+        --load-state "$(w "$STATE")")
+  # SON="0" (ou "0 3") : ces runners-là gardent le son ; les autres sont muets. Couper le son ne
+  # change pas l'émulation (le DSP tourne pareil, seul le volume de sortie est à 0).
+  [[ " ${SON:-} " == *" $r "* ]] || ARGS+=(--mute)
+  # HD="0 1 2 3" (ou all) : ces runners-là chargent le pack de textures HD (work\textures\pack_hd), en
+  # deux mods (Gigapixel AI, puis Waifu Caffe qui gagne sur les doublons), par des jonctions.
+  # ETIQ="0 3" (ou all) : ces runners-là montent le mod des étiquettes 5P-8P (work\etiquettes\mods :
+  # srnp_etiquettes, un GTSE à nous, et srnp_etiquettes_hd avec HD). Visible depuis un state pris avant
+  # le chargement de la course (pret1p…).
+  MODS=()
+  E="$W/etiquettes/mods"
+  etiq=0; [[ " ${ETIQ:-} " == *" $r "* || "${ETIQ:-}" == all ]] && etiq=1
+  (( etiq )) && MODS+=("srnp_etiquettes:files:$E/srnp_etiquettes/files")
+  if [[ " ${HD:-} " == *" $r "* || "${HD:-}" == all ]]; then
+    # RES=1920x1080 (ou 1280x720, 2560x1440…) : la résolution interne de ces runners-là.
+    [[ -n "${RES:-}" ]] && sed -i "s/^resolution=.*/resolution=$RES/" "$D/userdir/config.ini"
+    P="$W/textures/pack_hd/Vanilla(ECT_Optimized)"
+    MODS+=("hd_gigapixel:textures:$P/Gigapixel AI" "hd_waifu:textures:$P/Waifu Caffe (Denoise & Magnify)")
+    (( etiq )) && MODS+=("srnp_etiquettes_hd:textures:$E/srnp_etiquettes_hd/textures")
+  fi
+  for m in "${MODS[@]}"; do
+    id="${m%%:*}"; rest="${m#*:}"; kind="${rest%%:*}"; src="${rest#*:}"
+    mkdir -p "$D/userdir/Mods/$id"
+    printf 'name=%s\ngame=GXEE8P\n' "$id" > "$D/userdir/Mods/$id/mod.ini"
+    # (cmd mklink /J : Git Bash change /J en chemin ; PowerShell s'en sort, & et () compris.)
+    powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/$id/$kind")' -Target '$(w "$src")' | Out-Null"
+    printf 'mod=%s\n' "$id" >> "$D/userdir/config.ini"
+  done
+  (( ${#MODS[@]} )) || ARGS+=(--no-mods)
+  if [[ "$MODE" == "natif" ]]; then
+    ARGS+=(--module "$(w "${MODULE_TE:?MODULE_TE=<dll de TE>}")"); export MODERNGEKKO_STATICRECOMP=1
+  else export MODERNGEKKO_STATICRECOMP=0; fi
+  LLVM_PROFILE_FILE="$(w "$D/module-%p.profraw")" SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$SEATS SRNP_SEATS=$SIEGES SRNP_RACERS=1 SRNP_INPUT="${ENTREES:-course:1}" SRNP_CHECK=${CHECK:-60} SRNP_CKDUMP="$(w "$D/ck")" \
+    ./moderngekko-run.exe "${ARGS[@]}" > "$D/runner.log" 2>&1 &
+  PIDS+=($!)
+  echo "runner $r : sièges $SEATS"
+  # ECART=<s> : délai entre deux lancements (des joueurs qui arrivent l'un après l'autre : les runners
+  # attendent à leur première frame le GO du relais).
+  sleep "${ECART:-0}"
+done
+attend() {  # attend <commande> <limite s>
+  local T0=$SECONDS
+  for r in $(seq 0 $((N - 1))); do
+    A="$RUN/runner$r/auto"
+    while [[ ! -f "$A/processed/$1.txt" && ! -f "$A/failed/$1.txt" ]]; do
+      kill -0 "${PIDS[$r]}" 2>/dev/null || { echo "!! runner $r sorti"; break; }
+      (( SECONDS - T0 > $2 )) && { echo "!! runner $r : $1 pas fait en $2 s"; break; }
+      sleep 0.2
+    done
+  done
+  echo "$1 : fait par tous en $((SECONDS - T0)) s"
+}
+attend 00_capt 1200
+for r in $(seq 0 $((N - 1))); do
+  A="$RUN/runner$r/auto"
+  printf 'command=screenshot\npath=%s\n' "$(w "$RUN/runner$r/vue.png")" > "$A/commands/01_vue.txt"
+  printf 'command=resume\n' > "$A/commands/02_reprise.txt"
+  printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$FIN" > "$A/commands/03_fin.txt"
+done
+attend 03_fin 1200
+for r in $(seq 0 $((N - 1))); do
+  A="$RUN/runner$r/auto"
+  printf 'command=read_memory\naddress=0x80000000\nsize=16777216\npath=%s\n' "$(w "$RUN/runner$r/mem1_lo.bin")" > "$A/commands/04_lo.txt"
+  printf 'command=read_memory\naddress=0x81000000\nsize=8388608\npath=%s\n' "$(w "$RUN/runner$r/mem1_hi.bin")" > "$A/commands/05_hi.txt"
+done
+attend 05_hi 120
+# Une capture de chacun à la fin (prise à la reprise), quelques frames plus loin.
+for r in $(seq 0 $((N - 1))); do
+  A="$RUN/runner$r/auto"
+  printf 'command=screenshot\npath=%s\n' "$(w "$RUN/runner$r/fin.png")" > "$A/commands/06_capt.txt"
+  printf 'command=resume\n' > "$A/commands/07_reprise.txt"
+  printf 'command=pad_frames\nport=3\nframes=1\npause_at=%s\n' "$((FIN + 5))" > "$A/commands/08_fin2.txt"
+done
+attend 08_fin2 120
+for r in $(seq 0 $((N - 1))); do printf 'command=stop\n' > "$RUN/runner$r/auto/commands/99_stop.txt"; done
+for p in "${PIDS[@]}"; do
+  for i in $(seq 1 30); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+  kill -0 "$p" 2>/dev/null && taskkill //F //T //PID "$p" > /dev/null 2>&1
+done
+taskkill //F //T //PID "$RPID" > /dev/null 2>&1; kill "$RPID" 2>/dev/null
+for r in $(seq 0 $((N - 1))); do
+  echo "runner $r : $(grep -h "srnp relay\] seat\|srnp racers\|paused at\|waited" "$RUN/runner$r/runner.log" | tr '\n' ' ' | cut -c1-600)"
+done
+tail -3 "$RUN/relais.out"
+"$PY" -I "$W/te/lockstep/compare_racers_te.py" "$RUN" "$N"; "$PY" -I "$W/phase2/compare_ck.py" "$RUN" "$N" | tail -3
+echo "RUN=$RUN"

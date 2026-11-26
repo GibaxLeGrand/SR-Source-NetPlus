@@ -1,0 +1,29 @@
+# <début US> <fin US> <début TE>  (fin exclue) ; trouvé à la main le 26/11/2026
+# La boucle principale (US 0x805B8290 : bl de la lecture des manettes, en tête de boucle) : TE la refait
+# (deux appels de plus) ; sa tête en 0x8027B934 (bl 0x80004358, la même fonction des manettes).
+805B8290 805B8294 8027B934
+# Nos caves et nos structures en mémoire basse (0x80002A00-0x80003000) : les mêmes adresses. TE n'y lit que
+# 0x80002004 (et 0x80001800-0x80001808, 0x80001FFF, 0x800030xx de l'OS) : à vérifier en course qu'elles restent à zéro.
+80002A00 80003000 80002A00
+# La BSS de _Main.rel (US 0x805FB080-0x806B5774 : racers, tâches, règles) : un seul bloc dans TE, écart
+# -0xD66C0 sur toutes les paires trouvées (14 plages de carte.py, 26/11) ; donc tout le bloc.
+805FB080 806B5774 805249C0
+# Lectures de l'index pour la caméra (PatchCameras) dans trois fonctions que TE a changées : retrouvées
+# entre les sites voisins traduits, mêmes registres, mêmes écarts entre elles, même usage (mulli 0x25C
+# pour 8 des 16) que dans le jeu US (26/11).
+804C2F60 804C2F64 8016FB18
+804C2FC0 804C2FC4 8016FB78
+804C30E0 804C30E4 8016FC98
+804C3140 804C3144 8016FCF8
+804E0760 804E0764 8018D09C
+804E07D8 804E07DC 8018D114
+804E08DC 804E08E0 8018D218
+804E0954 804E0958 8018D290
+804E0B94 804E0B98 8018D484
+804E0C0C 804E0C10 8018D4FC
+804E0D10 804E0D14 8018D600
+804E0D88 804E0D8C 8018D678
+804E75D8 804E75DC 801933C8
+804E7638 804E763C 80193428
+804E7740 804E7744 80193530
+804E77A0 804E77A4 80193590

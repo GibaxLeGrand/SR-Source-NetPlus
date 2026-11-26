@@ -1,0 +1,2352 @@
+From b28adff54923825eeda96ee52e5c38042d71d257 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:07:09 +0100
+Subject: [PATCH] Runner: the online mod on Sonic Riders Tournament Edition
+ (GXSRTE 2.4.6.1)
+
+srnp_game.hpp/.cpp: the game that runs (the disc's ID at boot); At(us), a Sonic Riders US address in it
+(srnp_game_te.inc: 760 ranges made from the two games' code by tools/srnp/te: code matched by the
+instructions' shape, data by the instructions that compute their addresses; the REL's BSS moved as one
+block, -0xD66C0; a racer the same 0x1080 bytes); InGame, the mod's words for TE (a branch to its
+target's place, the same instruction's immediate carried over from TE's).
+
+srnp_racers.cpp: memory through At; patches by Resolve/Made/SwapIn (TE's original read and checked by
+its shape); the caves holding addresses made for the game; seats 5-7 on TE, where the racers' low half
+goes past 0x7FFF, through three-word caves in free low memory (0x80002010-0x80002A00); TE's race setup
+(its Free Race keeps the racer count at 1 while the menu writes the racers), its gear table (44, the
+Chaos Emerald for Super Sonic only: Sonic on it hangs the loading), two more sound handles out of the
+checksum (+0xF60), racer 0 always drawn on TE (left out, TE changed scene). srnp_relay.cpp: the state's
+hash, rules, task pool (TE's held at 0x8042E58C), main loop hook (TE's 0x8027B934) by game. The waiting
+screen: TE's characters' names, a greyish green background on TE (Gibax). Labels 5P-8P: not on TE yet.
+
+Measured on 2026-11-26 (native, TE's module): 2 runners 0 divergence; 8 runners, Sonic, Metal Sonic,
+Blaze, Tikal, Silver, Chaos, Super Sonic, Shadow: the seat 7 case fixed and checked on 2 runners
+(43 identical, 0 divergence).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |   1 +
+ src/runtime/dolphin_runtime.cpp     |   5 +-
+ src/runtime/srnp_game.cpp           | 127 +++++
+ src/runtime/srnp_game.hpp           |  48 ++
+ src/runtime/srnp_game_te.inc        | 748 ++++++++++++++++++++++++++++
+ src/runtime/srnp_labels.cpp         |   4 +
+ src/runtime/srnp_racers.cpp         | 569 ++++++++++++++-------
+ src/runtime/srnp_relay.cpp          |  94 ++--
+ src/runtime/srnp_relay.hpp          |   2 +-
+ src/runtime/srnp_waiting_screen.cpp |  18 +-
+ 10 files changed, 1410 insertions(+), 206 deletions(-)
+ create mode 100644 src/runtime/srnp_game.cpp
+ create mode 100644 src/runtime/srnp_game.hpp
+ create mode 100644 src/runtime/srnp_game_te.inc
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fe0b45c..307288d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -440,6 +440,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/srnp_labels.cpp
+         src/runtime/srnp_waiting_screen.cpp
+         src/runtime/srnp_game_textures.cpp
++        src/runtime/srnp_game.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 8dfefe3..11a6cf8 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -14,6 +14,7 @@
+ #include "Core/Config/SYSCONFSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/CPU.h"
++#include "srnp_game.hpp"
+ #include "srnp_game_textures.hpp"
+ #include "srnp_labels.hpp"
+ #include "srnp_racers.hpp"
+@@ -1101,6 +1102,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+       "ModernGekko - " + impl->metadata.game_name + " [" +
+       impl->metadata.disc_id + "]");
+   impl->mods = std::make_unique<ModManager>();
++  // SR-Source Net Plus: which game (the online mod's addresses, srnp_game.hpp).
++  srnp::SetGameId(impl->metadata.disc_id);
+   // SR-Source Net Plus: the game's own pictures for the runner's screens (srnp_game_textures.hpp).
+   srnp::SetGameRoot(impl->config.game_root);
+   srnp::SetModDirectories(impl->config.mod_directories);
+@@ -1316,7 +1319,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+     std::string ranges =
+         env ? env : Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES);
+     ranges += std::string(ranges.empty() ? "" : ",") +
+-              srnp::kGameFrameHookFallbackRange;
++              srnp::GameFrameHookFallbackRange();
+ #ifdef _WIN32
+     _putenv_s("STATICRECOMP_FALLBACK_RANGES", ranges.c_str());
+ #else
+diff --git a/src/runtime/srnp_game.cpp b/src/runtime/srnp_game.cpp
+new file mode 100644
+index 0000000..0b3b663
+--- /dev/null
++++ b/src/runtime/srnp_game.cpp
+@@ -0,0 +1,127 @@
++// SR-Source Net Plus: the games the online mod knows. See srnp_game.hpp.
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "srnp_game.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++
++namespace srnp
++{
++namespace
++{
++struct Range
++{
++  std::uint32_t us_start, us_end, te_start;
++};
++constexpr Range kTE[] = {
++#include "srnp_game_te.inc"
++};
++
++std::atomic<Game> s_game{Game::Other};
++
++// The shape of an instruction: its opcode and registers, without the immediate or the branch's distance.
++std::uint32_t Shape(std::uint32_t w)
++{
++  const std::uint32_t op = w >> 26;
++  if (op == 18)  // b, bl
++    return w & 0xFC000003u;
++  if (op == 16)  // bc
++    return w & 0xFFFF0003u;
++  if ((op >= 7 && op <= 15) || (op >= 24 && op <= 29) || (op >= 32 && op <= 55))  // 16-bit immediate
++    return w & 0xFFFF0000u;
++  return w;
++}
++
++bool DForm(std::uint32_t op)
++{
++  return (op >= 7 && op <= 15) || (op >= 24 && op <= 29) || (op >= 32 && op <= 55);
++}
++
++std::int32_t Sext(std::uint32_t v, int bits)
++{
++  const std::uint32_t m = 1u << (bits - 1);
++  return static_cast<std::int32_t>((v ^ m) - m);
++}
++}  // namespace
++
++void SetGameId(const std::string& id)
++{
++  const Game g = id == "GXEE8P" ? Game::Riders : id == "GXSRTE" ? Game::TE : Game::Other;
++  s_game.store(g);
++  std::fprintf(stderr, "[srnp game] %s: %s\n", id.c_str(), GameName());
++}
++
++Game CurrentGame()
++{
++  return s_game.load(std::memory_order_relaxed);
++}
++
++const char* GameName()
++{
++  switch (CurrentGame())
++  {
++  case Game::Riders:
++    return "Sonic Riders (US)";
++  case Game::TE:
++    return "Sonic Riders Tournament Edition";
++  default:
++    return "not a game of the online mod";
++  }
++}
++
++std::uint32_t At(std::uint32_t us)
++{
++  switch (CurrentGame())
++  {
++  case Game::Riders:
++    return us;
++  case Game::TE:
++  {
++    const Range* end = kTE + sizeof(kTE) / sizeof(kTE[0]);
++    const Range* r = std::upper_bound(kTE, end, us,
++                                      [](std::uint32_t a, const Range& x) { return a < x.us_start; });
++    if (r == kTE)
++      return 0;
++    --r;
++    return us < r->us_end ? r->te_start + (us - r->us_start) : 0;
++  }
++  default:
++    return 0;
++  }
++}
++
++bool SameInstruction(std::uint32_t us_word, std::uint32_t word)
++{
++  if (CurrentGame() != Game::TE)
++    return word == us_word;
++  return Shape(word) == Shape(us_word);
++}
++
++std::uint32_t InGame(std::uint32_t us_address, std::uint32_t us_word, std::uint32_t us_original,
++                     std::uint32_t original)
++{
++  if (CurrentGame() != Game::TE)
++    return us_word;
++  const std::uint32_t op = us_word >> 26;
++  const std::uint32_t at = At(us_address);
++  if ((op == 18 || op == 16) && (us_word & 2u) == 0 && at != 0)
++  {
++    // A relative branch: to its target's place.
++    const std::int32_t d = op == 18 ? Sext(us_word & 0x03FFFFFCu, 26) : Sext(us_word & 0xFFFCu, 16);
++    const std::uint32_t target = At(us_address + static_cast<std::uint32_t>(d));
++    if (target != 0)
++    {
++      const std::uint32_t rel = target - at;
++      return op == 18 ? (us_word & 0xFC000003u) | (rel & 0x03FFFFFCu) : (us_word & 0xFFFF0003u) | (rel & 0xFFFCu);
++    }
++    return 0;  // no place for the target: no word
++  }
++  // The same instruction (opcode, rD, rA) with another immediate: the change on TE's own immediate (the
++  // racers' low half plus a seat's offset, a constant compared...). Another instruction: as written (its
++  // immediate a field's offset or a constant; one holding an address is made for the game by the caller).
++  if (DForm(op) && (us_word & 0xFFFF0000u) == (us_original & 0xFFFF0000u))
++    return (us_word & 0xFFFF0000u) | ((original + (us_word - us_original)) & 0xFFFFu);
++  return us_word;
++}
++}  // namespace srnp
+diff --git a/src/runtime/srnp_game.hpp b/src/runtime/srnp_game.hpp
+new file mode 100644
+index 0000000..40a9bd7
+--- /dev/null
++++ b/src/runtime/srnp_game.hpp
+@@ -0,0 +1,48 @@
++// SR-Source Net Plus: the games the online mod knows, and where Sonic Riders US's addresses are in
++// Tournament Edition.
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++// The mod's code is written with Sonic Riders US's addresses (GXEE8P: main.dol and _Main.rel loaded at
++// 0x803FBD00). Tournament Edition (GXSRTE, 2.4.6.1: everything in main.dol) has the same code for the most
++// part, moved, and the same structures (a racer is 0x1080 bytes, its fields at the same offsets: measured
++// on 2026-11-26). At(us) gives a US address's place in the game that runs, from a table of ranges made from
++// the two games' code (srnp_game_te.inc, by work/te/adresses/carte.py and genere_inc.py: code matched by
++// the instructions' shape, data by the instructions that compute their addresses).
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace srnp
++{
++enum class Game
++{
++  Other,
++  Riders,  // Sonic Riders US, GXEE8P
++  TE,      // Sonic Riders Tournament Edition, GXSRTE
++};
++
++// The disc's ID, at boot (dolphin_runtime.cpp, before the hooks are set).
++void SetGameId(const std::string& id);
++Game CurrentGame();
++const char* GameName();
++
++// A Sonic Riders US address in the game that runs: itself on GXEE8P; on TE, its place from the table, or
++// 0 if the table has none (the caller then leaves that part out).
++std::uint32_t At(std::uint32_t us);
++
++// An instruction found in the game where the mod expects the US one: the same word on GXEE8P; on TE the
++// same opcode and registers (the immediates and the branches' distances move with the code and data).
++bool SameInstruction(std::uint32_t us_word, std::uint32_t word);
++
++// The mod's word for a site of the game's code, in the game that runs. On GXEE8P, us_word. On TE: a relative
++// branch (b, bl, bc) goes to its US target's place in TE (a cave in low memory stays where it is); the same
++// instruction as the US original with another 16-bit immediate gets the US change on TE's original (an
++// address's low half plus an offset, a constant compared: the change is the same, TE's base its own);
++// anything else as is (a word holding an address of its own is made for the game by the caller).
++// us_original is the US word at us_address, original the game's word there. 0 when it cannot be made (a
++// branch whose target has no place in TE).
++std::uint32_t InGame(std::uint32_t us_address, std::uint32_t us_word, std::uint32_t us_original,
++                     std::uint32_t original);
++
++}  // namespace srnp
+diff --git a/src/runtime/srnp_game_te.inc b/src/runtime/srnp_game_te.inc
+new file mode 100644
+index 0000000..db9ad01
+--- /dev/null
++++ b/src/runtime/srnp_game_te.inc
+@@ -0,0 +1,748 @@
++// Generated by work/te/adresses/genere_inc.py from the two games' code (2026-11-26): Sonic Riders US
++// (GXEE8P, _Main.rel at 0x803FBD00) -> Tournament Edition 2.4.6.1 (GXSRTE). Addresses only.
++// {US start, US end, TE start}
++{0x80002A00u, 0x80003000u, 0x80002A00u},  // manuel
++{0x800032A8u, 0x8000332Cu, 0x80003178u},  // code
++{0x80003420u, 0x80003450u, 0x802684C8u},  // code
++{0x800055D8u, 0x80006300u, 0x80003298u},  // code
++{0x80006360u, 0x80006390u, 0x80003FF8u},  // code
++{0x80006414u, 0x80006480u, 0x80004024u},  // code
++{0x800064B8u, 0x800065A8u, 0x80004094u},  // code
++{0x800065A8u, 0x800067F0u, 0x80004188u},  // code
++{0x800067F4u, 0x80007A5Cu, 0x800043D4u},  // code
++{0x80007A5Cu, 0x80007BB0u, 0x80005638u},  // code
++{0x80007C24u, 0x80007CF4u, 0x80005790u},  // code
++{0x80007EACu, 0x8000918Cu, 0x80005848u},  // code
++{0x8000918Cu, 0x800097CCu, 0x80006B2Cu},  // code
++{0x800098E0u, 0x80009980u, 0x80268274u},  // code
++{0x80009984u, 0x80009A08u, 0x8026831Cu},  // code
++{0x8000B560u, 0x8000B590u, 0x80267E8Cu},  // code
++{0x8000EB58u, 0x8000EBCCu, 0x802684FCu},  // code
++{0x80011AD0u, 0x80011E74u, 0x8001148Cu},  // code
++{0x8001A574u, 0x8001A5C8u, 0x802B3438u},  // code
++{0x8001C6F4u, 0x8001C738u, 0x80007168u},  // code
++{0x8001C738u, 0x8001DBC0u, 0x800071A8u},  // code
++{0x8001DBC4u, 0x8001E084u, 0x80008634u},  // code
++{0x8001E088u, 0x80025E4Cu, 0x80008AF8u},  // code
++{0x800350B8u, 0x80035150u, 0x80269140u},  // code
++{0x8004C528u, 0x8004D0F8u, 0x800108B8u},  // code
++{0x8004DB74u, 0x800659CCu, 0x8001183Cu},  // code
++{0x800659CCu, 0x8007D2E8u, 0x800296C8u},  // code
++{0x8007D2F8u, 0x8007D36Cu, 0x80040FF4u},  // code
++{0x8007D37Cu, 0x8007D3F0u, 0x80041078u},  // code
++{0x8007D3FCu, 0x8007D454u, 0x800410F8u},  // code
++{0x8007D480u, 0x8008AAE4u, 0x8004117Cu},  // code
++{0x8008AAE8u, 0x8008AB24u, 0x8004E7E8u},  // code
++{0x8008AB3Cu, 0x8008E1C0u, 0x8004E83Cu},  // code
++{0x8008E1D0u, 0x8008E304u, 0x80051ED0u},  // code
++{0x8008E324u, 0x8009B868u, 0x80052024u},  // code
++{0x8009B8B8u, 0x8009B9D0u, 0x8005F5B8u},  // code
++{0x8009BAD8u, 0x8009BB84u, 0x8005F7DCu},  // code
++{0x8009BBACu, 0x8009BBE8u, 0x8005F8B0u},  // code
++{0x8009BBFCu, 0x8009BC40u, 0x8005F90Cu},  // code
++{0x8009BC9Cu, 0x8009BCE8u, 0x8005F9B8u},  // code
++{0x8009BD14u, 0x8009BD50u, 0x8005FA50u},  // code
++{0x8009BD70u, 0x8009BDA8u, 0x8005FAACu},  // code
++{0x8009BDACu, 0x8009BE10u, 0x8005FAE8u},  // code
++{0x8009BE14u, 0x8009BE78u, 0x8005FB50u},  // code
++{0x8009BE7Cu, 0x8009BEC0u, 0x8005FBB4u},  // code
++{0x8009BEC4u, 0x8009DCD0u, 0x8005FBFCu},  // code
++{0x8009DD50u, 0x800A5274u, 0x80061A88u},  // code
++{0x800A5280u, 0x800A53B0u, 0x80068FB8u},  // code
++{0x800A53C4u, 0x800E27C8u, 0x800690FCu},  // code
++{0x800E27C8u, 0x800E2A84u, 0x800A6514u},  // code
++{0x800E2ABCu, 0x800E2DF0u, 0x800A6810u},  // code
++{0x800E2DF0u, 0x800E2E54u, 0x800A6B4Cu},  // code
++{0x800E2F60u, 0x800E50FCu, 0x80351DF0u},  // donnees
++{0x800E72D0u, 0x800ED2C4u, 0x80356160u},  // donnees
++{0x800ED380u, 0x800ED480u, 0x803AC9A0u},  // donnees
++{0x80117C18u, 0x80117D18u, 0x803D7200u},  // donnees
++{0x80119DC8u, 0x80119EC8u, 0x803D934Cu},  // donnees
++{0x8011A748u, 0x80120874u, 0x803D9990u},  // donnees
++{0x8012107Cu, 0x8012117Cu, 0x803E0128u},  // donnees
++{0x801222A8u, 0x8012242Cu, 0x803E0874u},  // donnees
++{0x80122440u, 0x80125DA8u, 0x803E0A20u},  // donnees
++{0x80125E00u, 0x80125F00u, 0x8042EB40u},  // donnees
++{0x801AF600u, 0x801AFD54u, 0x804B8340u},  // donnees
++{0x801B2D50u, 0x801B7384u, 0x804BBA90u},  // donnees
++{0x801BBD80u, 0x801BBE80u, 0x804C4AC0u},  // donnees
++{0x801CD660u, 0x801CD760u, 0x804D63A0u},  // donnees
++{0x801D2AA8u, 0x801D5058u, 0x804DB7E8u},  // donnees
++{0x801DDD68u, 0x801E4640u, 0x804E6AA8u},  // donnees
++{0x801EC2E8u, 0x801ECC74u, 0x804F5028u},  // donnees
++{0x801EECF0u, 0x801EF298u, 0x804F7A30u},  // donnees
++{0x801F3998u, 0x801F3E30u, 0x804FC6D8u},  // donnees
++{0x801F7E30u, 0x801F9720u, 0x80500B70u},  // donnees
++{0x801FA6C0u, 0x801FB9A0u, 0x80503540u},  // donnees
++{0x801FC820u, 0x801FD504u, 0x80505920u},  // donnees
++{0x80201500u, 0x802040D8u, 0x8050A600u},  // donnees
++{0x802160F8u, 0x80218EACu, 0x8051F1F8u},  // donnees
++{0x8021B8C0u, 0x8021B9C0u, 0x8042DA60u},  // donnees
++{0x8021B9D8u, 0x8021BAC0u, 0x8042DB50u},  // donnees
++{0x8021BAC0u, 0x8021BB40u, 0x8042DC30u},  // donnees
++{0x8021BB40u, 0x8021BC40u, 0x8042DDC0u},  // donnees
++{0x8021BC50u, 0x8021BD50u, 0x8040B97Cu},  // donnees
++{0x8021BE88u, 0x8021BE8Cu, 0x8042E834u},  // donnees
++{0x8021BE8Cu, 0x8021BF08u, 0x8042E830u},  // donnees
++{0x8021BF08u, 0x8021C31Cu, 0x8042E188u},  // donnees
++{0x8021C340u, 0x8021CF94u, 0x803ABC70u},  // donnees
++{0x8021CFA0u, 0x8021D0A0u, 0x803AC918u},  // donnees
++{0x8022CFA8u, 0x8022D0A8u, 0x805E3108u},  // donnees
++{0x803FBDBCu, 0x803FE5C8u, 0x800A6D40u},  // code
++{0x803FE5C8u, 0x8040624Cu, 0x800A9558u},  // code
++{0x80406250u, 0x80406434u, 0x800B11E0u},  // code
++{0x80406434u, 0x804066CCu, 0x800B13D8u},  // code
++{0x804066D0u, 0x804071E0u, 0x800B169Cu},  // code
++{0x804071E4u, 0x80407288u, 0x800B21ACu},  // code
++{0x804072F0u, 0x8040799Cu, 0x800B22DCu},  // code
++{0x804079A4u, 0x8040ADF4u, 0x800B298Cu},  // code
++{0x8040AE38u, 0x8040B0A4u, 0x800B5E1Cu},  // code
++{0x8040B0C8u, 0x8040B1E8u, 0x800B60F0u},  // code
++{0x8040B1E8u, 0x8040B2ECu, 0x800B6244u},  // code
++{0x8040B324u, 0x8040B8F0u, 0x800B6374u},  // code
++{0x8040B8F0u, 0x8040B94Cu, 0x800B694Cu},  // code
++{0x8040B94Cu, 0x8040BA78u, 0x800B69E8u},  // code
++{0x8040BA78u, 0x8040BB7Cu, 0x800B6B48u},  // code
++{0x8040BBB4u, 0x8040C604u, 0x800B6C74u},  // code
++{0x8040C650u, 0x8040CA78u, 0x800B76C8u},  // code
++{0x8040CA78u, 0x8040DC18u, 0x800B7AF8u},  // code
++{0x8040DC34u, 0x8040E010u, 0x800B8CC8u},  // code
++{0x8040E010u, 0x8040E5D0u, 0x800B90BCu},  // code
++{0x8040E5D4u, 0x8040F09Cu, 0x800B9680u},  // code
++{0x8040F09Cu, 0x8040F330u, 0x800BA160u},  // code
++{0x8040F330u, 0x8040F40Cu, 0x800BA45Cu},  // code
++{0x8040F40Cu, 0x8040F4CCu, 0x800BA54Cu},  // code
++{0x8040F4F0u, 0x8040F83Cu, 0x800BA654u},  // code
++{0x8040F840u, 0x8040FBDCu, 0x800BA9A4u},  // code
++{0x8040FBDCu, 0x8040FFF0u, 0x800BAD48u},  // code
++{0x8040FFF0u, 0x80411554u, 0x800BB1C8u},  // code
++{0x80411564u, 0x80411770u, 0x800BC754u},  // code
++{0x80411770u, 0x804117A8u, 0x800BC988u},  // code
++{0x804117ACu, 0x804119C8u, 0x800BC9E8u},  // code
++{0x804119D0u, 0x80411C40u, 0x800BCC10u},  // code
++{0x80411C40u, 0x80411CA4u, 0x800BCE9Cu},  // code
++{0x80411CA4u, 0x8041230Cu, 0x800BCF04u},  // code
++{0x8041230Cu, 0x80412A90u, 0x800BD5A8u},  // code
++{0x80412A90u, 0x80412D50u, 0x800BDD38u},  // code
++{0x80412D50u, 0x80412E08u, 0x800BE048u},  // code
++{0x80412E08u, 0x80413758u, 0x800BE108u},  // code
++{0x8041375Cu, 0x80415084u, 0x800BEA58u},  // code
++{0x804150ACu, 0x804158E8u, 0x800C03CCu},  // code
++{0x80415908u, 0x8041BC00u, 0x800C0C4Cu},  // code
++{0x8041BC04u, 0x8041D570u, 0x800C6F48u},  // code
++{0x8041D574u, 0x8041D6B0u, 0x800C88B8u},  // code
++{0x8041D6B4u, 0x8041F128u, 0x800C89F8u},  // code
++{0x8041F12Cu, 0x8041F5ECu, 0x800CA470u},  // code
++{0x8041F5F0u, 0x80421FECu, 0x800CA934u},  // code
++{0x80422008u, 0x80422060u, 0x800CD364u},  // code
++{0x80422060u, 0x804220A8u, 0x800CD3F8u},  // code
++{0x804220A8u, 0x80425160u, 0x800CD460u},  // code
++{0x8042516Cu, 0x80425424u, 0x800D052Cu},  // code
++{0x8042542Cu, 0x80425580u, 0x800D07F4u},  // code
++{0x80425580u, 0x804258E8u, 0x800D0954u},  // code
++{0x80425A38u, 0x80425DF4u, 0x800D0D28u},  // code
++{0x80425DFCu, 0x80425F8Cu, 0x800D10F4u},  // code
++{0x80425F94u, 0x80426054u, 0x800D1294u},  // code
++{0x80426290u, 0x804274E0u, 0x800D13D0u},  // code
++{0x804274E4u, 0x80427914u, 0x800D2620u},  // code
++{0x80427924u, 0x80427B50u, 0x800D2A78u},  // code
++{0x80427B60u, 0x80427E44u, 0x800D2D2Cu},  // code
++{0x80427E4Cu, 0x80428BF4u, 0x800D3088u},  // code
++{0x80428BF8u, 0x8042922Cu, 0x800D3E30u},  // code
++{0x8042922Cu, 0x80429C18u, 0x800D4478u},  // code
++{0x80429C4Cu, 0x8042A80Cu, 0x800D4F10u},  // code
++{0x8042A80Cu, 0x8042C31Cu, 0x800D5B14u},  // code
++{0x8042C32Cu, 0x8042C548u, 0x800D764Cu},  // code
++{0x8042C550u, 0x8042C618u, 0x800D78E8u},  // code
++{0x8042C640u, 0x8042CC10u, 0x800D7A48u},  // code
++{0x8042CC14u, 0x8042CE4Cu, 0x800D8018u},  // code
++{0x8042CE4Cu, 0x8042D730u, 0x800D8264u},  // code
++{0x8042D734u, 0x8042D9ECu, 0x800D8B48u},  // code
++{0x8042D9FCu, 0x8042DB48u, 0x800D8E18u},  // code
++{0x8042DB50u, 0x8042DE90u, 0x800D8FDCu},  // code
++{0x8042DEA0u, 0x8042E85Cu, 0x800D9394u},  // code
++{0x8042E860u, 0x8042EF08u, 0x800D9D50u},  // code
++{0x8042EF08u, 0x8042F2D0u, 0x800DA40Cu},  // code
++{0x8042F2D0u, 0x80431BE0u, 0x800DA7E0u},  // code
++{0x80431BE4u, 0x80431D24u, 0x800DD0F0u},  // code
++{0x80431D78u, 0x804326B8u, 0x800DD410u},  // code
++{0x804326B8u, 0x80433218u, 0x800DDD58u},  // code
++{0x80433218u, 0x804334BCu, 0x800DE8C4u},  // code
++{0x804334BCu, 0x804334ECu, 0x800DEB6Cu},  // code
++{0x80433504u, 0x80433830u, 0x800DEBC8u},  // code
++{0x80433830u, 0x80433A10u, 0x800DEF00u},  // code
++{0x80433A10u, 0x80434528u, 0x800DF120u},  // code
++{0x80434528u, 0x80434628u, 0x800DFC50u},  // code
++{0x80434628u, 0x80434670u, 0x800DFD68u},  // code
++{0x80434674u, 0x804346DCu, 0x800DFDB4u},  // code
++{0x804346DCu, 0x804349C0u, 0x800DFE28u},  // code
++{0x804349C8u, 0x80434AC8u, 0x800E0128u},  // code
++{0x80434ACCu, 0x80434B44u, 0x800E0230u},  // code
++{0x80434B48u, 0x80434CF8u, 0x800E02B0u},  // code
++{0x80434CFCu, 0x8043568Cu, 0x800E0468u},  // code
++{0x80435690u, 0x804367DCu, 0x800E0E54u},  // code
++{0x804367DCu, 0x804373BCu, 0x800E1FBCu},  // code
++{0x804373BCu, 0x804373ECu, 0x800E2BA0u},  // code
++{0x804373ECu, 0x80437C34u, 0x800E2BD8u},  // code
++{0x80437C40u, 0x80437C8Cu, 0x800E3424u},  // code
++{0x80437C8Cu, 0x80437D40u, 0x800E34ECu},  // code
++{0x80437D40u, 0x80437F08u, 0x800E35BCu},  // code
++{0x80437F08u, 0x80437F38u, 0x800E37C4u},  // code
++{0x80437F44u, 0x8043854Cu, 0x800E3814u},  // code
++{0x8043856Cu, 0x804385ACu, 0x800E3E48u},  // code
++{0x804385B0u, 0x80438664u, 0x800E3E8Cu},  // code
++{0x80438664u, 0x80438AC8u, 0x800E3F44u},  // code
++{0x80438AECu, 0x80438BC4u, 0x800E43E4u},  // code
++{0x80438BC4u, 0x80438BF4u, 0x800E44CCu},  // code
++{0x80438BF4u, 0x8043901Cu, 0x800E4514u},  // code
++{0x8043901Cu, 0x80439218u, 0x800E4958u},  // code
++{0x80439218u, 0x804392ACu, 0x800E4B60u},  // code
++{0x804392ACu, 0x80439B7Cu, 0x800E4C14u},  // code
++{0x80439B7Cu, 0x80439ED8u, 0x800E54E8u},  // code
++{0x80439FF8u, 0x8043A0E4u, 0x800E586Cu},  // code
++{0x8043A0F0u, 0x8043A270u, 0x800E59D4u},  // code
++{0x8043A2C8u, 0x8043A300u, 0x800E5BD4u},  // code
++{0x8043A300u, 0x8043A4A8u, 0x800E5CCCu},  // code
++{0x8043A4C4u, 0x8043A7B4u, 0x800E5E9Cu},  // code
++{0x8043A7B4u, 0x8043AF94u, 0x800E6190u},  // code
++{0x8043AF94u, 0x8043BC1Cu, 0x800E69A8u},  // code
++{0x8043BC74u, 0x80441328u, 0x800E7754u},  // code
++{0x80441400u, 0x80441A20u, 0x800ECF30u},  // code
++{0x80441A30u, 0x80441BE0u, 0x800ED570u},  // code
++{0x80441BF0u, 0x80441C38u, 0x800ED740u},  // code
++{0x80441C3Cu, 0x804445D8u, 0x800ED78Cu},  // code
++{0x804445E0u, 0x804450ACu, 0x800F0134u},  // code
++{0x804450ACu, 0x80445104u, 0x800F0C20u},  // code
++{0x80445114u, 0x804451C4u, 0x800F0CC4u},  // code
++{0x804451C4u, 0x80445DC4u, 0x800F0D98u},  // code
++{0x80445DC8u, 0x8044AEECu, 0x800F19C4u},  // code
++{0x8044AEECu, 0x80452B4Cu, 0x800F6AECu},  // code
++{0x80452B4Cu, 0x80452E6Cu, 0x800FE770u},  // code
++{0x80452E70u, 0x80453224u, 0x800FEACCu},  // code
++{0x80453254u, 0x804532D0u, 0x800FEEFCu},  // code
++{0x804532E4u, 0x804535D4u, 0x800FEF78u},  // code
++{0x804535D4u, 0x80453778u, 0x800FF270u},  // code
++{0x8045377Cu, 0x80454610u, 0x800FF420u},  // code
++{0x80454610u, 0x80455390u, 0x801002F8u},  // code
++{0x80455394u, 0x8045C2ACu, 0x80101078u},  // code
++{0x8045C2B0u, 0x8045C2F0u, 0x80107F94u},  // code
++{0x8045C2F0u, 0x80461DB8u, 0x80108000u},  // code
++{0x80461DB8u, 0x8046477Cu, 0x8010DAE8u},  // code
++{0x8046477Cu, 0x80468D54u, 0x8011047Cu},  // code
++{0x80468D54u, 0x80469394u, 0x80114AE4u},  // code
++{0x804693B8u, 0x804693FCu, 0x801152C0u},  // code
++{0x80469440u, 0x80469584u, 0x80115344u},  // code
++{0x804695D8u, 0x80469608u, 0x80115488u},  // code
++{0x80469620u, 0x80469834u, 0x801154D0u},  // code
++{0x80469838u, 0x8046986Cu, 0x801156E4u},  // code
++{0x8046986Cu, 0x80469904u, 0x80115734u},  // code
++{0x80469904u, 0x80469A30u, 0x801157F4u},  // code
++{0x80469A94u, 0x80469AF0u, 0x80115930u},  // code
++{0x80469AF0u, 0x80469D44u, 0x8011599Cu},  // code
++{0x80469D4Cu, 0x8046A070u, 0x80115BF8u},  // code
++{0x8046A07Cu, 0x8046A13Cu, 0x80115F2Cu},  // code
++{0x8046A18Cu, 0x8046A35Cu, 0x8011605Cu},  // code
++{0x8046A35Cu, 0x8046A7D8u, 0x80116238u},  // code
++{0x8046A834u, 0x8046A984u, 0x801166E4u},  // code
++{0x8046A988u, 0x8046A9E4u, 0x80116860u},  // code
++{0x8046A9E4u, 0x8046AAC0u, 0x80116ACCu},  // code
++{0x8046AB00u, 0x8046ABA8u, 0x80116BFCu},  // code
++{0x8046ABD0u, 0x8046AD00u, 0x80116D68u},  // code
++{0x8046AD00u, 0x8046B0D4u, 0x80116EB8u},  // code
++{0x8046B0D4u, 0x8046B13Cu, 0x801172A8u},  // code
++{0x8046B13Cu, 0x8046C080u, 0x8011732Cu},  // code
++{0x8046C094u, 0x8046C144u, 0x801182B8u},  // code
++{0x8046C158u, 0x8046C694u, 0x801183ACu},  // code
++{0x8046C694u, 0x8046D928u, 0x801188F0u},  // code
++{0x8046D92Cu, 0x8046D9D4u, 0x80119B84u},  // code
++{0x8046D9D4u, 0x8046E204u, 0x80119C4Cu},  // code
++{0x8046E204u, 0x8046E240u, 0x8011A48Cu},  // code
++{0x8046E240u, 0x8046E4A4u, 0x8011A4D8u},  // code
++{0x8046E4A4u, 0x8046E9ECu, 0x8011A744u},  // code
++{0x8046E9ECu, 0x8046FE88u, 0x8011AC94u},  // code
++{0x8046FE88u, 0x8046FF7Cu, 0x8011C19Cu},  // code
++{0x8046FF7Cu, 0x804702E4u, 0x8011C2ACu},  // code
++{0x804702E4u, 0x80470C10u, 0x8011C63Cu},  // code
++{0x80470C9Cu, 0x80470DA8u, 0x8011CFA8u},  // code
++{0x80470DA8u, 0x80471280u, 0x8011D0D8u},  // code
++{0x80471280u, 0x804716F8u, 0x8011D628u},  // code
++{0x8047171Cu, 0x8047186Cu, 0x8011DAC4u},  // code
++{0x8047186Cu, 0x8047208Cu, 0x8011DC98u},  // code
++{0x8047208Cu, 0x80472870u, 0x8011E4C4u},  // code
++{0x80472870u, 0x80472CBCu, 0x8011ED14u},  // code
++{0x80472CC4u, 0x80472D9Cu, 0x8011F178u},  // code
++{0x80472E90u, 0x80472F6Cu, 0x8011F284u},  // code
++{0x8047301Cu, 0x8047304Cu, 0x8011F41Cu},  // code
++{0x80473054u, 0x804730B8u, 0x8011F45Cu},  // code
++{0x804730C0u, 0x8047403Cu, 0x8011F4D0u},  // code
++{0x8047403Cu, 0x804741C4u, 0x80120460u},  // code
++{0x804741C4u, 0x804745A8u, 0x801205F8u},  // code
++{0x804745ACu, 0x804748BCu, 0x801209F8u},  // code
++{0x804748C0u, 0x804748F0u, 0x80120D10u},  // code
++{0x804748F0u, 0x80474944u, 0x80120D54u},  // code
++{0x80474944u, 0x804758B8u, 0x80120DBCu},  // code
++{0x804758B8u, 0x80475904u, 0x80121D40u},  // code
++{0x80475968u, 0x80476338u, 0x80121E18u},  // code
++{0x80476338u, 0x804764C8u, 0x80122804u},  // code
++{0x804764CCu, 0x80476508u, 0x80122994u},  // code
++{0x80476508u, 0x8047663Cu, 0x801229F0u},  // code
++{0x80476654u, 0x80476960u, 0x80122B50u},  // code
++{0x80476988u, 0x80477320u, 0x80122EA4u},  // code
++{0x80477320u, 0x804773E0u, 0x80123854u},  // code
++{0x804773E0u, 0x80477418u, 0x8012391Cu},  // code
++{0x80477434u, 0x80477464u, 0x8012396Cu},  // code
++{0x80477464u, 0x80477640u, 0x801239A8u},  // code
++{0x80477640u, 0x8047797Cu, 0x80123B88u},  // code
++{0x804779B0u, 0x80478118u, 0x80123F38u},  // code
++{0x80478118u, 0x80478574u, 0x801246CCu},  // code
++{0x80478574u, 0x80478E54u, 0x80124B50u},  // code
++{0x80478E54u, 0x80478FECu, 0x80125450u},  // code
++{0x80478FF0u, 0x804799A8u, 0x801255F8u},  // code
++{0x804799B8u, 0x8047CE10u, 0x80125FECu},  // code
++{0x8047CE10u, 0x8047D0ECu, 0x80129470u},  // code
++{0x8047D0F0u, 0x80484B04u, 0x8012974Cu},  // code
++{0x80484B04u, 0x80484E60u, 0x8013118Cu},  // code
++{0x80484E60u, 0x804851F0u, 0x8013150Cu},  // code
++{0x804851F0u, 0x80485368u, 0x801318C0u},  // code
++{0x80485388u, 0x804854F4u, 0x80131A48u},  // code
++{0x80485504u, 0x80485614u, 0x80131BCCu},  // code
++{0x80485614u, 0x804857B8u, 0x80131CE4u},  // code
++{0x804857F4u, 0x804858ACu, 0x80131ED8u},  // code
++{0x804858ACu, 0x80485970u, 0x80131FC0u},  // code
++{0x8048597Cu, 0x80485ADCu, 0x801320A0u},  // code
++{0x80485AE4u, 0x80485B40u, 0x801322E8u},  // code
++{0x80485B40u, 0x80485B7Cu, 0x80132358u},  // code
++{0x80485D1Cu, 0x80485D58u, 0x801325B4u},  // code
++{0x80485D60u, 0x80485E58u, 0x801325F8u},  // code
++{0x80485E74u, 0x80485ED0u, 0x80132724u},  // code
++{0x80485ED8u, 0x80486094u, 0x801327A0u},  // code
++{0x80486094u, 0x804860E4u, 0x80132974u},  // code
++{0x804860E4u, 0x8048633Cu, 0x801329F4u},  // code
++{0x80486354u, 0x804864ECu, 0x80132C6Cu},  // code
++{0x804864ECu, 0x804866C4u, 0x80132E14u},  // code
++{0x804866C4u, 0x804869D4u, 0x80132FFCu},  // code
++{0x804869D4u, 0x80486E30u, 0x80133318u},  // code
++{0x80486E34u, 0x804870BCu, 0x80133774u},  // code
++{0x804870C8u, 0x804898C0u, 0x801339FCu},  // code
++{0x804898C0u, 0x80489A34u, 0x80136200u},  // code
++{0x80489A34u, 0x8048CA08u, 0x801363B8u},  // code
++{0x8048CA0Cu, 0x8048D3F0u, 0x80139390u},  // code
++{0x8048D414u, 0x8048D474u, 0x80139DE4u},  // code
++{0x8048D4A0u, 0x8048D9A4u, 0x80139EB4u},  // code
++{0x8048D9A4u, 0x8048DBD8u, 0x8013A420u},  // code
++{0x8048DBD8u, 0x8048DC8Cu, 0x8013A660u},  // code
++{0x8048DC90u, 0x8048E030u, 0x8013A714u},  // code
++{0x8048E0ECu, 0x8048E6B4u, 0x8013AB68u},  // code
++{0x8048E6C8u, 0x8048E864u, 0x8013B148u},  // code
++{0x8048E864u, 0x80490404u, 0x8013B2F8u},  // code
++{0x80490404u, 0x80490CC8u, 0x8013CECCu},  // code
++{0x80490CC8u, 0x80490F88u, 0x8013D7A4u},  // code
++{0x80490F88u, 0x80491214u, 0x8013DA78u},  // code
++{0x80491214u, 0x80491D08u, 0x8013DD3Cu},  // code
++{0x80491D28u, 0x80491DACu, 0x8013E874u},  // code
++{0x80491DB0u, 0x804920BCu, 0x8013E908u},  // code
++{0x804920D0u, 0x804926BCu, 0x8013EC48u},  // code
++{0x804926BCu, 0x80492724u, 0x8013F230u},  // code
++{0x80492754u, 0x80492800u, 0x8013F2B4u},  // code
++{0x80492804u, 0x80492984u, 0x8013F360u},  // code
++{0x804929C0u, 0x80492A40u, 0x8013F514u},  // code
++{0x80492A54u, 0x80492B78u, 0x8013F59Cu},  // code
++{0x80492B78u, 0x804930D8u, 0x8013F718u},  // code
++{0x80493144u, 0x804931C4u, 0x8013FD94u},  // code
++{0x804931F0u, 0x80493274u, 0x8013FE50u},  // code
++{0x80493278u, 0x80493310u, 0x8013FF04u},  // code
++{0x80493314u, 0x80493E4Cu, 0x8013FF9Cu},  // code
++{0x80493E6Cu, 0x80493F94u, 0x80140B70u},  // code
++{0x80493FCCu, 0x8049B5F0u, 0x80140D2Cu},  // code
++{0x8049B5F0u, 0x8049B810u, 0x80148374u},  // code
++{0x8049B814u, 0x8049B9BCu, 0x80148594u},  // code
++{0x8049B9C4u, 0x8049C4C8u, 0x80148750u},  // code
++{0x8049C4CCu, 0x8049C540u, 0x80149254u},  // code
++{0x8049C544u, 0x8049C6D4u, 0x801492C8u},  // code
++{0x8049C6E0u, 0x8049C8CCu, 0x80149480u},  // code
++{0x8049C9B0u, 0x8049DD44u, 0x801496A8u},  // code
++{0x8049DD48u, 0x804A25E8u, 0x8014AA40u},  // code
++{0x804A25ECu, 0x804A26A0u, 0x8014F2F0u},  // code
++{0x804A26A0u, 0x804A273Cu, 0x8014F450u},  // code
++{0x804A2740u, 0x804A2A40u, 0x8014F4F0u},  // code
++{0x804A2A6Cu, 0x804A2B44u, 0x8014F864u},  // code
++{0x804A2B58u, 0x804A3A28u, 0x8014F9FCu},  // code
++{0x804A3A28u, 0x804A3ACCu, 0x801508D8u},  // code
++{0x804A3ACCu, 0x804A7534u, 0x80150994u},  // code
++{0x804A7534u, 0x804A7E14u, 0x80154464u},  // code
++{0x804A7E14u, 0x804A7E5Cu, 0x80154D58u},  // code
++{0x804A7E70u, 0x804A816Cu, 0x80154DF8u},  // code
++{0x804A816Cu, 0x804A9604u, 0x801550F8u},  // code
++{0x804A961Cu, 0x804A9714u, 0x80156598u},  // code
++{0x804A9718u, 0x804A99A0u, 0x801566C0u},  // code
++{0x804A99A4u, 0x804B2A7Cu, 0x80156978u},  // code
++{0x804B2A7Cu, 0x804B319Cu, 0x8015FA68u},  // code
++{0x804B319Cu, 0x804B3984u, 0x80160200u},  // code
++{0x804B39B4u, 0x804B3C88u, 0x801609E4u},  // code
++{0x804B3C88u, 0x804B3E14u, 0x80160CBCu},  // code
++{0x804B3E24u, 0x804B406Cu, 0x80160E48u},  // code
++{0x804B406Cu, 0x804B4190u, 0x8016109Cu},  // code
++{0x804B4190u, 0x804B44C0u, 0x801611C8u},  // code
++{0x804B44C0u, 0x804B8488u, 0x801615FCu},  // code
++{0x804B8488u, 0x804B9768u, 0x801655D0u},  // code
++{0x804B9768u, 0x804B97DCu, 0x801668C0u},  // code
++{0x804B97E4u, 0x804B99C8u, 0x8016697Cu},  // code
++{0x804B99E0u, 0x804B9EA0u, 0x80166B70u},  // code
++{0x804B9EA0u, 0x804B9F5Cu, 0x80167044u},  // code
++{0x804B9F5Cu, 0x804BE7A8u, 0x80167108u},  // code
++{0x804BE7A8u, 0x804BEBB4u, 0x8016B964u},  // code
++{0x804BEBB4u, 0x804BEF50u, 0x8016BD80u},  // code
++{0x804BEF54u, 0x804BF0E4u, 0x8016C120u},  // code
++{0x804BF0ECu, 0x804BF364u, 0x8016C2C8u},  // code
++{0x804BF364u, 0x804BF424u, 0x8016C564u},  // code
++{0x804BF514u, 0x804BFCE0u, 0x8016C634u},  // code
++{0x804BFDA4u, 0x804C0340u, 0x8016CE10u},  // code
++{0x804C0410u, 0x804C06BCu, 0x8016D3BCu},  // code
++{0x804C0708u, 0x804C0B04u, 0x8016D668u},  // code
++{0x804C0B50u, 0x804C0F78u, 0x8016DA64u},  // code
++{0x804C0FC4u, 0x804C1900u, 0x8016DE8Cu},  // code
++{0x804C19F0u, 0x804C1DD0u, 0x8016E7D8u},  // code
++{0x804C1DFCu, 0x804C1FCCu, 0x8016EC4Cu},  // code
++{0x804C20DCu, 0x804C2684u, 0x8016EE2Cu},  // code
++{0x804C2754u, 0x804C2A38u, 0x8016F3E4u},  // code
++{0x804C2AA4u, 0x804C2EF4u, 0x8016F6C8u},  // code
++{0x804C2F60u, 0x804C2F64u, 0x8016FB18u},  // manuel
++{0x804C2FC0u, 0x804C2FC4u, 0x8016FB78u},  // manuel
++{0x804C30E0u, 0x804C30E4u, 0x8016FC98u},  // manuel
++{0x804C3140u, 0x804C3144u, 0x8016FCF8u},  // manuel
++{0x804C33E4u, 0x804C3C2Cu, 0x8016FF50u},  // code
++{0x804C3CFCu, 0x804C40CCu, 0x801707A8u},  // code
++{0x804C4168u, 0x804C42A0u, 0x80170B80u},  // code
++{0x804C42A4u, 0x804C4688u, 0x80170CD0u},  // code
++{0x804C4778u, 0x804C49FCu, 0x801710C4u},  // code
++{0x804C4A48u, 0x804C5098u, 0x80171348u},  // code
++{0x804C50E4u, 0x804C5E14u, 0x80171998u},  // code
++{0x804C5EE4u, 0x804C61A8u, 0x801726D8u},  // code
++{0x804C62B8u, 0x804C64D0u, 0x801729ACu},  // code
++{0x804C64D4u, 0x804C68A0u, 0x80172BDCu},  // code
++{0x804C6C90u, 0x804C70B8u, 0x8017326Cu},  // code
++{0x804C7104u, 0x804C7740u, 0x80173694u},  // code
++{0x804C7740u, 0x804C77ACu, 0x80173CE8u},  // code
++{0x804C77C0u, 0x804C7888u, 0x80173D74u},  // code
++{0x804C7888u, 0x804C78E8u, 0x80173E4Cu},  // code
++{0x804C78E8u, 0x804C7950u, 0x80173EBCu},  // code
++{0x804C7950u, 0x804C7F98u, 0x80173F40u},  // code
++{0x804C7F9Cu, 0x804C84A4u, 0x80174598u},  // code
++{0x804C84A8u, 0x804C9298u, 0x80174AB0u},  // code
++{0x804C9298u, 0x804C9340u, 0x801758A8u},  // code
++{0x804C9340u, 0x804C93DCu, 0x801759A4u},  // code
++{0x804C9400u, 0x804C94E0u, 0x80175AA4u},  // code
++{0x804C94E0u, 0x804C952Cu, 0x80175BB0u},  // code
++{0x804C9530u, 0x804CA6D8u, 0x80175C04u},  // code
++{0x804CA6F4u, 0x804CB160u, 0x80176DC4u},  // code
++{0x804CB168u, 0x804CC684u, 0x80177840u},  // code
++{0x804CC6CCu, 0x804CD9E4u, 0x80178D64u},  // code
++{0x804CD9E8u, 0x804CDFE4u, 0x8017A080u},  // code
++{0x804CDFE8u, 0x804CFEF4u, 0x8017A684u},  // code
++{0x804CFEF8u, 0x804D08B0u, 0x8017C594u},  // code
++{0x804D08B0u, 0x804D0EB8u, 0x8017CF70u},  // code
++{0x804D0EBCu, 0x804D1354u, 0x8017D57Cu},  // code
++{0x804D1358u, 0x804D276Cu, 0x8017DA18u},  // code
++{0x804D276Cu, 0x804D27ACu, 0x8017EE38u},  // code
++{0x804D27ACu, 0x804D2B6Cu, 0x8017EE84u},  // code
++{0x804D2B6Cu, 0x804D3B24u, 0x8017F250u},  // code
++{0x804D3B24u, 0x804D49F8u, 0x80180214u},  // code
++{0x804D49F8u, 0x804D4B18u, 0x801810ECu},  // code
++{0x804D4B18u, 0x804D4F3Cu, 0x8018123Cu},  // code
++{0x804D4F3Cu, 0x804D6344u, 0x80181680u},  // code
++{0x804D6478u, 0x804D66ACu, 0x80182BDCu},  // code
++{0x804D67A0u, 0x804D6B94u, 0x80182E18u},  // code
++{0x804D6B94u, 0x804D723Cu, 0x80183268u},  // code
++{0x804D723Cu, 0x804D7930u, 0x80183918u},  // code
++{0x804D7930u, 0x804D91DCu, 0x80184210u},  // code
++{0x804D91DCu, 0x804D9210u, 0x80185AD8u},  // code
++{0x804D9218u, 0x804DAA48u, 0x80185B58u},  // code
++{0x804DAA48u, 0x804DAF18u, 0x80187390u},  // code
++{0x804DAF18u, 0x804DB098u, 0x80187878u},  // code
++{0x804DB098u, 0x804DB23Cu, 0x80187A68u},  // code
++{0x804DB23Cu, 0x804DB2D8u, 0x80187C28u},  // code
++{0x804DB2DCu, 0x804DB31Cu, 0x80187CE0u},  // code
++{0x804DB388u, 0x804DCA40u, 0x80187DBCu},  // code
++{0x804DCA40u, 0x804DD898u, 0x8018949Cu},  // code
++{0x804DD898u, 0x804DF1F0u, 0x8018A31Cu},  // code
++{0x804DF1F4u, 0x804DFDFCu, 0x8018BC74u},  // code
++{0x804DFE48u, 0x804E01B4u, 0x8018C87Cu},  // code
++{0x804E0224u, 0x804E04CCu, 0x8018CBF8u},  // code
++{0x804E0518u, 0x804E0714u, 0x8018CEA0u},  // code
++{0x804E0760u, 0x804E0764u, 0x8018D09Cu},  // manuel
++{0x804E07D8u, 0x804E07DCu, 0x8018D114u},  // manuel
++{0x804E08DCu, 0x804E08E0u, 0x8018D218u},  // manuel
++{0x804E0954u, 0x804E0958u, 0x8018D290u},  // manuel
++{0x804E0B94u, 0x804E0B98u, 0x8018D484u},  // manuel
++{0x804E0C0Cu, 0x804E0C10u, 0x8018D4FCu},  // manuel
++{0x804E0D10u, 0x804E0D14u, 0x8018D600u},  // manuel
++{0x804E0D88u, 0x804E0D8Cu, 0x8018D678u},  // manuel
++{0x804E0FC4u, 0x804E176Cu, 0x8018D868u},  // code
++{0x804E185Cu, 0x804E1DE4u, 0x8018E020u},  // code
++{0x804E1EF4u, 0x804E23D8u, 0x8018E5B8u},  // code
++{0x804E24C8u, 0x804E27D4u, 0x8018EAACu},  // code
++{0x804E2820u, 0x804E2C7Cu, 0x8018EDB8u},  // code
++{0x804E2CC8u, 0x804E3128u, 0x8018F214u},  // code
++{0x804E3174u, 0x804E3C58u, 0x8018F674u},  // code
++{0x804E3D48u, 0x804E42DCu, 0x80190168u},  // code
++{0x804E43ECu, 0x804E4980u, 0x8019070Cu},  // code
++{0x804E4A50u, 0x804E4DB4u, 0x80190CB0u},  // code
++{0x804E4E20u, 0x804E5244u, 0x80191014u},  // code
++{0x804E5290u, 0x804E56A8u, 0x80191438u},  // code
++{0x804E56F4u, 0x804E5DBCu, 0x80191850u},  // code
++{0x804E5E8Cu, 0x804E64C8u, 0x80191F28u},  // code
++{0x804E65B8u, 0x804E6C4Cu, 0x80192574u},  // code
++{0x804E6D1Cu, 0x804E6D8Cu, 0x80192C18u},  // code
++{0x804E6E08u, 0x804E708Cu, 0x80192C90u},  // code
++{0x804E70D8u, 0x804E758Cu, 0x80192F14u},  // code
++{0x804E75D8u, 0x804E75DCu, 0x801933C8u},  // manuel
++{0x804E7638u, 0x804E763Cu, 0x80193428u},  // manuel
++{0x804E7740u, 0x804E7744u, 0x80193530u},  // manuel
++{0x804E77A0u, 0x804E77A4u, 0x80193590u},  // manuel
++{0x804E7A40u, 0x804E82A8u, 0x801937E4u},  // code
++{0x804E8370u, 0x804E87C0u, 0x80194054u},  // code
++{0x804E88D0u, 0x804E8EE4u, 0x801944B4u},  // code
++{0x804E8FB4u, 0x804E9288u, 0x80194AD8u},  // code
++{0x804E92D4u, 0x804E975Cu, 0x80194DACu},  // code
++{0x804E97A8u, 0x804E9BF0u, 0x80195234u},  // code
++{0x804E9C3Cu, 0x804EC8F4u, 0x8019567Cu},  // code
++{0x804EC914u, 0x804ECA30u, 0x80198360u},  // code
++{0x804ECA38u, 0x804EDD78u, 0x801984A8u},  // code
++{0x804EDD94u, 0x804EE034u, 0x80199800u},  // code
++{0x804EE038u, 0x804EE188u, 0x80199AA4u},  // code
++{0x804EE18Cu, 0x804EE468u, 0x80199BF8u},  // code
++{0x804EE490u, 0x804F6068u, 0x80199EF4u},  // code
++{0x804F6068u, 0x804F60D4u, 0x801A1AD8u},  // code
++{0x804F60E4u, 0x804F61BCu, 0x801A1B68u},  // code
++{0x804F61BCu, 0x804F627Cu, 0x801A1C60u},  // code
++{0x804F627Cu, 0x804F634Cu, 0x801A1D40u},  // code
++{0x804F634Cu, 0x804F63B4u, 0x801A1E14u},  // code
++{0x804F63C0u, 0x804F7200u, 0x801A1E8Cu},  // code
++{0x804F7200u, 0x80507680u, 0x801A2D44u},  // code
++{0x80507750u, 0x80507850u, 0x801B3234u},  // donnees
++{0x80507C48u, 0x80507D30u, 0x801B35ECu},  // code
++{0x80507D7Cu, 0x80507EE8u, 0x801B36D4u},  // code
++{0x80507F34u, 0x805082E0u, 0x801B3840u},  // code
++{0x8050832Cu, 0x8050CCA0u, 0x801B3BECu},  // code
++{0x8050CCCCu, 0x8050EDBCu, 0x801B858Cu},  // code
++{0x8050EDBCu, 0x8050EE18u, 0x801BA6F8u},  // code
++{0x8050EE18u, 0x8050EF44u, 0x801BA758u},  // code
++{0x8050EF44u, 0x8050F0ACu, 0x801BA894u},  // code
++{0x8050F0B0u, 0x8050F1FCu, 0x801BAA00u},  // code
++{0x8050F1FCu, 0x8050F8C8u, 0x801BAB54u},  // code
++{0x8050F8D0u, 0x8050F924u, 0x801BB224u},  // code
++{0x8050F924u, 0x8050FA5Cu, 0x801BB27Cu},  // code
++{0x8050FA5Cu, 0x8050FAC8u, 0x801BB3B8u},  // code
++{0x8050FAC8u, 0x8050FC80u, 0x801BB428u},  // code
++{0x8050FD00u, 0x8050FDACu, 0x801BB6A4u},  // code
++{0x8050FDACu, 0x80510030u, 0x801BB754u},  // code
++{0x80510030u, 0x80510244u, 0x801BB9DCu},  // code
++{0x80510244u, 0x805102E4u, 0x801BBC00u},  // code
++{0x805102E4u, 0x8051034Cu, 0x801BBCA4u},  // code
++{0x8051034Cu, 0x8051064Cu, 0x801BBD10u},  // code
++{0x8051064Cu, 0x80510CC4u, 0x801BC014u},  // code
++{0x80510CC4u, 0x80510E0Cu, 0x801BC6A4u},  // code
++{0x80510E10u, 0x80510E6Cu, 0x801BC7F0u},  // code
++{0x80510E6Cu, 0x805110DCu, 0x801BC878u},  // code
++{0x805110E0u, 0x80511788u, 0x801BCB00u},  // code
++{0x805117A0u, 0x80511B70u, 0x801BD208u},  // code
++{0x80511B84u, 0x80512138u, 0x801BD608u},  // code
++{0x80512150u, 0x805121DCu, 0x801BDBECu},  // code
++{0x805121DCu, 0x8051264Cu, 0x801BDC9Cu},  // code
++{0x80512650u, 0x805126C0u, 0x801BE110u},  // code
++{0x805126C4u, 0x80512DC8u, 0x801BE184u},  // code
++{0x80512DC8u, 0x80512E24u, 0x801BE890u},  // code
++{0x80512E50u, 0x8051333Cu, 0x801BE924u},  // code
++{0x8051333Cu, 0x80513750u, 0x801BEE24u},  // code
++{0x80513750u, 0x80516308u, 0x801BF244u},  // code
++{0x80516310u, 0x80517450u, 0x801C1E1Cu},  // code
++{0x80517454u, 0x805177CCu, 0x801C2F5Cu},  // code
++{0x80517800u, 0x8051889Cu, 0x801C3314u},  // code
++{0x8051889Cu, 0x8051C2C4u, 0x801C43BCu},  // code
++{0x8051C2C4u, 0x8051C378u, 0x801C7DF4u},  // code
++{0x8051C384u, 0x8052252Cu, 0x801C7EA8u},  // code
++{0x8052252Cu, 0x805259C8u, 0x801CE060u},  // code
++{0x805259C8u, 0x80526830u, 0x801D1548u},  // code
++{0x80526854u, 0x80526958u, 0x801D241Cu},  // code
++{0x80526958u, 0x80528554u, 0x801D253Cu},  // code
++{0x80528578u, 0x80528678u, 0x801D4184u},  // code
++{0x8052868Cu, 0x80529D20u, 0x801D42C0u},  // code
++{0x80529D24u, 0x8052BCF4u, 0x801D5958u},  // code
++{0x8052BCF4u, 0x8052CBE8u, 0x801D7934u},  // code
++{0x8052CBE8u, 0x80532334u, 0x801D8864u},  // code
++{0x80532334u, 0x80532AF0u, 0x801DDFB4u},  // code
++{0x80532AF0u, 0x80534C08u, 0x801DE778u},  // code
++{0x80534C08u, 0x80534C50u, 0x801E0894u},  // code
++{0x80534C50u, 0x80534EF0u, 0x801E08ECu},  // code
++{0x80534EF0u, 0x80535020u, 0x801E0BA4u},  // code
++{0x80535020u, 0x8053536Cu, 0x801E0CE0u},  // code
++{0x8053538Cu, 0x805353C8u, 0x801E1054u},  // code
++{0x805353C8u, 0x80535570u, 0x801E10B0u},  // code
++{0x80535570u, 0x80536744u, 0x801E1264u},  // code
++{0x80536744u, 0x80536880u, 0x801E2440u},  // code
++{0x80536880u, 0x80537E78u, 0x801E2584u},  // code
++{0x80537E7Cu, 0x805391B8u, 0x801E3B80u},  // code
++{0x805391B8u, 0x80539264u, 0x801E4EC0u},  // code
++{0x80539264u, 0x80539CD4u, 0x801E4F78u},  // code
++{0x80539CE0u, 0x80539E60u, 0x801E59ECu},  // code
++{0x80539E6Cu, 0x80539F80u, 0x801E5B70u},  // code
++{0x80539F8Cu, 0x80539FD8u, 0x801E5C88u},  // code
++{0x80539FE4u, 0x8053A298u, 0x801E5CD8u},  // code
++{0x8053A298u, 0x8053A494u, 0x801E5F98u},  // code
++{0x8053A4E4u, 0x8053A558u, 0x801E6204u},  // code
++{0x8053A600u, 0x8053A6C8u, 0x801E63BCu},  // code
++{0x8053A6C8u, 0x8053A710u, 0x801E6490u},  // code
++{0x8053A714u, 0x8053A788u, 0x801E64DCu},  // code
++{0x8053A7DCu, 0x8053A8F0u, 0x801E6598u},  // code
++{0x8053A8FCu, 0x8053A934u, 0x801E66B8u},  // code
++{0x8053A984u, 0x8053A9D4u, 0x801E674Cu},  // code
++{0x8053A9DCu, 0x8053AE44u, 0x801E67F4u},  // code
++{0x8053AE88u, 0x8053AF08u, 0x801E6CACu},  // code
++{0x8053AF28u, 0x8053B060u, 0x801E6D50u},  // code
++{0x8053B060u, 0x8053B184u, 0x801E6E90u},  // code
++{0x8053B184u, 0x8053B1B8u, 0x801E6FC0u},  // code
++{0x8053B1E0u, 0x8053B29Cu, 0x801E6FF8u},  // code
++{0x8053B29Cu, 0x8053B3DCu, 0x801E70B8u},  // code
++{0x8053B3DCu, 0x8053B610u, 0x801E7214u},  // code
++{0x8053B610u, 0x8053B684u, 0x801E7454u},  // code
++{0x8053B6BCu, 0x8053B724u, 0x801E7584u},  // code
++{0x8053B778u, 0x8053B9F0u, 0x801E75D8u},  // code
++{0x8053B9FCu, 0x8053BAD4u, 0x801E787Cu},  // code
++{0x8053BAD4u, 0x8053BBACu, 0x801E7958u},  // code
++{0x8053BBACu, 0x8053BC30u, 0x801E7B24u},  // code
++{0x8053BC3Cu, 0x8053BCCCu, 0x801E7BD4u},  // code
++{0x8053BCCCu, 0x8053BF68u, 0x801E7C80u},  // code
++{0x8053BF78u, 0x8053BFF0u, 0x801E7F30u},  // code
++{0x8053C1ECu, 0x8053C2B0u, 0x801E7FB0u},  // code
++{0x8053C2B4u, 0x8053C52Cu, 0x801E808Cu},  // code
++{0x8053C598u, 0x8053C638u, 0x801E8390u},  // code
++{0x8053C638u, 0x8053C7A0u, 0x801E8438u},  // code
++{0x8053C7A0u, 0x8053C858u, 0x801E85DCu},  // code
++{0x8053C864u, 0x8053C974u, 0x801E86C0u},  // code
++{0x8053C974u, 0x8053CD98u, 0x801E87D8u},  // code
++{0x8053CD98u, 0x8053D09Cu, 0x801E8C5Cu},  // code
++{0x8053D0A0u, 0x8053D118u, 0x801E8F68u},  // code
++{0x8053D14Cu, 0x8053D1C0u, 0x801E9008u},  // code
++{0x8053D1D8u, 0x8053D2ACu, 0x801E90ACu},  // code
++{0x8053D2F8u, 0x8053D374u, 0x801E91B4u},  // code
++{0x8053D37Cu, 0x8053D3ACu, 0x801E9238u},  // code
++{0x8053D3B0u, 0x8053D3FCu, 0x801E926Cu},  // code
++{0x8053D424u, 0x8053D45Cu, 0x801E9304u},  // code
++{0x8053D490u, 0x8053D514u, 0x801E9380u},  // code
++{0x8053D514u, 0x8053D54Cu, 0x801E9414u},  // code
++{0x8053D57Cu, 0x8053D5C0u, 0x801E94E0u},  // code
++{0x8053D5D0u, 0x8053D608u, 0x801E9558u},  // code
++{0x8053D61Cu, 0x80546C78u, 0x801E95C0u},  // code
++{0x80546C78u, 0x80546FB4u, 0x801F2C24u},  // code
++{0x80546FB8u, 0x80547094u, 0x801F2F68u},  // code
++{0x805470C4u, 0x80547190u, 0x801F3078u},  // code
++{0x80547190u, 0x80547698u, 0x801F3154u},  // code
++{0x80547698u, 0x80547944u, 0x801F3658u},  // code
++{0x80547948u, 0x80547AC8u, 0x801F3908u},  // code
++{0x80547AD4u, 0x80547B80u, 0x801F3A90u},  // code
++{0x80547B84u, 0x80547C54u, 0x801F3B40u},  // code
++{0x80547C58u, 0x80547E24u, 0x801F3C14u},  // code
++{0x80547E24u, 0x805480BCu, 0x801F3DDCu},  // code
++{0x805480BCu, 0x80548C58u, 0x801F4070u},  // code
++{0x80548D6Cu, 0x80548DE8u, 0x801F4D10u},  // code
++{0x80548EE8u, 0x805490C8u, 0x801F4E80u},  // code
++{0x80549358u, 0x8054950Cu, 0x801F52D4u},  // code
++{0x8054979Cu, 0x805498D8u, 0x801F56FCu},  // code
++{0x805499F4u, 0x80549AE4u, 0x801F5820u},  // code
++{0x80549B8Cu, 0x80549C20u, 0x801F59B8u},  // code
++{0x80549C24u, 0x80549DA8u, 0x801F5A50u},  // code
++{0x80549E50u, 0x80549FACu, 0x801F5C7Cu},  // code
++{0x8054A054u, 0x8054A134u, 0x801F5E80u},  // code
++{0x8054A1DCu, 0x8054A268u, 0x801F6008u},  // code
++{0x8054A310u, 0x8054A41Cu, 0x801F613Cu},  // code
++{0x8054A474u, 0x8054A558u, 0x801F62A0u},  // code
++{0x8054A618u, 0x8054A71Cu, 0x801F6424u},  // code
++{0x8054A71Cu, 0x8054A88Cu, 0x801F6530u},  // code
++{0x8054A890u, 0x8054EC68u, 0x801F66A4u},  // code
++{0x8054EC6Cu, 0x80550CD0u, 0x801FAA7Cu},  // code
++{0x80550DC0u, 0x80550E18u, 0x801FCAF0u},  // code
++{0x80550E20u, 0x80550ED4u, 0x801FCB64u},  // code
++{0x80550FE4u, 0x8055133Cu, 0x801FCC28u},  // code
++{0x8055140Cu, 0x80553AE0u, 0x801FCF90u},  // code
++{0x80553B90u, 0x805540D4u, 0x801FF674u},  // code
++{0x805541C4u, 0x80554524u, 0x801FFBC8u},  // code
++{0x805545F4u, 0x8055A564u, 0x801FFF38u},  // code
++{0x8055A614u, 0x8055A6E0u, 0x80205EB8u},  // code
++{0x8055A7B0u, 0x8055AB08u, 0x80205F94u},  // code
++{0x8055ABF8u, 0x8055B4A4u, 0x802062FCu},  // code
++{0x8055B4CCu, 0x8055E2A0u, 0x80206BD4u},  // code
++{0x8055E350u, 0x8055E430u, 0x802099B8u},  // code
++{0x8055E500u, 0x8055E858u, 0x80209AA8u},  // code
++{0x8055E948u, 0x80562C80u, 0x80209E10u},  // code
++{0x80562C84u, 0x80562DA0u, 0x8020E168u},  // code
++{0x80562E44u, 0x8057197Cu, 0x8020E2A8u},  // code
++{0x80571998u, 0x80571A3Cu, 0x8021CDE0u},  // code
++{0x80571AD4u, 0x80572C7Cu, 0x8021CE78u},  // code
++{0x80572D08u, 0x805827E4u, 0x8021E04Cu},  // code
++{0x805827E8u, 0x80586A98u, 0x8022DB28u},  // code
++{0x80586A98u, 0x80586B18u, 0x80231DE0u},  // code
++{0x80586B44u, 0x80586B80u, 0x80231ED0u},  // code
++{0x80586B98u, 0x80586C2Cu, 0x80231F98u},  // code
++{0x80586C44u, 0x80587358u, 0x802320E8u},  // code
++{0x80587408u, 0x80587528u, 0x8023280Cu},  // code
++{0x805878D4u, 0x805879D4u, 0x80232C38u},  // donnees
++{0x805879DCu, 0x80588720u, 0x80232C80u},  // code
++{0x805887D0u, 0x80588A40u, 0x802339D4u},  // code
++{0x80588EF4u, 0x8058A2E0u, 0x80233F98u},  // code
++{0x8058A3B0u, 0x8058A45Cu, 0x80235394u},  // code
++{0x8058A52Cu, 0x8058A770u, 0x80235450u},  // code
++{0x8058A840u, 0x8058B99Cu, 0x802356A4u},  // code
++{0x8058B99Cu, 0x8058EDECu, 0x80236808u},  // code
++{0x8058EDF0u, 0x8059CCC8u, 0x80239C70u},  // code
++{0x8059CCCCu, 0x805A03B4u, 0x80247B48u},  // code
++{0x805A03B8u, 0x805A69A8u, 0x8024B230u},  // code
++{0x805A69A8u, 0x805A6A0Cu, 0x80251854u},  // code
++{0x805A6A0Cu, 0x805A6AA8u, 0x802518ECu},  // code
++{0x805A6AA8u, 0x805A6B8Cu, 0x802519C4u},  // code
++{0x805A6BA0u, 0x805A6C38u, 0x80251AC4u},  // code
++{0x805A6C38u, 0x805A6F8Cu, 0x80251B88u},  // code
++{0x805A6F8Cu, 0x805A6FE4u, 0x80251EE4u},  // code
++{0x805A6FE4u, 0x805A704Cu, 0x80251F4Cu},  // code
++{0x805A7074u, 0x805A7170u, 0x80251FF4u},  // code
++{0x805A7170u, 0x805A745Cu, 0x8025210Cu},  // code
++{0x805A746Cu, 0x805A76C4u, 0x8025242Cu},  // code
++{0x805A7700u, 0x805A778Cu, 0x80252718u},  // code
++{0x805A779Cu, 0x805A900Cu, 0x802527D8u},  // code
++{0x805A91BCu, 0x805AA9ACu, 0x80254030u},  // code
++{0x805AA9B4u, 0x805AEE94u, 0x8025582Cu},  // code
++{0x805AEEC8u, 0x805B2D08u, 0x80259D48u},  // code
++{0x805B2D14u, 0x805B2D94u, 0x8025DBD0u},  // code
++{0x805B2DA8u, 0x805B76E8u, 0x8025DCA0u},  // code
++{0x805B76E8u, 0x805B80D4u, 0x8026260Cu},  // code
++{0x805B8100u, 0x805B8140u, 0x8027B818u},  // code
++{0x805B8290u, 0x805B8294u, 0x8027B934u},  // manuel
++{0x805B82D8u, 0x805B834Cu, 0x80262FF0u},  // code
++{0x805B83ACu, 0x805BCE98u, 0x8026304Cu},  // code
++{0x805BCE98u, 0x805C09C4u, 0x8035C16Cu},  // donnees
++{0x805C0BE4u, 0x805CF44Cu, 0x8035FF98u},  // donnees
++{0x805CF458u, 0x805CF46Cu, 0x8037340Cu},  // donnees
++{0x805CF46Cu, 0x805CF56Cu, 0x80373424u},  // donnees
++{0x805CF5B0u, 0x805D375Cu, 0x8036E964u},  // donnees
++{0x805D37D0u, 0x805D56ACu, 0x803E4B30u},  // donnees
++{0x805E0A9Cu, 0x805E5144u, 0x803F1DFCu},  // donnees
++{0x805E5370u, 0x805E5F44u, 0x803F65A8u},  // donnees
++{0x805EA990u, 0x805EB35Cu, 0x803FC138u},  // donnees
++{0x805EB39Cu, 0x805EC00Cu, 0x803FCB60u},  // donnees
++{0x805EC048u, 0x805EDA24u, 0x803FD82Cu},  // donnees
++{0x805EDAB8u, 0x805EDAD0u, 0x803FF2A0u},  // donnees
++{0x805EDAD0u, 0x805EDBD0u, 0x803FF2BCu},  // donnees
++{0x805EDEE4u, 0x805EDF08u, 0x803FF700u},  // donnees
++{0x805EDF08u, 0x805EDF7Cu, 0x803FF728u},  // donnees
++{0x805EDF7Cu, 0x805EE05Cu, 0x803FF7A0u},  // donnees
++{0x805EE05Cu, 0x805EF33Cu, 0x803FF884u},  // donnees
++{0x805EF3E0u, 0x805EF6F4u, 0x80400C18u},  // donnees
++{0x805EF844u, 0x805EF944u, 0x80401108u},  // donnees
++{0x805EF9D0u, 0x805F0DACu, 0x804012F4u},  // donnees
++{0x805F2F68u, 0x805F76D4u, 0x8040488Cu},  // donnees
++{0x805F7810u, 0x805F7910u, 0x8040914Cu},  // donnees
++{0x805F7984u, 0x805F8034u, 0x804092F0u},  // donnees
++{0x805F92B8u, 0x805FAFACu, 0x80409BB0u},  // donnees
++{0x805FB080u, 0x806B5774u, 0x805249C0u},  // manuel
++{0x80808081u, 0x80808181u, 0x80808081u},  // donnees
++{0x80BEFBFFu, 0x80BEFCFFu, 0x80BEFBFFu},  // donnees
++{0x81020409u, 0x81020509u, 0x81020409u},  // donnees
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 7dbe4df..9f66ab3 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -1,6 +1,7 @@
+ // SR-Source Net Plus: the "1P".."8P" labels. See srnp_labels.hpp.
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #include "srnp_labels.hpp"
++#include "srnp_game.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -894,6 +895,9 @@ void SetSeatTag(int seat, const std::string& text)
+ 
+ void LabelsOnFrame()
+ {
++  // The labels' code and caves are Sonic Riders US's (Tournament Edition: not carried over yet).
++  if (CurrentGame() != Game::Riders)
++    return;
+   static const bool off = [] {
+     const char* v = std::getenv("SRNP_ETIQUETTES");
+     return v && *v == '0';
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 758520c..f1fc08b 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -2,6 +2,7 @@
+ // See srnp_racers.hpp.
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #include "srnp_racers.hpp"
++#include "srnp_game.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -43,10 +44,113 @@ constexpr std::uint32_t kPadStatusNow = 0x8021BB44;  // -> this frame's PADStatu
+ constexpr std::uint32_t kControl = 0xBC;           // racer byte: 0 human, 1 CPU (who writes its controls)
+ constexpr std::uint32_t kCpuFlag = 0xBD;  // racer byte: 1 CPU, read by 71 functions (AI, physics, items, label)
+ 
+-std::uint8_t* Guest(std::uint32_t address, std::uint32_t size)
++// Parts of the mod not yet carried over to Tournament Edition (their words checked against TE's code one
++// by one): left out there, said once each.
++bool NotOnTE(const char* what)
++{
++  if (CurrentGame() != Game::TE)
++    return false;
++  static std::map<std::string, bool> said;
++  if (!said[what])
++  {
++    said[what] = true;
++    std::fprintf(stderr, "[srnp racers] %s: not on Tournament Edition yet\n", what);
++  }
++  return true;
++}
++
++// A word of the game's code the mod swaps, in the game that runs (srnp_game.hpp): its address, the game's
++// original and the mod's word. On TE the original is read the first time (its shape checked against the US
++// one) and kept, the mod's word made from it (InGame). False when the game holds neither, or on TE when the
++// mod's word cannot be made.
++struct Swap
++{
++  std::uint32_t at = 0, original = 0, patched = 0;
++};
++std::uint32_t RawWord(std::uint32_t address);
++// The site's address and the game's original only (the word there may be the mod's already).
++bool Resolve(std::uint32_t us_address, std::uint32_t us_original, Swap* out)
++{
++  const std::uint32_t at = At(us_address);
++  if (at == 0)
++    return false;
++  std::uint32_t original = us_original;
++  if (CurrentGame() == Game::TE)
++  {
++    static std::map<std::uint32_t, std::uint32_t> originals;  // TE's, by US address
++    const auto it = originals.find(us_address);
++    const std::uint32_t word = RawWord(at);
++    if (it != originals.end())
++      original = it->second;
++    else if (SameInstruction(us_original, word))
++      original = originals[us_address] = word;
++    else
++      return false;
++  }
++  out->at = at;
++  out->original = original;
++  out->patched = original;
++  return true;
++}
++// Tournament Edition's racers are at 0x80532D80: an "addi rD, rA, 0x2D80" (rA from lis 0x8053) given a seat's
++// offset goes past 0x7FFF from seat 5 on (0x2D80 + 5 x 0x1080 = 0x8000), where addi takes it as negative (the
++// US table's low half, 0x9440, never crosses). Such a site branches instead to three words of its own in free
++// low memory (0x80002010-0x80002A00: zero through TE's races, measured on 2026-11-26): addis rD, rA, 1;
++// addi rD, rD, the low half; b back.
++void PutCode(std::uint32_t at, std::uint32_t word);
++std::uint32_t FarAddi(std::uint32_t at, std::uint32_t word)
++{
++  static std::map<std::uint32_t, std::uint32_t> caves;  // site -> its cave
++  constexpr std::uint32_t kFirst = 0x80002010u, kEnd = 0x80002A00u;
++  auto it = caves.find(at);
++  if (it == caves.end())
++  {
++    const std::uint32_t cave = kFirst + 12u * static_cast<std::uint32_t>(caves.size());
++    if (cave + 12u > kEnd)
++      return 0;
++    it = caves.emplace(at, cave).first;
++  }
++  const std::uint32_t cave = it->second;
++  const std::uint32_t rd = (word >> 21) & 31u, ra = (word >> 16) & 31u, lo = word & 0xFFFFu;
++  PutCode(cave, 0x3C000000u | rd << 21 | ra << 16 | 1u);  // addis rD, rA, 1
++  // addi rD, rD, lo (addic for r0: addi reads rA = r0 as 0)
++  PutCode(cave + 4, (rd == 0 ? 0x30000000u : 0x38000000u) | rd << 21 | rd << 16 | lo);
++  PutCode(cave + 8, 0x48000000u | ((at + 4u - (cave + 8u)) & 0x03FFFFFCu));  // b back
++  return 0x48000000u | ((cave - at) & 0x03FFFFFCu);                           // b cave
++}
++// The mod's word for that site (srnp_game.hpp, InGame): 0 if it cannot be made.
++std::uint32_t Made(std::uint32_t us_address, std::uint32_t us_original, std::uint32_t us_word, const Swap& site)
+ {
++  const std::uint32_t word = InGame(us_address, us_word, us_original, site.original);
++  if (CurrentGame() == Game::TE && word != 0 && (word >> 26) == 14u && (site.original >> 26) == 14u &&
++      (word & 0xFFFF0000u) == (site.original & 0xFFFF0000u) && (site.original & 0xFFFFu) < 0x8000u &&
++      (word & 0xFFFFu) >= 0x8000u)
++    return FarAddi(site.at, word);
++  return word;
++}
++bool SwapIn(std::uint32_t us_address, std::uint32_t us_original, std::uint32_t us_patched, Swap* out)
++{
++  if (!Resolve(us_address, us_original, out))
++    return false;
++  out->patched = Made(us_address, us_original, us_patched, *out);
++  if (out->patched == 0)
++    return false;
++  const std::uint32_t word = RawWord(out->at);
++  return word == out->original || word == out->patched;
++}
++
++// The game's memory at an address the game holds (a pointer read from its RAM).
++std::uint8_t* GuestRaw(std::uint32_t address, std::uint32_t size)
++{
++  if (address == 0)
++    return nullptr;
+   return Core::System::GetInstance().GetMemory().GetPointerForRange(address, size);
+ }
++// The game's memory at a Sonic Riders US address of this file, in the game that runs (srnp_game.hpp).
++std::uint8_t* Guest(std::uint32_t address, std::uint32_t size)
++{
++  return GuestRaw(At(address), size);
++}
+ std::uint32_t Get32(const std::uint8_t* p)
+ {
+   return (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) | (std::uint32_t{p[2]} << 8) | p[3];
+@@ -63,6 +167,20 @@ std::uint32_t Read32(std::uint32_t address)
+   const std::uint8_t* p = Guest(address, 4);
+   return p ? Get32(p) : 0;
+ }
++std::uint32_t RawWord(std::uint32_t address)
++{
++  const std::uint8_t* p = GuestRaw(address, 4);
++  return p ? Get32(p) : 0;
++}
++// Writes a word of code at an address of the game that runs, and tells the CPU cores.
++void PutCode(std::uint32_t at, std::uint32_t word)
++{
++  if (std::uint8_t* p = GuestRaw(at, 4))
++  {
++    Put32(p, word);
++    Core::System::GetInstance().GetJitInterface().InvalidateICache(at, 4, true);
++  }
++}
+ 
+ // A PADStatus after PADClamp: buttons (PAD_BUTTON_*), stick, substick, triggers.
+ struct PadStatus
+@@ -235,26 +353,26 @@ void PatchIndexReads(int seat)
+     const IndexRead& read = kIndexReads[i];
+     if (read.game_logic && logic_off)
+       continue;
+-    std::uint8_t* p = Guest(read.address, 4);
++    // The caves are in low memory, at the same place in both games (srnp_game_te.inc).
+     const std::uint32_t cave = kIndexCaves + static_cast<std::uint32_t>(i) * 12u;
+     std::uint8_t* c = Guest(cave, 12);
+     const std::uint32_t call = 0x48000001u | ((cave - read.address) & 0x03FFFFFCu);  // bl cave
+-    if (!p || !c || (Get32(p) != read.original && Get32(p) != call))
++    Swap w;
++    if (!c || !SwapIn(read.address, read.original, call, &w))
+     {
+-      std::fprintf(stderr, "[srnp racers] index read 0x%08X holds %08X: left alone\n", read.address,
+-                   p ? Get32(p) : 0u);
++      std::fprintf(stderr, "[srnp racers] index read 0x%08X holds %08X (%s): left alone\n", w.at,
++                   RawWord(At(read.address)), GameName());
+       continue;
+     }
+-    const std::uint32_t rd = (read.original >> 21) & 31u;
+-    Put32(c, read.original);
++    const std::uint32_t rd = (w.original >> 21) & 31u;
++    Put32(c, w.original);
+     // addi rD, rD, -seat; for r0, addic (addi takes rA = r0 as 0; the carry it sets is not read after
+     // these reads)
+     Put32(c + 4, (rd == 0 ? 0x30000000u : 0x38000000u) | rd << 21 | rd << 16 |
+                      ((0u - static_cast<std::uint32_t>(seat)) & 0xFFFFu));
+     Put32(c + 8, 0x4E800020u);                                              // blr
+-    jit.InvalidateICache(cave, 12, true);
+-    Put32(p, seat ? call : read.original);  // seat 0: the game's own lbz
+-    jit.InvalidateICache(read.address, 4, true);
++    jit.InvalidateICache(At(cave), 12, true);
++    PutCode(w.at, seat ? w.patched : w.original);  // seat 0: the game's own lbz
+   }
+ }
+ 
+@@ -278,26 +396,25 @@ void PatchHud(int seat)
+       0x281F0000u | static_cast<std::uint32_t>(seat),
+   };
+   static_assert(std::size(kHudCode) == std::size(patched));
+-  if (s_hud_seat == 0)  // the game's code must be there (same game, same version)
++  // The game's code must be there (same game, same version); on TE the racers' low half is TE's (InGame).
++  // (Checked only from the game's words: going back to seat 0, the words are another seat's.)
++  Swap words[std::size(kHudCode)];
++  for (std::size_t i = 0; i < std::size(kHudCode); ++i)
+   {
+-    for (const CodeWord& word : kHudCode)
++    const bool ok = Resolve(kHudCode[i].address, kHudCode[i].original, &words[i]);
++    if (ok)
++      words[i].patched = Made(kHudCode[i].address, kHudCode[i].original, patched[i], words[i]);
++    if (!ok || words[i].patched == 0 || (s_hud_seat == 0 && RawWord(words[i].at) != words[i].original))
+     {
+-      if (Read32(word.address) != word.original)
+-      {
+-        std::fprintf(stderr, "[srnp racers] HUD: 0x%08X holds %08X, not %08X: left alone\n",
+-                     word.address, Read32(word.address), word.original);
+-        return;
+-      }
++      std::fprintf(stderr, "[srnp racers] HUD: 0x%08X holds %08X, not the game's (%s): left alone\n",
++                   words[i].at, RawWord(At(kHudCode[i].address)), GameName());
++      return;
+     }
+   }
+   auto& jit = Core::System::GetInstance().GetJitInterface();
+   PatchIndexReads(seat);
+-  for (std::size_t i = 0; i < std::size(kHudCode); ++i)
+-  {
+-    if (std::uint8_t* p = Guest(kHudCode[i].address, 4))
+-      Put32(p, patched[i]);  // seat 0: the game's own words
+-    jit.InvalidateICache(kHudCode[i].address, 4, true);
+-  }
++  for (const Swap& w : words)
++    PutCode(w.at, w.patched);  // seat 0: the game's own words
+   // The 1P labels also leave out racer 0 at the head of their loop: 0x8042F5B4 cntlzw r0, r31, then
+   // srwi r8, r0, 5 = "racer 0", whose label is skipped unless [0x806129A0] is 400 or 500. Gibax: the
+   // other machines must show "1P" over racer 0 as they do "2P" over racer 1. It becomes "the seat's
+@@ -307,20 +424,19 @@ void PatchHud(int seat)
+     constexpr std::uint32_t kSkipSite = 0x8042F5B4, kSkipOriginal = 0x7FE00034;  // cntlzw r0, r31
+     constexpr std::uint32_t kSkipCave = kIndexCaves + 5u * 12u;                   // 0x80002DBC
+     const std::uint32_t call = 0x48000001u | ((kSkipCave - kSkipSite) & 0x03FFFFFCu);
+-    std::uint8_t* p = Guest(kSkipSite, 4);
+     std::uint8_t* c = Guest(kSkipCave, 12);
+-    if (p && c && (Get32(p) == kSkipOriginal || Get32(p) == call))
++    Swap w;
++    if (c && SwapIn(kSkipSite, kSkipOriginal, call, &w))
+     {
+       Put32(c, 0x6BE00000u | static_cast<std::uint32_t>(seat));  // xori r0, r31, seat
+       Put32(c + 4, 0x7C000034u);                                  // cntlzw r0, r0
+       Put32(c + 8, 0x4E800020u);                                  // blr
+-      jit.InvalidateICache(kSkipCave, 12, true);
+-      Put32(p, seat ? call : kSkipOriginal);
+-      jit.InvalidateICache(kSkipSite, 4, true);
++      jit.InvalidateICache(At(kSkipCave), 12, true);
++      PutCode(w.at, seat ? w.patched : w.original);
+     }
+     else
+-      std::fprintf(stderr, "[srnp racers] labels: 0x%08X holds %08X: racer 0's label left alone\n",
+-                   kSkipSite, p ? Get32(p) : 0u);
++      std::fprintf(stderr, "[srnp racers] labels: 0x%08X holds %08X (%s): racer 0's label left alone\n",
++                   w.at, RawWord(At(kSkipSite)), GameName());
+   }
+   s_hud_seat = seat;
+   std::fprintf(stderr, "[srnp racers] HUD shows racer %d\n", seat);
+@@ -330,6 +446,7 @@ void PatchHud(int seat)
+ struct Choice
+ {
+   int character = -1, gear = -1;
++  int model = -1;  // +0xBF when it is not the character's (tests: "c/g/m" in SRNP_PERSOS)
+ };
+ std::array<Choice, 8>& Lobby()
+ {
+@@ -342,6 +459,8 @@ std::array<Choice, 8>& Lobby()
+       out[k].character = static_cast<int>(std::strtol(v, &end, 0));
+       if (*end == '/')
+         out[k].gear = static_cast<int>(std::strtol(end + 1, &end, 0));
++      if (*end == '/')
++        out[k].model = static_cast<int>(std::strtol(end + 1, &end, 0));
+       v = *end == ',' ? end + 1 : end;
+     }
+     return out;
+@@ -360,13 +479,26 @@ bool s_setting_up = false;
+ std::uint64_t s_race_start = 0;
+ 
+ // The gear table (REL data, 41 records of 0x1D0 bytes): +0x0, the characters that may ride it.
++// Tournament Edition (2026-11-26): the same records at 0x803F7178, 44 of them, most open to every character.
+ constexpr std::uint32_t kGearTable = 0x805E5F40;
+-constexpr int kGears = 41;
++int Gears()
++{
++  return CurrentGame() == Game::TE ? 44 : 41;
++}
++std::uint32_t GearWord(int gear)
++{
++  return RawWord(At(kGearTable) + static_cast<std::uint32_t>(gear) * 0x1D0u);
++}
+ bool GearAllows(int gear, int character)
+ {
+-  if (gear < 0 || gear >= kGears)
++  if (gear < 0 || gear >= Gears() || character < 0 || character >= 32)
+     return false;
+-  return (Read32(kGearTable + static_cast<std::uint32_t>(gear) * 0x1D0u) >> character) & 1u;
++  // Tournament Edition's Chaos Emerald (18): its table names Sonic, Tails, Knuckles, Shadow and Metal Sonic,
++  // whose super forms its menu sets up; written by the runner, Sonic on it hangs the race's loading, and
++  // Super Sonic (11) rides it as in the US game (measured on 2026-11-26).
++  if (CurrentGame() == Game::TE && gear == 18)
++    return character == 11;
++  return (GearWord(gear) >> character) & 1u;
+ }
+ 
+ // SRNP_TOUS_CPU=1 (tests: the AI drives every racer, the menu's players' too): the players' racers
+@@ -405,21 +537,30 @@ int NbRacers()
+ // Entry's) and the start of the race, at every present: the lobby's characters and gears, the
+ // racer count, and the racers as CPUs. Measured on 2026-11-25: written at the present after the
+ // menu's, they are what the race loads (racer 1 stays Sonic; 8 CPUs: same grid, a whole race).
++// Tournament Edition (measured on 2026-11-26 from its "Are you ready?", Free Race on Metal City): the racer
++// count stays 1 (its Free Race runs the player alone by default) while the menu writes the racers (racer
++// 1's +0xBA leaves 0xFF, a CPU's character, 4 frames before the race's scene, 0x8021C1C0, becomes 4): the
++// setup starts there, and the count is ours (the host's, else 8).
++std::uint8_t s_last_racer1 = 0xFF;
+ void SetUpRace(std::uint8_t* racers)
+ {
++  const bool te = CurrentGame() == Game::TE;
+   const std::uint32_t count = Read32(kRacerCount);
+-  if (count != 1 && s_last_count == 1 && (HasLobby() || NbRacers()))
++  const std::uint8_t racer1 = racers[kRacerSize + 0xBA];
++  const bool menu_done = te ? racer1 != 0xFF && s_last_racer1 == 0xFF : count != 1 && s_last_count == 1;
++  if (menu_done && (HasLobby() || NbRacers()))
+   {
+     s_setting_up = true;
+     std::fprintf(stderr, "[srnp racers] race being set up: lobby characters, %d racers, all CPUs\n",
+-                 NbRacers() ? NbRacers() : static_cast<int>(count));
++                 NbRacers() ? NbRacers() : te ? 8 : static_cast<int>(count));
+   }
+   s_last_count = count;
+-  if (!s_setting_up || racers[kRacerSize + 0xBA] == 0xFF)
++  s_last_racer1 = racer1;
++  if (!s_setting_up || racer1 == 0xFF)
+     return;
+-  if (NbRacers())
++  if (NbRacers() || te)
+     if (std::uint8_t* p = Guest(kRacerCount, 4))
+-      Put32(p, static_cast<std::uint32_t>(NbRacers()));
++      Put32(p, static_cast<std::uint32_t>(NbRacers() ? NbRacers() : 8));
+   static bool told[8] = {};
+   for (std::size_t k = 0; k < 8; ++k)
+   {
+@@ -427,15 +568,28 @@ void SetUpRace(std::uint8_t* racers)
+     const Choice& c = Lobby()[k];
+     if (c.character >= 0)
+       racer[0xBA] = racer[0xBF] = static_cast<std::uint8_t>(c.character);
++    else if (racer[0xBA] == 0xFF)  // a racer the menu left empty (TE: all but the CPUs it set up)
++    {
++      static constexpr std::uint8_t kSpare[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14};
++      racer[0xBA] = racer[0xBF] = kSpare[k % std::size(kSpare)];
++      racer[0xBB] = 0;
++    }
++    if (c.model >= 0)
++      racer[0xBF] = static_cast<std::uint8_t>(c.model);
+     if (c.gear >= 0)
+       racer[0xBB] = static_cast<std::uint8_t>(c.gear);
+     // A gear the character may not ride hangs the loading (2026-11-25: character 7 or 10 on gear
+     // 0): the gear table says who may ride each gear; else the first gear the character may ride.
+     const int character = racer[0xBA], gear = racer[0xBB];
+-    if (character < 32 && !GearAllows(gear, character))
++    // SRNP_PLANCHE_LIBRE=1 (tests): the gear as asked, whatever the table says.
++    static const bool free_gear = [] {
++      const char* v = std::getenv("SRNP_PLANCHE_LIBRE");
++      return v && *v == '1';
++    }();
++    if (character < 32 && !free_gear && !GearAllows(gear, character))
+     {
+       int fallback = -1;
+-      for (int g = 0; g < kGears && fallback < 0; ++g)
++      for (int g = 0; g < Gears() && fallback < 0; ++g)
+         if (GearAllows(g, character))
+           fallback = g;
+       if (!told[k])
+@@ -537,7 +691,7 @@ void OfflineRacersFrame()
+     }
+     const int character = racer[0xBA], gear = racer[0xBB];
+     if (character < 32 && !GearAllows(gear, character))
+-      for (int g = 0; g < kGears; ++g)
++      for (int g = 0; g < Gears(); ++g)
+         if (GearAllows(g, character))
+         {
+           racer[0xBB] = static_cast<std::uint8_t>(g);
+@@ -549,7 +703,7 @@ void OfflineRacersFrame()
+ 
+ int GearCount()
+ {
+-  return kGears;
++  return Gears();
+ }
+ 
+ bool GearAllowed(int gear, int character)
+@@ -557,11 +711,10 @@ bool GearAllowed(int gear, int character)
+   // Once, in the log: who may ride each gear as the game's table says (one bit a character).
+   static const bool logged = [] {
+     std::string line;
+-    for (int g = 0; g < kGears; ++g)
++    for (int g = 0; g < Gears(); ++g)
+     {
+-      char text[16];
+-      std::snprintf(text, sizeof(text), " %d:%05X", g,
+-                    Read32(kGearTable + static_cast<std::uint32_t>(g) * 0x1D0u) & 0x1FFFFu);
++      char text[24];
++      std::snprintf(text, sizeof(text), " %d:%06X", g, GearWord(g) & 0xFFFFFFu);
+       line += text;
+     }
+     std::fprintf(stderr, "[srnp racers] gears, who may ride them (bit = character):%s\n", line.c_str());
+@@ -604,21 +757,19 @@ void PatchAnimation(bool on)
+   }();
+   if (off || on == s_anim_patched)
+     return;
+-  std::uint8_t* p = Guest(kAnimSkip.address, 4);
+-  std::uint8_t* q = Guest(kAnimZoneSkip.address, 4);
+-  const std::uint32_t expected = on ? kAnimSkip.original : kAnimKeep;
+-  const std::uint32_t expected_zone = on ? kAnimZoneSkip.original : kAnimZoneKeep;
+-  if (!p || !q || Get32(p) != expected || Get32(q) != expected_zone)
++  // (Tournament Edition 2.4.6.1: the same branches, 0x70 bytes further in the function; 2026-11-26.)
++  Swap skip, zone;
++  if (!SwapIn(kAnimSkip.address, kAnimSkip.original, kAnimKeep, &skip) ||
++      !SwapIn(kAnimZoneSkip.address, kAnimZoneSkip.original, kAnimZoneKeep, &zone) ||
++      RawWord(skip.at) != (on ? skip.original : skip.patched) ||
++      RawWord(zone.at) != (on ? zone.original : zone.patched))
+   {
+-    std::fprintf(stderr, "[srnp racers] animation: 0x%08X holds %08X and 0x%08X %08X, not %08X %08X: left alone\n",
+-                 kAnimSkip.address, Read32(kAnimSkip.address), kAnimZoneSkip.address,
+-                 Read32(kAnimZoneSkip.address), expected, expected_zone);
++    std::fprintf(stderr, "[srnp racers] animation: 0x%08X holds %08X and 0x%08X %08X (%s): left alone\n",
++                 skip.at, RawWord(skip.at), zone.at, RawWord(zone.at), GameName());
+     return;
+   }
+-  Put32(p, on ? kAnimKeep : kAnimSkip.original);
+-  Put32(q, on ? kAnimZoneKeep : kAnimZoneSkip.original);
+-  Core::System::GetInstance().GetJitInterface().InvalidateICache(kAnimSkip.address, 4, true);
+-  Core::System::GetInstance().GetJitInterface().InvalidateICache(kAnimZoneSkip.address, 4, true);
++  PutCode(skip.at, on ? skip.patched : skip.original);
++  PutCode(zone.at, on ? zone.patched : zone.original);
+   s_anim_patched = on;
+   std::fprintf(stderr, "[srnp racers] animations of racers out of sight: %s\n",
+                on ? "moved on (every machine alike)" : "the game's");
+@@ -649,23 +800,19 @@ void PatchZones(bool on)
+   }();
+   if (off || on == s_zones_patched)
+     return;
++  Swap words[std::size(kZoneWords)];
+   for (std::size_t i = 0; i < std::size(kZoneWords); ++i)
+   {
+-    const std::uint32_t expected = on ? kZoneWords[i].original : kZonePatched[i];
+-    if (Read32(kZoneWords[i].address) != expected)
++    const bool ok = SwapIn(kZoneWords[i].address, kZoneWords[i].original, kZonePatched[i], &words[i]);
++    if (!ok || RawWord(words[i].at) != (on ? words[i].original : words[i].patched))
+     {
+-      std::fprintf(stderr, "[srnp racers] zones: 0x%08X holds %08X, not %08X: left alone\n",
+-                   kZoneWords[i].address, Read32(kZoneWords[i].address), expected);
++      std::fprintf(stderr, "[srnp racers] zones: 0x%08X holds %08X (%s): left alone\n", words[i].at,
++                   RawWord(words[i].at), GameName());
+       return;
+     }
+   }
+-  auto& jit = Core::System::GetInstance().GetJitInterface();
+-  for (std::size_t i = 0; i < std::size(kZoneWords); ++i)
+-  {
+-    if (std::uint8_t* p = Guest(kZoneWords[i].address, 4))
+-      Put32(p, on ? kZonePatched[i] : kZoneWords[i].original);
+-  }
+-  jit.InvalidateICache(kZoneWords[0].address, 0x10, true);
++  for (const Swap& w : words)
++    PutCode(w.at, on ? w.patched : w.original);
+   s_zones_patched = on;
+   std::fprintf(stderr, "[srnp racers] scenery zones: %s\n",
+                on ? "camera 0's, from racer 0's path only" : "the game's");
+@@ -755,6 +902,8 @@ void WriteCameraSlots(std::uint8_t* racers)
+ // seat < 0: the game's reads back.
+ void PatchCameras(std::uint8_t* racers, int seat, int seat2)
+ {
++  // (Tournament Edition: the same reads; 16 of them, in three functions TE changed, found by hand:
++  // srnp_game_te.inc.)
+   static const bool off = [] {
+     const char* v = std::getenv("SRNP_CAMERAS");
+     return v && *v == '0';
+@@ -777,13 +926,8 @@ void PatchCameras(std::uint8_t* racers, int seat, int seat2)
+   s_camera_of = of;
+   s_cameras_patched = on;
+   WriteCameraSlots(racers);  // before the code reads them
+-  auto& jit = Core::System::GetInstance().GetJitInterface();
+   for (const std::uint32_t address : kCameraIndexReads)
+-  {
+-    if (std::uint8_t* p = Guest(address, 4))
+-      Put32(p, (Get32(p) & 0xFFFF0000u) | to);
+-    jit.InvalidateICache(address, 4, true);
+-  }
++    PutCode(At(address), (Read32(address) & 0xFFFF0000u) | to);
+   if (on)
+     std::fprintf(stderr, "[srnp racers] cameras: racer events to cameras %u %u %u %u %u %u %u %u\n", of[0],
+                  of[1], of[2], of[3], of[4], of[5], of[6], of[7]);
+@@ -801,6 +945,9 @@ struct SeatDisplay
+   CodeWord words[4];
+   std::size_t count;
+   std::uint32_t (*patched)(std::size_t i, int seat);
++  // Bit i: word i holds an address of its own, made for the game that runs (else made from the US word by
++  // Made: TE's immediates).
++  std::uint32_t game_words = 0;
+   bool on = false;
+   std::uint32_t written[4] = {};
+ };
+@@ -874,12 +1021,19 @@ SeatDisplay s_racers_drawn{
+       const std::uint32_t s = static_cast<std::uint32_t>(seat);
+       switch (i)
+       {
+-      case 0: return 0x28100000u | s;
++      // Tournament Edition: racer 0 stays drawn always (left out, on the machine of a seat far behind it,
++      // TE's scene went from 4 to 3 for ~28 frames, and our runner took the race for over: measured on
++      // 2026-11-26, seat 7 only); the seat's racer is drawn anyway, its own zone being the reference.
++      case 0: return 0x28100000u | (CurrentGame() == Game::TE ? 0u : s);
+       case 1: return 0x38A32BD8u + 4u * s;
+-      case 2: return 0x3C608061u;  // lis r3, 0x8061
+-      default: return 0x80630000u | ((0xBA8u - 0x6BC0u + s * 0x1080u) & 0xFFFFu);
+       }
+-    }};
++      // The seat's racer's +0xBA8, in the game that runs: lis r3, its high half; lwz r3, its low half(r3).
++      const std::uint32_t flags = At(kRacers) + 0xBA8u + s * kRacerSize;
++      if (i == 2)
++        return 0x3C600000u | (((flags + 0x8000u) >> 16) & 0xFFFFu);
++      return 0x80630000u | (flags & 0xFFFFu);
++    },
++    0b1100u};
+ 
+ // Three more displays the game starts for its players only (index under the player count), found by
+ // their task creations after such a test (2026-11-25; Gibax: Sonic's route icon and stick prompt on
+@@ -1055,22 +1209,25 @@ void PatchObjectZones(int seat)
+     return;
+   const int from = s_object_zones_on ? s_object_zones_seat : 0;
+   const int to = on ? seat : 0;
+-  for (const ZoneSite& z : kObjectZoneSites)
++  // (Tournament Edition: the same sites, TE's low halves: Made.)
++  static std::vector<std::uint32_t> to_words;
++  to_words.assign(std::size(kObjectZoneSites), 0);
++  for (std::size_t i = 0; i < std::size(kObjectZoneSites); ++i)
+   {
+-    if (Read32(z.address) != ZoneSiteWord(z, from))
++    const ZoneSite& z = kObjectZoneSites[i];
++    Swap site;
++    const bool ok = Resolve(z.address, z.original, &site);
++    const std::uint32_t expected = ok ? Made(z.address, z.original, ZoneSiteWord(z, from), site) : 0;
++    to_words[i] = ok ? Made(z.address, z.original, ZoneSiteWord(z, to), site) : 0;
++    if (!ok || RawWord(site.at) != expected || to_words[i] == 0)
+     {
+-      std::fprintf(stderr, "[srnp racers] objects: 0x%08X holds %08X, not %08X: left alone\n", z.address,
+-                   Read32(z.address), ZoneSiteWord(z, from));
++      std::fprintf(stderr, "[srnp racers] objects: 0x%08X holds %08X, not %08X (%s): left alone\n", site.at,
++                   RawWord(At(z.address)), expected, GameName());
+       return;
+     }
+   }
+-  auto& jit = Core::System::GetInstance().GetJitInterface();
+-  for (const ZoneSite& z : kObjectZoneSites)
+-  {
+-    if (std::uint8_t* p = Guest(z.address, 4))
+-      Put32(p, ZoneSiteWord(z, to));
+-    jit.InvalidateICache(z.address, 4, true);
+-  }
++  for (std::size_t i = 0; i < std::size(kObjectZoneSites); ++i)
++    PutCode(At(kObjectZoneSites[i].address), to_words[i]);
+   s_object_zones_on = on;
+   s_object_zones_seat = to;
+   std::fprintf(stderr, "[srnp racers] objects: %zu sites drawn for racer %d's zone\n",
+@@ -1083,6 +1240,7 @@ void PatchObjectZones(int seat)
+ // any racer that retires (0x805A7AAC, the racer's index in r29), so every machine darkened. Here the call
+ // goes to a cave that makes it only for this machine's seat, and otherwise sets r4 and r5 as the skipped
+ // words would have (0x805A7AC8, 0x805A7ACC) and goes on at 0x805A7AF4. The task only draws.
++bool FigureOff(const char* name);
+ constexpr std::uint32_t kRetireCave = 0x80002A00;  // free low memory (0x80001810-0x80002B00)
+ constexpr CodeWord kRetireCall = {0x805A7AAC, 0x4BB3AC79};  // bl 0x800E2724 (makes the task)
+ bool s_retire_patched = false;
+@@ -1093,24 +1251,40 @@ void PatchRetireDisplay(int seat)
+     const char* v = std::getenv("SRNP_FIGURES");
+     return v && *v == '0';
+   }();
+-  const bool on = !off && seat >= 0 && seat < 8;
++  const bool on = !off && seat >= 0 && seat < 8 && !FigureOff("retire");
+   if (on == s_retire_patched)
+     return;
+   const auto b = [](std::uint32_t from, std::uint32_t to, bool link) {
+     return (link ? 0x48000001u : 0x48000000u) | ((to - from) & 0x03FFFFFCu);
+   };
++  // In the game that runs (Tournament Edition: its own lis r4/r5, 0x8054 and 0x8043; the same steps).
++  const std::uint32_t past = At(0x805A7AF4), task = At(0x800E2724), back = At(0x805A7AB0);
++  Swap call;
++  if (!past || !task || !back || !Resolve(kRetireCall.address, kRetireCall.original, &call))
++  {
++    std::fprintf(stderr, "[srnp racers] retire display: not found (%s): left alone\n", GameName());
++    return;
++  }
++  const std::uint32_t lis_r4 = Read32(0x805A7AC8), lis_r5 = Read32(0x805A7ACC);
++  if ((lis_r4 & 0xFFFF0000u) != 0x3C800000u || (lis_r5 & 0xFFFF0000u) != 0x3CA00000u)
++  {
++    std::fprintf(stderr, "[srnp racers] retire display: %08X %08X are not lis r4, lis r5: left alone\n", lis_r4,
++                 lis_r5);
++    return;
++  }
+   const std::uint32_t cave[] = {
+       0x281D0000u | static_cast<std::uint32_t>(std::max(seat, 0)),  // cmplwi r29, seat
+       0x41820010u,                                                  // beq +0x10 (make it)
+-      0x3C808061u, 0x3CA08022u,                                     // lis r4, 0x8061; lis r5, 0x8022
+-      b(kRetireCave + 0x10, 0x805A7AF4, false),                     // b past the task's setup
+-      b(kRetireCave + 0x14, 0x800E2724, true),                      // bl 0x800E2724 (the task)
+-      b(kRetireCave + 0x18, 0x805A7AB0, false)};                    // b back
+-  const std::uint32_t expected = on ? kRetireCall.original : b(kRetireCall.address, kRetireCave, false);
+-  if (Read32(kRetireCall.address) != expected)
++      lis_r4, lis_r5,                                               // lis r4, 0x8061; lis r5, 0x8022 (US)
++      b(kRetireCave + 0x10, past, false),                           // b past the task's setup
++      b(kRetireCave + 0x14, task, true),                            // bl 0x800E2724 (the task)
++      b(kRetireCave + 0x18, back, false)};                          // b back
++  const std::uint32_t to_cave = b(call.at, kRetireCave, false);
++  const std::uint32_t expected = on ? call.original : to_cave;
++  if (RawWord(call.at) != expected)
+   {
+-    std::fprintf(stderr, "[srnp racers] retire display: 0x%08X holds %08X, not %08X: left alone\n",
+-                 kRetireCall.address, Read32(kRetireCall.address), expected);
++    std::fprintf(stderr, "[srnp racers] retire display: 0x%08X holds %08X, not %08X: left alone\n", call.at,
++                 RawWord(call.at), expected);
+     return;
+   }
+   auto& jit = Core::System::GetInstance().GetJitInterface();
+@@ -1129,11 +1303,9 @@ void PatchRetireDisplay(int seat)
+     for (std::size_t i = 0; i < std::size(cave); ++i)
+       if (std::uint8_t* p = Guest(kRetireCave + 4 * static_cast<std::uint32_t>(i), 4))
+         Put32(p, cave[i]);
+-    jit.InvalidateICache(kRetireCave, static_cast<std::uint32_t>(4 * std::size(cave)), true);
++    jit.InvalidateICache(At(kRetireCave), static_cast<std::uint32_t>(4 * std::size(cave)), true);
+   }
+-  if (std::uint8_t* p = Guest(kRetireCall.address, 4))
+-    Put32(p, on ? b(kRetireCall.address, kRetireCave, false) : kRetireCall.original);
+-  jit.InvalidateICache(kRetireCall.address, 4, true);
++  PutCode(call.at, on ? to_cave : call.original);
+   s_retire_patched = on;
+   if (on)
+     std::fprintf(stderr, "[srnp racers] retire display: for racer %d only (this machine's seat)\n", seat);
+@@ -1141,32 +1313,59 @@ void PatchRetireDisplay(int seat)
+     std::fprintf(stderr, "[srnp racers] retire display: the game's\n");
+ }
+ 
++// SRNP_FIGURES_SAUF=<name>,<name>... (tests): those of the seat's displays left to the game (a display's
++// name starts with one of them: "item", "tricks", "level", "racers", "player", "HUD player", "HUD task",
++// "HUD fade", "speed", "retire", "intro", "finish").
++bool FigureOff(const char* name)
++{
++  static const std::string list = [] {
++    const char* v = std::getenv("SRNP_FIGURES_SAUF");
++    return std::string(v ? v : "");
++  }();
++  for (std::size_t from = 0; from < list.size();)
++  {
++    const std::size_t comma = list.find(',', from);
++    const std::string item = list.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
++    if (!item.empty() && std::string_view(name).substr(0, item.size()) == item)
++      return true;
++    if (comma == std::string::npos)
++      break;
++    from = comma + 1;
++  }
++  return false;
++}
++
+ void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+     const char* v = std::getenv("SRNP_FIGURES");
+     return v && *v == '0';
+   }();
+-  const bool on = seat >= 0 && seat < 8;
++  const bool on = seat >= 0 && seat < 8 && !FigureOff(d.name);
+   if (off || on == d.on)
+     return;
++  Swap sites[4];
++  std::uint32_t made[4] = {};
+   for (std::size_t i = 0; i < d.count; ++i)
+   {
+-    const std::uint32_t expected = on ? d.words[i].original : d.written[i];
+-    if (Read32(d.words[i].address) != expected)
++    const bool ok = Resolve(d.words[i].address, d.words[i].original, &sites[i]);
++    if (ok && on)
++    {
++      const std::uint32_t us_word = d.patched(i, seat);
++      made[i] = (d.game_words >> i) & 1u ? us_word : Made(d.words[i].address, d.words[i].original, us_word, sites[i]);
++    }
++    const std::uint32_t expected = on ? sites[i].original : d.written[i];
++    if (!ok || RawWord(sites[i].at) != expected || (on && made[i] == 0))
+     {
+-      std::fprintf(stderr, "[srnp racers] %s: 0x%08X holds %08X, not %08X: left alone\n", d.name,
+-                   d.words[i].address, Read32(d.words[i].address), expected);
++      std::fprintf(stderr, "[srnp racers] %s: 0x%08X holds %08X, not %08X (%s): left alone\n", d.name,
++                   sites[i].at, RawWord(At(d.words[i].address)), expected, GameName());
+       return;
+     }
+   }
+-  auto& jit = Core::System::GetInstance().GetJitInterface();
+   for (std::size_t i = 0; i < d.count; ++i)
+   {
+-    d.written[i] = on ? d.patched(i, seat) : d.written[i];
+-    if (std::uint8_t* p = Guest(d.words[i].address, 4))
+-      Put32(p, on ? d.written[i] : d.words[i].original);
+-    jit.InvalidateICache(d.words[i].address, 4, true);
++    d.written[i] = on ? made[i] : d.written[i];
++    PutCode(sites[i].at, on ? d.written[i] : sites[i].original);
+   }
+   d.on = on;
+   if (on)
+@@ -1218,36 +1417,54 @@ void PatchIntro(int seat, int seats)
+     const char* v = std::getenv("SRNP_FIGURES");
+     return v && *v == '0';
+   }();
+-  const bool on = !off && seat >= 0 && seat < 8 && seats >= 1 && seats <= 8;
++  const bool on = !off && seat >= 0 && seat < 8 && seats >= 1 && seats <= 8 && !FigureOff("intro");
+   if (on == s_intro_patched)
+     return;
+   const auto bl = [](std::uint32_t from, std::uint32_t to) {
+     return 0x48000001u | ((to - from) & 0x03FFFFFCu);
+   };
++  // The cave's addresses in the game that runs (Tournament Edition: srnp_game.hpp).
++  const std::uint32_t racer0 = At(kRacers), pose = At(0x804B2430), anim = At(0x804B2404), after = At(0x804B2388),
++                      speed = At(0x805BFC0C);  // a float the pose's animation is given
++  if (!racer0 || !pose || !anim || !after || !speed)
++  {
++    std::fprintf(stderr, "[srnp racers] intro: not found (%s): left alone\n", GameName());
++    return;
++  }
++  const auto hi = [](std::uint32_t a) { return ((a + 0x8000u) >> 16) & 0xFFFFu; };
++  const auto lo = [](std::uint32_t a) { return a & 0xFFFFu; };
+   const std::uint32_t loop = kIntroCave + 8 * 4;
+   const std::uint32_t cave[] = {
+       0x9421FFE0, 0x7C0802A6, 0x90010024, 0x93E1001C,  // stwu r1,-32(r1); mflr r0; stw r0,36(r1); stw r31
+-      0x93C10018, 0x3FE08061, 0x3BFF9440,              // stw r30; r31 = racer 0 (0x80609440)
++      0x93C10018, 0x3FE00000u | hi(racer0), 0x3BFF0000u | lo(racer0),  // stw r30; r31 = racer 0 (0x80609440)
+       0x3BC00000u | static_cast<std::uint32_t>(seats),  // li r30, seats
+-      0x7FE3FB78, bl(loop + 4, 0x804B2430),            // loop: mr r3, r31; bl 0x804B2430
+-      0x3C60805C, 0xC023FC0C, 0x7FE3FB78,              // lfs f1, [0x805BFC0C]; mr r3, r31
++      0x7FE3FB78, bl(loop + 4, pose),                  // loop: mr r3, r31; bl 0x804B2430
++      0x3C600000u | hi(speed), 0xC0230000u | lo(speed), 0x7FE3FB78,  // lfs f1, [0x805BFC0C]; mr r3, r31
+       0x38800056, 0x38A0000C, 0xFC400890,              // li r4, 86; li r5, 12; fmr f2, f1
+-      bl(loop + 32, 0x804B2404),                       // bl 0x804B2404 (the pose's animation)
+-      0x7FE3FB78, bl(loop + 40, 0x804B2388),           // mr r3, r31; bl 0x804B2388
++      bl(loop + 32, anim),                             // bl 0x804B2404 (the pose's animation)
++      0x7FE3FB78, bl(loop + 40, after),                // mr r3, r31; bl 0x804B2388
+       0x3BFF1080, 0x37DEFFFF, 0x4082FFCC,              // next racer; addic. r30, r30, -1; bne loop
+       0x83C10018, 0x83E1001C, 0x80010024, 0x7C0803A6,  // restore r30, r31, lr
+       0x38210020, 0x4E800020,                          // addi r1, r1, 32; blr
+   };
+-  const std::uint32_t patched[] = {bl(kIntroWords[0].address, kIntroCave), 0x48000030u,
+-                                   0x38A40000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(
+-                                                                         std::max(seat, 0))) & 0xFFFFu)};
++  Swap sites[std::size(kIntroWords)];
++  std::uint32_t patched[std::size(kIntroWords)] = {};
+   for (std::size_t i = 0; i < std::size(kIntroWords); ++i)
+   {
+-    const std::uint32_t expected = on ? kIntroWords[i].original : Read32(kIntroWords[i].address);
+-    if (on && Read32(kIntroWords[i].address) != expected)
++    const bool ok = Resolve(kIntroWords[i].address, kIntroWords[i].original, &sites[i]);
++    if (ok)
+     {
+-      std::fprintf(stderr, "[srnp racers] intro: 0x%08X holds %08X, not %08X: left alone\n",
+-                   kIntroWords[i].address, Read32(kIntroWords[i].address), expected);
++      // bl the cave; b past the three calls (US 0x80434AA8); the seat's racer for the voice (TE's low half).
++      const std::uint32_t us_word =
++          i == 0 ? bl(kIntroWords[0].address, kIntroCave)
++                 : i == 1 ? 0x48000030u
++                          : 0x38A40000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(std::max(seat, 0))) & 0xFFFFu);
++      patched[i] = Made(kIntroWords[i].address, kIntroWords[i].original, us_word, sites[i]);
++    }
++    if (!ok || patched[i] == 0 || (on && RawWord(sites[i].at) != sites[i].original))
++    {
++      std::fprintf(stderr, "[srnp racers] intro: 0x%08X holds %08X (%s): left alone\n", sites[i].at,
++                   RawWord(At(kIntroWords[i].address)), GameName());
+       return;
+     }
+   }
+@@ -1267,14 +1484,10 @@ void PatchIntro(int seat, int seats)
+     for (std::size_t i = 0; i < std::size(cave); ++i)
+       if (std::uint8_t* p = Guest(kIntroCave + 4 * static_cast<std::uint32_t>(i), 4))
+         Put32(p, cave[i]);
+-    jit.InvalidateICache(kIntroCave, static_cast<std::uint32_t>(4 * std::size(cave)), true);
++    jit.InvalidateICache(At(kIntroCave), static_cast<std::uint32_t>(4 * std::size(cave)), true);
+   }
+   for (std::size_t i = 0; i < std::size(kIntroWords); ++i)
+-  {
+-    if (std::uint8_t* p = Guest(kIntroWords[i].address, 4))
+-      Put32(p, on ? patched[i] : kIntroWords[i].original);
+-    jit.InvalidateICache(kIntroWords[i].address, 4, true);
+-  }
++    PutCode(sites[i].at, on ? patched[i] : sites[i].original);
+   s_intro_patched = on;
+   if (on)
+     std::fprintf(stderr, "[srnp racers] intro: the %d seats' racers pose, racer %d's voice\n", seats, seat);
+@@ -1341,7 +1554,7 @@ void PatchFinish(int seat, int seats)
+     const char* v = std::getenv("SRNP_FIGURES");
+     return v && *v == '0';
+   }();
+-  const bool on = !off && seat >= 0 && seat < 8 && seats >= 1 && seats <= 8;
++  const bool on = !off && seat >= 0 && seat < 8 && seats >= 1 && seats <= 8 && !FigureOff("finish");
+   if (std::uint8_t* flag = Guest(kFinishFlag, 1))
+     *flag = 0;
+   s_all_crossed = 0;
+@@ -1355,28 +1568,40 @@ void PatchFinish(int seat, int seats)
+   // r0 = r7 + (flag ? 0 : 1): equal to r7, the player the game would make the results for, once up.
+   const std::uint32_t check[] = {0x3D808000u, 0x880C0000u | (kFinishFlag & 0xFFFFu), 0x68000001u,
+                                  0x7C003A14u, 0x4E800020u};  // lis r12; lbz r0; xori r0, 1; add r0, r7; blr
+-  const std::uint32_t loop[] = {0x3AA00000u, 0x3EE08061u, 0x3AF79440u,
++  // The racers' table in the game that runs (Tournament Edition: srnp_game.hpp).
++  const auto hi = [](std::uint32_t a) { return ((a + 0x8000u) >> 16) & 0xFFFFu; };
++  const auto lo = [](std::uint32_t a) { return a & 0xFFFFu; };
++  const std::uint32_t racer0 = At(kRacers);
++  const std::uint32_t seat_racer = racer0 + kRacerSize * static_cast<std::uint32_t>(std::max(seat, 0));
++  const std::uint32_t loop[] = {0x3AA00000u, 0x3EE00000u | hi(racer0), 0x3AF70000u | lo(racer0),
+                                 0x4E800020u};  // li r21, 0; r23 = racer 0 (0x80609440); blr
+   // r3 = (the seat's racer +0xBA8 >> 19) & 1: has it crossed the line.
+   const std::uint32_t seat_crossed[] = {
+-      0x3C608061u, 0x38630000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(std::max(seat, 0))) & 0xFFFFu),
++      0x3C600000u | hi(seat_racer), 0x38630000u | lo(seat_racer),
+       0x80630BA8u, 0x54636FFEu, 0x4E800020u};  // lis; addi; lwz r3, 0xBA8(r3); rlwinm r3, r3, 13, 31, 31; blr
+-  const std::uint32_t patched[] = {
++  const std::uint32_t us_patched[] = {
+       0x38840000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(std::max(seat, 0))) & 0xFFFFu),
+       bl(kFinishWords[1].address, kFinishCaveLoop), bl(kFinishWords[2].address, kFinishCaveCheck),
+       0x408200D0u, bl(kFinishWords[4].address, kFinishCaveSeat), bl(kFinishWords[5].address, kFinishCaveSeat),
+       bl(kFinishWords[6].address, kFinishCaveSeat), bl(kFinishWords[7].address, kFinishCaveSeat),
+       0x48000018u, 0x60000000u};
+-  static_assert(std::size(patched) == std::size(kFinishWords));
++  static_assert(std::size(us_patched) == std::size(kFinishWords));
++  Swap sites[std::size(kFinishWords)];
++  std::uint32_t patched[std::size(kFinishWords)] = {};
++  for (std::size_t i = 0; i < std::size(kFinishWords); ++i)
++  {
++    const CodeWord& w = kFinishWords[i];
++    const bool ok = racer0 != 0 && Resolve(w.address, w.original, &sites[i]);
++    patched[i] = ok ? Made(w.address, w.original, us_patched[i], sites[i]) : 0;
++    if (!ok || patched[i] == 0 || (on && RawWord(sites[i].at) != sites[i].original))
++    {
++      std::fprintf(stderr, "[srnp racers] finish: 0x%08X holds %08X (%s): left alone\n", sites[i].at,
++                   RawWord(At(w.address)), GameName());
++      return;
++    }
++  }
+   if (on)
+   {
+-    for (const CodeWord& w : kFinishWords)
+-      if (Read32(w.address) != w.original)
+-      {
+-        std::fprintf(stderr, "[srnp racers] finish: 0x%08X holds %08X, not %08X: left alone\n", w.address,
+-                     Read32(w.address), w.original);
+-        return;
+-      }
+     const auto ours = [&](std::uint32_t a) -> std::uint32_t {
+       if (a >= kFinishCaveCheck && a < kFinishCaveCheck + 4 * std::size(check))
+         return check[(a - kFinishCaveCheck) / 4];
+@@ -1404,14 +1629,10 @@ void PatchFinish(int seat, int seats)
+     for (std::size_t i = 0; i < std::size(seat_crossed); ++i)
+       if (std::uint8_t* p = Guest(kFinishCaveSeat + 4 * static_cast<std::uint32_t>(i), 4))
+         Put32(p, seat_crossed[i]);
+-    jit.InvalidateICache(kFinishCaveCheck, kFinishCaveSeat + 4 * std::size(seat_crossed) - kFinishCaveCheck, true);
++    jit.InvalidateICache(At(kFinishCaveCheck), kFinishCaveSeat + 4 * std::size(seat_crossed) - kFinishCaveCheck, true);
+   }
+   for (std::size_t i = 0; i < std::size(kFinishWords); ++i)
+-  {
+-    if (std::uint8_t* p = Guest(kFinishWords[i].address, 4))
+-      Put32(p, on ? patched[i] : kFinishWords[i].original);
+-    jit.InvalidateICache(kFinishWords[i].address, 4, true);
+-  }
++    PutCode(sites[i].at, on ? patched[i] : sites[i].original);
+   s_finish_patched = on;
+   if (on)
+     std::fprintf(stderr, "[srnp racers] finish: the HUD on racer %d, the results %llu frames after the %d seats\n",
+@@ -1472,6 +1693,8 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> s_test_patch_saved;
+ 
+ void PatchTest(bool on)
+ {
++  if (NotOnTE("PatchTest"))
++    return;
+   static const std::vector<std::pair<std::uint32_t, std::uint32_t>> words = [] {
+     std::vector<std::pair<std::uint32_t, std::uint32_t>> list;
+     const char* v = std::getenv("SRNP_PATCH");
+@@ -1527,21 +1750,27 @@ void WatchWords()
+ {
+   static std::vector<std::pair<std::uint32_t, std::uint32_t>> watched = [] {
+     std::vector<std::pair<std::uint32_t, std::uint32_t>> list;
+-    const char* v = std::getenv("SRNP_WATCH");
+-    for (const char* p = v; p && *p;)
++    // SRNP_WATCH: Sonic Riders US addresses (At: their place in the game that runs); SRNP_WATCH_BRUT: the
++    // game's own addresses as they are (bit 0 set in the list: raw).
++    for (const char* name : {"SRNP_WATCH", "SRNP_WATCH_BRUT"})
+     {
+-      char* end = nullptr;
+-      const unsigned long address = std::strtoul(p, &end, 16);
+-      if (end == p)
+-        break;
+-      list.emplace_back(static_cast<std::uint32_t>(address) & ~3u, 0u);
+-      p = *end == ',' ? end + 1 : nullptr;
++      const bool raw = name[10] == '_';
++      const char* v = std::getenv(name);
++      for (const char* p = v; p && *p;)
++      {
++        char* end = nullptr;
++        const unsigned long address = std::strtoul(p, &end, 16);
++        if (end == p)
++          break;
++        list.emplace_back((static_cast<std::uint32_t>(address) & ~3u) | (raw ? 1u : 0u), 0u);
++        p = *end == ',' ? end + 1 : nullptr;
++      }
+     }
+     return list;
+   }();
+   for (auto& [address, last] : watched)
+   {
+-    const std::uint32_t now = Read32(address);
++    const std::uint32_t now = (address & 1u) ? RawWord(address & ~3u) : Read32(address);
+     if (now != last)
+       std::fprintf(stderr, "[srnp watch] frame %llu 0x%08X %08X -> %08X\n",
+                    static_cast<unsigned long long>(s_frames), address, last, now);
+@@ -1575,7 +1804,7 @@ void MenusOnPort0()
+   std::uint8_t* racer = Guest(kRacers, kRacerSize);
+   if (!racer)
+     return;
+-  Put32(racer, kGamePads);
++  Put32(racer, At(kGamePads));
+   racer[kCpuFlag] = 0;
+ }
+ 
+@@ -1602,8 +1831,11 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+   const std::uint32_t phase = Read32(kRacePhase);
+   const std::uint32_t count = Read32(kRacerCount);
+   // The race is set up and runs (while it loads, the game still writes the racers).
+-  const bool racing = count >= 2 && count <= 8 && Read32(kRaceLoading) == 0 && Read32(kRaceScene) == 4;
+-  if (racing && !s_race && Get32(racers) == kGamePads)
++  // (Tournament Edition: the US loading flag's place holds something else there, a byte the Start key
++  // flips; its race is taken once the scene is the race's.)
++  const bool racing = count >= 2 && count <= 8 && (CurrentGame() == Game::TE || Read32(kRaceLoading) == 0) &&
++                      Read32(kRaceScene) == 4;
++  if (racing && !s_race && Get32(racers) == At(kGamePads))
+   {
+     // A race the game has set up (racer 0 points to port 0's structure), not taken yet.
+     s_race = true;
+@@ -1726,7 +1958,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+         racer[kControl] = 1;
+         racer[kCpuFlag] = simulated ? 0 : 1;  // the AI, with the CPUs' rules (or a player's)
+         // Back to the game's own controller structure of that racer, as the game's CPUs have it.
+-        Put32(racer, kGamePads + static_cast<std::uint32_t>(k) * kPadSize);
++        Put32(racer, At(kGamePads) + static_cast<std::uint32_t>(k) * kPadSize);
+         seat.released = true;
+         std::fprintf(stderr, "[srnp racers] racer %zu: seat %zu gives it to the AI%s\n", k, k,
+                      simulated ? " (a simulated player: still nP)" : "");
+@@ -1738,7 +1970,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+       pad = {};
+     }
+     FillPad(seat_pads + k * kPadSize, FromSeat(pad));
+-    Put32(racer, kSeatPads + static_cast<std::uint32_t>(k) * kPadSize);
++    Put32(racer, At(kSeatPads) + static_cast<std::uint32_t>(k) * kPadSize);
+     racer[kControl] = 0;
+     // A player: the human rules (speed, items, the "nP" label), not the CPUs'; SRNP_REGLES=cpu keeps
+     // the CPUs' rules for every seat.
+@@ -1791,7 +2023,10 @@ std::uint64_t RacersHash()
+       // differs once the track's objects show (and sound) around each machine's seat (PatchObjectZones;
+       // measured on 2026-11-26: +0xF50 alone differed, 0x0D against 0x06, from frame 960 on, the race
+       // the same).
+-      {0xF44, 0xF4C}, {0xF50, 0xF60}};
++      {0xF44, 0xF4C}, {0xF50, 0xF60},
++      // Tournament Edition's two more (measured on 2026-11-26, 8 runners: +0xF60/+0xF64 of Silver's racer,
++      // 0x0C/0x0D on seven machines and 0x13/0x14 on one, the race the same until then). Zero in the US game.
++      {0xF60, 0xF68}};
+   // Bits of the drawing only: 0x10000 of the flags +0xBAC (and of +0xBB8, last frame's copy) is set
+   // by the characters' drawing functions (table 0x805E3FF0) for a racer the camera sees, and only the
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+@@ -1881,7 +2116,7 @@ void PadCheckOnFrame(std::uint64_t frame)
+   static std::uint64_t checked = 0, wrong = 0, skipped = 0;
+   const std::uint8_t* game = Guest(kGamePads, kPadSize);
+   const std::uint32_t status_at = Read32(kPadStatusNow);
+-  const std::uint8_t* status = status_at ? Guest(status_at, 12) : nullptr;
++  const std::uint8_t* status = status_at ? GuestRaw(status_at, 12) : nullptr;
+   if (!game || !status)
+     return;
+   if (status_at == last_status)
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index bb47f24..03a4481 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -28,6 +28,7 @@
+ #endif
+ 
+ #include "srnp_relay.hpp"
++#include "srnp_game.hpp"
+ #include "srnp_labels.hpp"
+ #include "srnp_racers.hpp"
+ 
+@@ -399,8 +400,9 @@ std::uint64_t StateHash()
+ {
+   auto& memory = Core::System::GetInstance().GetMemory();
+   const std::uint8_t* ram = memory.GetRAM();
+-  const std::uint32_t start = 0x805FB080u - 0x80000000u;
+-  const std::uint32_t end = 0x806B5774u - 0x80000000u;
++  // (Tournament Edition: the same block, moved: srnp_game.hpp.)
++  const std::uint32_t start = At(0x805FB080u) - 0x80000000u;
++  const std::uint32_t end = start + (0x806B5774u - 0x805FB080u);
+   std::uint64_t hash = 0xCBF29CE484222325ull;
+   if (!ram || end > memory.GetRamSizeReal())
+     return 0;
+@@ -599,8 +601,8 @@ void ApplyRules()
+   const int course = s_rule_course, laps = s_rule_laps;
+   if (course < 1)
+     return;
+-  std::uint8_t* c = GuestByte(kRuleCourse);
+-  std::uint8_t* l = GuestByte(kRuleLaps);
++  std::uint8_t* c = GuestByte(At(kRuleCourse));
++  std::uint8_t* l = GuestByte(At(kRuleLaps));
+   if (!c || !l)
+     return;
+   std::fprintf(stderr, "[srnp relay] the host's rules: course %d (was %d), %d laps (was %d), %d racers\n",
+@@ -669,8 +671,8 @@ bool LobbyStep(LobbyLocal* l)
+     l->character = std::max(0, SeatCharacter(seat));
+     LobbySend(seat, *l);
+     // The host starts from the save state's rules.
+-    const std::uint8_t* c = GuestByte(kRuleCourse);
+-    const std::uint8_t* laps = GuestByte(kRuleLaps);
++    const std::uint8_t* c = GuestByte(At(kRuleCourse));
++    const std::uint8_t* laps = GuestByte(At(kRuleLaps));
+     if (seat == 0 && c && laps && *c >= 1 && *c <= kCourses && *laps >= 1 && *laps <= kMaxLaps)
+       SendRules(*c, *laps, std::max(s_relay.seats, RacersWanted() ? RacersWanted() : 8));
+   }
+@@ -977,6 +979,13 @@ bool RelayConfigured()
+   return configured;
+ }
+ 
++const char* GameFrameHookFallbackRange()
++{
++  // Tournament Edition's main loop (head 0x8027B934, its function 0x8027B7D8-0x8027B984: found on
++  // 2026-11-26 by the calls it makes, those of the US loop; TE adds two).
++  return CurrentGame() == Game::TE ? "8027B7D8-8027B984" : "805B80CC-805B82D8";
++}
++
+ std::uint32_t GameFrameHookAddress()
+ {
+   static const std::uint32_t address = [] {
+@@ -987,7 +996,7 @@ std::uint32_t GameFrameHookAddress()
+     const char* hook = std::getenv("SRNP_CROCHET");
+     const bool off = hook && *hook == '0';
+     return set("SRNP_RELAY") && set("SRNP_RACERS") && set("MODERNGEKKO_STATICRECOMP") && !off
+-               ? 0x805B8290u
++               ? At(0x805B8290u)
+                : 0u;
+   }();
+   return address;
+@@ -1139,21 +1148,21 @@ bool VanillaStep(std::uint64_t* frame)
+         TakeRules(line);
+     }
+     ApplyPad(0, VanillaPad(*frame));
+-    const std::uint32_t count = GuestWord(kRacerCount);
++    const std::uint32_t count = GuestWord(At(kRacerCount));
+     if (count != 1 && last_count == 1 && setup_at == 0)
+       setup_at = *frame;
+     last_count = count;
+     if (setup_at == 0 || *frame < setup_at + 2)
+       return false;
+     const int seat = s_relay.local.front();
+-    const std::uint8_t* racer = GuestByte(kRacer0);
++    const std::uint8_t* racer = GuestByte(At(kRacer0));
+     const int character = racer ? racer[0xBA] : 0, gear = racer ? racer[0xBB] : 0;
+     ApplyPad(0, Pad{});
+     SendLine("PICK " + std::to_string(seat) + " " + std::to_string(character) + " " + std::to_string(gear));
+     if (seat == 0)
+     {
+-      const std::uint8_t* c = GuestByte(kRuleCourse);
+-      const std::uint8_t* l = GuestByte(kRuleLaps);
++      const std::uint8_t* c = GuestByte(At(kRuleCourse));
++      const std::uint8_t* l = GuestByte(At(kRuleLaps));
+       if (c && l && *c >= 1 && *c <= kCourses && *l >= 1 && *l <= kMaxLaps)
+         SendRules(*c, *l, std::max(s_relay.seats, RacersWanted() ? RacersWanted() : 8));
+     }
+@@ -1173,7 +1182,7 @@ bool VanillaStep(std::uint64_t* frame)
+     return false;
+   }
+   case Vanilla::Reloading:
+-    if (GuestWord(kRacerCount) != 1)
++    if (GuestWord(At(kRacerCount)) != 1)
+       return false;  // still the menus' race: the start state is not back yet
+     s_game_frames.store(1);
+     *frame = 1;
+@@ -1187,7 +1196,7 @@ bool VanillaStep(std::uint64_t* frame)
+     // at the end of the menu's fade): the screen is black by then (Gibax: "juste avant que le
+     // chargement commence").
+     std::uint64_t& loading_at = s_loading_at;
+-    if (s_veil && loading_at == 0 && GuestWord(kRacerCount) != 1)
++    if (s_veil && loading_at == 0 && GuestWord(At(kRacerCount)) != 1)
+       loading_at = *frame;
+     if (s_veil && loading_at != 0 && *frame >= loading_at + 15)
+     {
+@@ -1230,12 +1239,33 @@ bool s_raced = false;             // a race was taken since the start state
+ constexpr std::uint32_t kMenuTaskFunction = 0x80528C9C;
+ constexpr std::uint32_t kRacerCountWord = 0x8021B8C0u;
+ 
++// Where the game's tasks are (slots of 0xC0 bytes, a task's function word first): Sonic Riders US's at
++// 0x803D0000; Tournament Edition's in its heap, after its larger DOL: its first slot is held at 0x8042E58C
++// (found on 2026-11-26 in a race's RAM: 175 slots from 0x80877EA8, the HUD's and the race manager's tasks
++// among them). A little before it, the same span as the US one.
++std::uint32_t TaskPool()
++{
++  switch (CurrentGame())
++  {
++  case Game::Riders:
++    return 0x803D0000u;
++  case Game::TE:
++  {
++    const std::uint8_t* p = GuestByte(0x8042E58Cu);
++    const std::uint32_t first = p ? (std::uint32_t{p[0]} << 24) | (p[1] << 16) | (p[2] << 8) | p[3] : 0;
++    return first >= 0x805E8000u && first < 0x817E0000u ? (first - 0x100u) & ~3u : 0;
++  }
++  default:
++    return 0;
++  }
++}
++
+ // A task of the game by its function: the task's pointer (the word of its function in the pool).
+ std::uint32_t FindTask(std::uint32_t function)
+ {
+   auto& memory = Core::System::GetInstance().GetMemory();
+-  constexpr std::uint32_t kPool = 0x803D0000u, kSize = 0x20000u;
+-  const std::uint8_t* pool = memory.GetPointerForRange(kPool, kSize);
++  const std::uint32_t kPool = TaskPool(), kSize = 0x20000u;
++  const std::uint8_t* pool = kPool ? memory.GetPointerForRange(kPool, kSize) : nullptr;
+   if (!pool)
+     return 0;
+   const std::uint8_t f[4] = {static_cast<std::uint8_t>(function >> 24), static_cast<std::uint8_t>(function >> 16),
+@@ -1248,7 +1278,7 @@ std::uint32_t FindTask(std::uint32_t function)
+ 
+ std::uint32_t FindMenuTask()
+ {
+-  return FindTask(kMenuTaskFunction);
++  return FindTask(At(kMenuTaskFunction));
+ }
+ 
+ // The racers on Rule Settings (Gibax, 2026-11-26: "on est capable de choisir le nombre de racers par
+@@ -1316,13 +1346,13 @@ void PatchRulesMenu(bool on)
+ // element's function at +48) moved by its matrix (measured: x -130, y +29 puts it left of CONTINUE).
+ void MoveDefault()
+ {
+-  const std::uint32_t pool = GuestWord(0x80682EF8u);
++  const std::uint32_t pool = GuestWord(At(0x80682EF8u));
+   if (pool < 0x80000000u)
+     return;
+   for (std::uint32_t k = 0; k < 128; ++k)
+   {
+     const std::uint32_t object = pool + 192 * k;
+-    if (GuestWord(object + 48) != 0x805A759Cu)
++    if (GuestWord(object + 48) != At(0x805A759Cu))
+       continue;
+     if (std::uint8_t* m = GuestByte(object))
+     {
+@@ -1342,8 +1372,8 @@ void MoveDefault()
+ void RulesMenuOnFrame()
+ {
+   static std::uint32_t task = 0;
+-  if (task == 0 || GuestWord(task) != 0x805A6660u)
+-    task = FindTask(0x805A6660u);
++  if (task == 0 || GuestWord(task) != At(0x805A6660u))
++    task = FindTask(At(0x805A6660u));
+   const std::uint8_t* t = task ? GuestByte(task) : nullptr;
+   const std::uint32_t data = task ? GuestWord(task + 16) : 0;
+   std::uint8_t* d = data >= 0x80000000u ? GuestByte(data) : nullptr;
+@@ -1401,8 +1431,8 @@ void RulesMenuOnFrame()
+ void LogTasks(std::uint32_t function)
+ {
+   auto& memory = Core::System::GetInstance().GetMemory();
+-  constexpr std::uint32_t kPool = 0x803D0000u, kSize = 0x20000u;
+-  const std::uint8_t* pool = memory.GetPointerForRange(kPool, kSize);
++  const std::uint32_t kPool = TaskPool(), kSize = 0x20000u;
++  const std::uint8_t* pool = kPool ? memory.GetPointerForRange(kPool, kSize) : nullptr;
+   if (!pool)
+     return;
+   for (std::uint32_t o = 0; o + 32 <= kSize; o += 4)
+@@ -1418,9 +1448,9 @@ void RaceManagerToChoice()
+   // The race's manager: 0x80434414 in the races played online (its states in the table 0x805D51F8:
+   // 7 the race, 8 after a player's finish, 9 the menu's choice at 0x80435D44), 0x804337A8 in another
+   // mode (its 9 at 0x80433AB0).
+-  std::uint32_t manager = FindTask(0x80434414u);
++  std::uint32_t manager = FindTask(At(0x80434414u));
+   if (!manager)
+-    manager = FindTask(0x804337A8u);
++    manager = FindTask(At(0x804337A8u));
+   std::uint8_t* m = manager ? GuestByte(manager) : nullptr;
+   if (!m)
+   {
+@@ -1495,7 +1525,7 @@ bool AfterRaceStep(std::uint64_t* frame)
+   {
+     ++s_menu_frames;
+     const std::uint8_t* task = GuestByte(s_menu_task);
+-    if (!task || GuestWord(s_menu_task) != kMenuTaskFunction)
++    if (!task || GuestWord(s_menu_task) != At(kMenuTaskFunction))
+     {
+       ApplyPad(0, Pad{});
+       return false;
+@@ -1552,17 +1582,17 @@ bool AfterRaceStep(std::uint64_t* frame)
+     a[1] = 0x1;
+     MenusOnPort0();
+     {
+-      const std::uint8_t* choice = GuestByte(0x806129CCu);
++      const std::uint8_t* choice = GuestByte(At(0x806129CCu));
+       const std::uint8_t* task = GuestByte(s_menu_task);
+       if (s_menu_frames % 10 == 0)
+         std::fprintf(stderr, "[srnp relay] Back to Menu, frame %llu: the game's choice %d (decided %d), menu state %d "
+                      "closing %d cursor %d, phase %u\n", static_cast<unsigned long long>(s_menu_frames),
+                      choice ? choice[0] : -1, choice ? choice[2] : -1, task ? task[20] : -1,
+-                     task ? task[25] : -1, task ? task[22] : -1, GuestWord(0x806129A0u));
++                     task ? task[25] : -1, task ? task[22] : -1, GuestWord(At(0x806129A0u)));
+     }
+     // A until the game has taken the choice (0x806129CE), at most 30 frames; then 10 frames for it.
+     static std::uint64_t decided_at = 0;
+-    const std::uint8_t* decided = GuestByte(0x806129CEu);
++    const std::uint8_t* decided = GuestByte(At(0x806129CEu));
+     ++s_menu_frames;
+     if (decided && decided[0] != 0 && decided_at == 0)
+     {
+@@ -1589,7 +1619,7 @@ bool AfterRaceStep(std::uint64_t* frame)
+   case After::Reloading:
+   {
+     ApplyPad(0, Pad{});
+-    if (GuestWord(kRacerCountWord) != 1)
++    if (GuestWord(At(kRacerCountWord)) != 1)
+       return false;  // still the race: the start state is not back yet
+     s_game_frames.store(1);
+     *frame = 1;
+@@ -1636,7 +1666,7 @@ void WatchForMenu()
+   s_after = After::Menu;
+   for (const int seat : s_relay.local)
+     SendLine("END " + std::to_string(seat));
+-  LogTasks(kMenuTaskFunction);
++  LogTasks(At(kMenuTaskFunction));
+   std::fprintf(stderr, "[srnp relay] results' menu open (task 0x%08X): out of the lockstep, this player's own\n",
+                task);
+ }
+@@ -1688,7 +1718,7 @@ void RelayStep(std::uint64_t frame)
+     if (dump_dir && *dump_dir && s_relay.racers)
+     {
+       auto& memory = Core::System::GetInstance().GetMemory();
+-      if (const std::uint8_t* racers = memory.GetPointerForRange(0x80609440u, 8 * 0x1080u))
++      if (const std::uint8_t* racers = memory.GetPointerForRange(At(0x80609440u), 8 * 0x1080u))
+       {
+         const std::string path = std::string(dump_dir) + "/racers_" + std::to_string(frame) + ".bin";
+         if (std::FILE* f = std::fopen(path.c_str(), "wb"))
+@@ -1772,7 +1802,7 @@ void RelayStep(std::uint64_t frame)
+   // state's menus until the race loads: 15 frames after seat 0's Start has set it up, as VanillaStep.
+   if (s_veil && !LobbyVanilla())
+   {
+-    if (s_loading_at == 0 && GuestWord(kRacerCountWord) != 1)
++    if (s_loading_at == 0 && GuestWord(At(kRacerCountWord)) != 1)
+       s_loading_at = frame;
+     if (s_loading_at != 0 && frame >= s_loading_at + 15)
+     {
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 15481df..992eb71 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -80,7 +80,7 @@ std::uint32_t GameFrameHookAddress();
+ void GameFrameHook(CPUState* state);
+ // The main loop's whole function, to run in the interpreter while the hook is in place: StaticRecomp's
+ // native code loops inside a function without going back to its dispatcher, where hooks are seen.
+-inline constexpr const char* kGameFrameHookFallbackRange = "805B80CC-805B82D8";
++const char* GameFrameHookFallbackRange();
+ // The game frames counted by that hook so far (0 without it). With SRNP_PAUSE_JEU=1, an automation
+ // pause (pad_frames pause_at=<n>) waits for this count instead of the present's: the presents of
+ // machines in lockstep differ (each has waited its own time), their game frames don't.
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index c78b738..b22f09d 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -12,6 +12,7 @@
+ // over a paused game, the last frame is presented again, on the video thread, with the screen over it.
+ 
+ #include "srnp_relay.hpp"
++#include "srnp_game.hpp"
+ #include "srnp_game_textures.hpp"
+ #include "srnp_labels.hpp"
+ 
+@@ -32,7 +33,9 @@ namespace
+ {
+ constexpr const char* kCharacters[] = {"Sonic",  "Tails",       "Knuckles", "Amy",  "Jet",    "Storm",
+                                        "Wave",   "Eggman",      "Cream",    "Rouge", "Shadow", "Super Sonic",
+-                                       "NiGHTS", "AiAi",        "Ulala",    "E-10000G", "E-10000R"};
++                                       "NiGHTS", "AiAi",        "Ulala",    "E-10000G", "E-10000R",
++                                       // Tournament Edition's (its table of the characters' files, 2026-11-26)
++                                       "Silver", "Metal Sonic", "Emerl",    "Blaze", "Chaos",  "Tikal"};
+ 
+ // The gears in the order of the game's table (41 records at 0x805E5F40), as the modding community names
+ // them (Sewer56's SonicRiders library, ExtremeGear); checked against who may ride them in the table on
+@@ -211,13 +214,18 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+   }
+   const int players = seats - left;
+ 
+-  // The menus' blue, darker at the top, and light bands across, as Player Entry has.
+-  list->AddRectFilledMultiColor(ImVec2(0, 0), display, Rgba(10, 28, 92), Rgba(10, 28, 92), Rgba(36, 104, 196),
+-                                Rgba(36, 104, 196));
++  // The menus' blue, darker at the top, and light bands across, as Player Entry has. Tournament Edition's
++  // menus are green: there a greyish green (Gibax, 2026-11-26: "plutôt vert (enfin vert mais un peu
++  // grisâtre) ... uniquement pour TE"; TE's own greens run from 24,94,24 to 80,125,80).
++  const bool te = CurrentGame() == Game::TE;
++  const ImU32 sky_top = te ? Rgba(26, 46, 30) : Rgba(10, 28, 92);
++  const ImU32 sky_bottom = te ? Rgba(78, 116, 80) : Rgba(36, 104, 196);
++  list->AddRectFilledMultiColor(ImVec2(0, 0), display, sky_top, sky_top, sky_bottom, sky_bottom);
+   for (int i = 0; i < 6; ++i)
+   {
+     const float y = display.y * (0.18f + 0.13f * static_cast<float>(i));
+-    list->AddRectFilled(ImVec2(0, y), ImVec2(display.x, y + display.y * 0.012f), Rgba(160, 200, 255, 0.07f));
++    list->AddRectFilled(ImVec2(0, y), ImVec2(display.x, y + display.y * 0.012f),
++                        te ? Rgba(200, 230, 200, 0.07f) : Rgba(160, 200, 255, 0.07f));
+   }
+   const float unit = std::min(display.y / 15.0f, display.x / (seats * 3.4f + 1.0f));
+ 
+-- 
+2.34.1.windows.1
+
