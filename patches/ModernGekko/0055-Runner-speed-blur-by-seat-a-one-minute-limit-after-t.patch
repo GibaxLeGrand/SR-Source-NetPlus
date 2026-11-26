@@ -1,0 +1,263 @@
+From fe40bf51a6c291c30bde51c55c0030ef9ae83a1e Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:15:14 +0100
+Subject: [PATCH] Runner: speed blur by seat, a one-minute limit after the
+ first finish, retire shown on its own screen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gibax (2026-11-26): "le flou dans la cam de Knuckles en bas, repris du 1P";
+"un timer d'une minute à l'arrivée du premier joueur. A la fin tout le monde
+finit de force la course"; then, his 3-player test: "uniquement les écrans
+retirent qui s'assombrissent".
+
+- Speed blur: the task 0x804A4B84 draws a veil as strong as racer 0's speed
+  (+0xAAC), for one view (0x804A4D30) or in a loop over the views
+  (0x804A4DE8); now the seat's racer. Knuckles at a standstill: sharp.
+- Time limit: 3600 frames after a first seat's racer crossed the line, every
+  seat's racer still racing retires through the game's own routine (racer
+  state +0x1034 = 4, handler 0x805A7898 in the table 0x805E1FF8, step
+  +0x1037 = 0): past the last lap, +0xBA8 |= 0xC0000, the last free rank,
+  99'99"99, "RETIRE!". Done at the same frame on every machine, from the
+  racers' state. With one player per machine the game took one retire for
+  "every player retired" and went to "Retry?": the routine's step 2
+  (0x805A7B04) and the results controller's skip (0x8052AB3C) take the
+  normal way (our flag already waits for every seat). SRNP_FIN_MINUTEUR.
+  Setting only the crossed bit was tried first: no GOAL nor results on the
+  late machine (the HUD makes GOAL from the lap count), 13 divergences.
+- Retire display: the routine makes the darkening "RETIRE!" task
+  (0x804A4F2C) for any racer (0x805A7AAC); now only on the machine of the
+  seat that retires, through a cave at 0x80002A00.
+- Test input SRNP_INPUT=ia@<n>: still for the race's first n frames, then
+  the AI (seat 0 presses Start in the menus, as with "ia").
+
+Measured, Gibax's test: 3 runners, 3 racers, no bot: Tails (racer 0) still,
+Jet (racer 1) to the AI, Wave (racer 2) still until 20" then the AI. Each
+screen its own HUD, camera, speed and rank all race long; Tails keeps his
+time after Jet's (57"16) and Wave's (1'15"68) finishes; one minute after
+Jet, Tails retires, his screen alone darkens; the same results on the three
+(1st Jet, 2nd Wave, 3rd Tails); 146 then 155 identical checksums, 0
+divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 129 +++++++++++++++++++++++++++++++++++-
+ src/runtime/srnp_relay.cpp  |  12 ++++
+ 2 files changed, 139 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 8ec5e46..237310d 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -871,6 +871,17 @@ SeatDisplay s_hud_fade{"HUD fade at the finish (0x804309C4)",
+                        {{0x804309C4, 0x38849440}},  // addi r4, r4, -0x6BC0 (racer 0)
+                        1,
+                        [](std::size_t, int seat) { return 0x38840000u | SeatRacerLow(seat); }};
++// The speed blur (Gibax, 2026-11-26: "le flou dans la cam de Knuckles en bas, repris du 1P"; Knuckles at
++// a standstill had his board smeared): the task 0x804A4B84 (made at the race's start, 0x8043856C) draws a
++// veil whose strength is racer 0's speed (+0xAAC) times a factor, for one view (0x804A4D30, r4) or in a
++// loop over the views (0x804A4DE8, r28, +0x1080 a view). Written: the seat's racer.
++SeatDisplay s_speed_blur{"speed blur (0x804A4D30, 0x804A4DE8)",
++                         {{0x804A4D30, 0x38839440},   // addi r4, r3, -0x6BC0 (racer 0)
++                          {0x804A4DE8, 0x3B839440}},  // addi r28, r3, -0x6BC0 (racer 0, then each view's)
++                         2,
++                         [](std::size_t i, int seat) {
++                           return (i == 0 ? 0x38830000u : 0x3B830000u) | SeatRacerLow(seat);
++                         }};
+ SeatDisplay s_hud_804250C0{"HUD task 0x804250C0",
+                            {{0x8042653C, 0x3A839440}},  // addi r20, r3, -0x6BC0 (racer 0)
+                            1,
+@@ -1007,6 +1018,70 @@ void PatchObjectZones(int seat)
+                std::size(kObjectZoneSites), to);
+ }
+ 
++// The retire display (Gibax, 2026-11-26, the 3-player test, Tails retired by the time limit: "uniquement
++// les écrans retirent qui s'assombrissent ... Jet et Wave ne doivent pas s'assombrir"): the retire routine
++// (0x805A7898, its first step) makes the display task 0x804A4F2C (the screen darkened, "RETIRE!") for
++// any racer that retires (0x805A7AAC, the racer's index in r29), so every machine darkened. Here the call
++// goes to a cave that makes it only for this machine's seat, and otherwise sets r4 and r5 as the skipped
++// words would have (0x805A7AC8, 0x805A7ACC) and goes on at 0x805A7AF4. The task only draws.
++constexpr std::uint32_t kRetireCave = 0x80002A00;  // free low memory (0x80001810-0x80002B00)
++constexpr CodeWord kRetireCall = {0x805A7AAC, 0x4BB3AC79};  // bl 0x800E2724 (makes the task)
++bool s_retire_patched = false;
++
++void PatchRetireDisplay(int seat)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_FIGURES");
++    return v && *v == '0';
++  }();
++  const bool on = !off && seat >= 0 && seat < 8;
++  if (on == s_retire_patched)
++    return;
++  const auto b = [](std::uint32_t from, std::uint32_t to, bool link) {
++    return (link ? 0x48000001u : 0x48000000u) | ((to - from) & 0x03FFFFFCu);
++  };
++  const std::uint32_t cave[] = {
++      0x281D0000u | static_cast<std::uint32_t>(std::max(seat, 0)),  // cmplwi r29, seat
++      0x41820010u,                                                  // beq +0x10 (make it)
++      0x3C808061u, 0x3CA08022u,                                     // lis r4, 0x8061; lis r5, 0x8022
++      b(kRetireCave + 0x10, 0x805A7AF4, false),                     // b past the task's setup
++      b(kRetireCave + 0x14, 0x800E2724, true),                      // bl 0x800E2724 (the task)
++      b(kRetireCave + 0x18, 0x805A7AB0, false)};                    // b back
++  const std::uint32_t expected = on ? kRetireCall.original : b(kRetireCall.address, kRetireCave, false);
++  if (Read32(kRetireCall.address) != expected)
++  {
++    std::fprintf(stderr, "[srnp racers] retire display: 0x%08X holds %08X, not %08X: left alone\n",
++                 kRetireCall.address, Read32(kRetireCall.address), expected);
++    return;
++  }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  if (on)
++  {
++    for (std::size_t i = 0; i < std::size(cave); ++i)
++    {
++      const std::uint32_t word = Read32(kRetireCave + 4 * static_cast<std::uint32_t>(i));
++      if (word != 0 && word != cave[i] && !(i == 0 && (word & 0xFFFF0000u) == 0x281D0000u))
++      {
++        std::fprintf(stderr, "[srnp racers] retire display: 0x%08X is not free (%08X): left alone\n",
++                     kRetireCave + 4 * static_cast<std::uint32_t>(i), word);
++        return;
++      }
++    }
++    for (std::size_t i = 0; i < std::size(cave); ++i)
++      if (std::uint8_t* p = Guest(kRetireCave + 4 * static_cast<std::uint32_t>(i), 4))
++        Put32(p, cave[i]);
++    jit.InvalidateICache(kRetireCave, static_cast<std::uint32_t>(4 * std::size(cave)), true);
++  }
++  if (std::uint8_t* p = Guest(kRetireCall.address, 4))
++    Put32(p, on ? b(kRetireCall.address, kRetireCave, false) : kRetireCall.original);
++  jit.InvalidateICache(kRetireCall.address, 4, true);
++  s_retire_patched = on;
++  if (on)
++    std::fprintf(stderr, "[srnp racers] retire display: for racer %d only (this machine's seat)\n", seat);
++  else
++    std::fprintf(stderr, "[srnp racers] retire display: the game's\n");
++}
++
+ void PatchSeatDisplay(SeatDisplay& d, int seat)
+ {
+   static const bool off = [] {
+@@ -1056,7 +1131,9 @@ void PatchSeatDisplays(int seat)
+   if (!hud || (*hud != '0' && *hud != 'a'))
+     PatchSeatDisplay(s_hud_804250C0, seat);
+   PatchSeatDisplay(s_hud_fade, seat);
++  PatchSeatDisplay(s_speed_blur, seat);
+   PatchObjectZones(seat);
++  PatchRetireDisplay(seat);
+ }
+ 
+ // The level's intro (2026-11-26, Gibax: on his machine "ya que l'animation et le son de Sonic qui sort
+@@ -1176,10 +1253,28 @@ constexpr CodeWord kFinishWords[] = {
+     {0x8051C4D4, 0x4BFFFEED},  // bl 0x8051C3C0, the same
+     {0x8051D258, 0x4BFFF169},  // bl 0x8051C3C0, the same
+     {0x805A8808, 0x4BF73BB9},  // bl 0x8051C3C0, the same (task 0x805A8760)
++    // A retired racer (the time limit, kNoContest): with one player per machine, the game counts
++    // every player as retired once one is ([0x806129B6] == the player count, 1) and goes to "Retry?"
++    // instead of the results (measured on 2026-11-26, both machines): the retire routine's step 2
++    // (0x805A7B04) and the controller skipping the results (0x8052AB3C). Our flag already waits for
++    // every seat: the routine always takes step 1, the controller always makes the results.
++    {0x805A7B04, 0x40820018},  // bne 0x805A7B1C (step 1)        -> b 0x805A7B1C
++    {0x8052AB3C, 0x41820044},  // beq 0x8052AB80 (no results)    -> nop
+ };
+ bool s_finish_patched = false;
+ int s_finish_seats = 0;
+ std::uint64_t s_all_crossed = 0;  // frames since every seat's racer crossed the line (0: not yet)
++// The time limit (Gibax, 2026-11-26: "un timer d'une minute à l'arrivée du premier joueur. A la fin tout
++// le monde finit de force la course"): kNoContest frames after the first seat's racer crossed the line,
++// every seat's racer still in the race retires, at the same frame on every machine (it comes from the
++// racers' own state). The game has the routine: the racers' update calls a handler by the racer's state
++// (+0x1034, table 0x805E1FF8), and state 4 (0x805A7898), in its first step (+0x1037 = 0), puts the
++// racer past the last lap, sets +0xBA8 |= 0xC0000 (crossed the line, retired), gives it the last rank
++// free from the bottom and the time 99'99"99, and counts it. Setting only the crossed bit was tried
++// first: the HUD makes GOAL from the lap count, so that machine had neither GOAL nor results (measured on
++// 2026-11-26). SRNP_FIN_MINUTEUR=<frames> changes the limit (0: none).
++constexpr std::uint64_t kNoContest = 3600;  // 60 s
++std::uint64_t s_first_crossed = 0;          // frames since the first seat's racer crossed the line
+ 
+ void PatchFinish(int seat, int seats)
+ {
+@@ -1191,6 +1286,7 @@ void PatchFinish(int seat, int seats)
+   if (std::uint8_t* flag = Guest(kFinishFlag, 1))
+     *flag = 0;
+   s_all_crossed = 0;
++  s_first_crossed = 0;
+   s_finish_seats = on ? seats : 0;
+   if (on == s_finish_patched)
+     return;
+@@ -1210,7 +1306,8 @@ void PatchFinish(int seat, int seats)
+       0x38840000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(std::max(seat, 0))) & 0xFFFFu),
+       bl(kFinishWords[1].address, kFinishCaveLoop), bl(kFinishWords[2].address, kFinishCaveCheck),
+       0x408200D0u, bl(kFinishWords[4].address, kFinishCaveSeat), bl(kFinishWords[5].address, kFinishCaveSeat),
+-      bl(kFinishWords[6].address, kFinishCaveSeat), bl(kFinishWords[7].address, kFinishCaveSeat)};
++      bl(kFinishWords[6].address, kFinishCaveSeat), bl(kFinishWords[7].address, kFinishCaveSeat),
++      0x48000018u, 0x60000000u};
+   static_assert(std::size(patched) == std::size(kFinishWords));
+   if (on)
+   {
+@@ -1269,9 +1366,37 @@ void UpdateFinishFlag(const std::uint8_t* racers)
+ {
+   if (!s_finish_patched)
+     return;
++  static const std::uint64_t limit = [] {
++    const char* v = std::getenv("SRNP_FIN_MINUTEUR");
++    return v && *v ? static_cast<std::uint64_t>(std::strtoull(v, nullptr, 10)) : kNoContest;
++  }();
++  const auto crossed = [racers](int k) {
++    return (Get32(racers + static_cast<std::size_t>(k) * kRacerSize + 0xBA8) & 0x80000u) != 0;
++  };
++  bool any = false;
++  for (int k = 0; k < s_finish_seats; ++k)
++    any = any || crossed(k);
++  s_first_crossed = any ? s_first_crossed + 1 : 0;
++  if (s_first_crossed == 1)
++    std::fprintf(stderr, "[srnp racers] finish: a first seat has crossed the line, %llu frames left to the others\n",
++                 static_cast<unsigned long long>(limit));
++  if (limit > 0 && s_first_crossed == limit)
++  {
++    for (int k = 0; k < s_finish_seats; ++k)
++    {
++      if (crossed(k))
++        continue;
++      if (std::uint8_t* p = Guest(kRacers + static_cast<std::uint32_t>(k) * kRacerSize, kRacerSize))
++      {
++        p[0x1034] = 4;  // the retire state
++        p[0x1037] = 0;  // its first step
++      }
++      std::fprintf(stderr, "[srnp racers] finish: time is up, seat %d's racer retires\n", k);
++    }
++  }
+   bool all = s_finish_seats > 0;
+   for (int k = 0; k < s_finish_seats; ++k)
+-    all = all && (Get32(racers + static_cast<std::size_t>(k) * kRacerSize + 0xBA8) & 0x80000u) != 0;
++    all = all && crossed(k);
+   const std::uint64_t before = s_all_crossed;
+   s_all_crossed = all ? s_all_crossed + 1 : 0;
+   if (std::uint8_t* flag = Guest(kFinishFlag, 1))
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index 8dd4a3a..b22af46 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -314,6 +314,18 @@ Pad LocalInputOf(std::uint64_t frame, int seat)
+       pad[0] = static_cast<std::uint8_t>(kSeatAI >> 8);
+     return pad;
+   }
++  if (s_relay.input_mode.rfind("ia@", 0) == 0)
++  {
++    // "ia@<n>": no input for the race's first n frames, then the AI drives for good (a player who
++    // starts late; Gibax's test of 2026-11-26: "Wave prend la course" after a while).
++    // Outside races, seat 0 presses Start in the menus, as in "ia".
++    const long long race = RaceFrame();
++    if (race < 0 && seat == 0 && frame % 120 < 5)
++      pad[1] = 0x20;
++    else if (race >= 0 && race >= std::atoll(s_relay.input_mode.c_str() + 3))
++      pad[0] = static_cast<std::uint8_t>(kSeatAI >> 8);
++    return pad;
++  }
+   if (s_relay.input_mode == "course")
+   {
+     // Racing test input: outside races, seat 0 presses Start for 5 frames every 120 (menus);
+-- 
+2.34.1.windows.1
+
