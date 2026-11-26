@@ -69,6 +69,14 @@ lance() {  # lance <siège>
   # son dossier est posé, mais le mod n'est PAS activé (son GTSE est celui du jeu US, il remplacerait celui de TE).
   mkdir -p "$D/userdir/Mods/srnp_etiquettes"
   powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes/files")' -Target '$(w "$W/etiquettes/mods/srnp_etiquettes/files")' | Out-Null"
+  # ETIQ_TE=1 (défaut) : le mod des étiquettes de TE (work/te/etiquettes/mods/srnp_etiquettes_te : le GTSE de TE
+  # et le même bloc), activé : les étiquettes 5P-8P en course.
+  if [[ "${ETIQ_TE:-1}" != 0 ]]; then
+    mkdir -p "$D/userdir/Mods/srnp_etiquettes_te"
+    printf 'name=srnp_etiquettes_te\ngame=GXSRTE\n' > "$D/userdir/Mods/srnp_etiquettes_te/mod.ini"
+    powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$(w "$D/userdir/Mods/srnp_etiquettes_te/files")' -Target '$(w "${ETIQ_TE_DIR:-$W/te/etiquettes/mods/srnp_etiquettes_te/files}")' | Out-Null"
+    printf 'mod=srnp_etiquettes_te\n' >> "$D/userdir/config.ini"
+  fi
   sed -i "s/^\[Core\]\$/[Core]\nEmulationSpeed = 1.0/" "$D/userdir/Config/Dolphin.ini"
   sed -i 's/^\[Interface\]$/[Interface]\nUsePanicHandlers = False/' "$D/userdir/Config/Dolphin.ini"
   if [[ "${ETIQ:-0}" != 0 ]]; then  # ETIQ=0 : sans le mod des étiquettes 5P-8P

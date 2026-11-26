@@ -1,0 +1,387 @@
+From 60cb73293f917c67bd5b38b73ae7ae2a14d71541 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:37:11 +0100
+Subject: [PATCH] Runner: the 5P-8P labels on Tournament Edition, in their
+ characters' colours
+
+The labels' code on TE: its sites and calls translated (srnp_game.hpp), the routine made for the game
+that runs (its calls, the current texture through r13, the tags' entry and table), in free low memory
+on TE (0x80002600-0x80002840: TE's first code section has no zero padding). The results' tags are left
+out on TE (its names texture has another palette).
+
+No GTSE of ours on TE: TE's decompressor refuses compresse_opt.py's stream (its own GTSE recompressed
+by it crashes TE's texture loader; the original file served the same way loads), and with the game's
+encoder (greedy, longest copy 2..255, nearest on ties: it gives TE's GTSE back byte for byte) the
+block makes the file 2.3 KB longer than the disc's, more than the game reads from a save state. The
+runner writes the mod's block (LabelsBlock: read from the srnp_etiquettes folder, left off on TE) at
+the bottom of the main thread's stack (0x805E8000; the stack runs 0x805E7C40-0x8060BC40, ArenaLo,
+and its lowest 110 KB stayed at zero in every TE race dumped).
+
+TE's new characters' labels were black: the labels' colour table is the US game's 17 (TE 0x8035D7D4);
+TE's HUD reads its own table of 23 (0x80372D48). The 1P labels' lookup goes there on TE (lis r3,
+0x8037; slwi; addic r0, r0, 0x2D48: addi would read r0 as 0).
+
+Measured on 2026-11-26: 8 TE runners, the labels 5P-8P on, each character's colour (Metal Sonic blue,
+Blaze purple, Silver silver, Chaos light blue, Super Sonic gold), 48 identical checksums, 0 divergence;
+8 US runners with the labels mod, 56 identical, 0 divergence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_game_textures.cpp |  22 ++++
+ src/runtime/srnp_game_textures.hpp |   5 +
+ src/runtime/srnp_labels.cpp        | 192 ++++++++++++++++++++++++++---
+ 3 files changed, 201 insertions(+), 18 deletions(-)
+
+diff --git a/src/runtime/srnp_game_textures.cpp b/src/runtime/srnp_game_textures.cpp
+index 05e0641..fc243e6 100644
+--- a/src/runtime/srnp_game_textures.cpp
++++ b/src/runtime/srnp_game_textures.cpp
+@@ -332,6 +332,28 @@ GamePicture GameTexture(const std::string& file, int index)
+   return Cached(file, index, [&] { return Decode(File(s_root / "files" / file), index); });
+ }
+ 
++const std::vector<std::uint8_t>& LabelsBlock()
++{
++  // (Its own read: the screens' cache of files belongs to the video thread.) The mod directories are set
++  // at boot, before the first frame.
++  static const std::vector<std::uint8_t> block = [] {
++    for (const std::filesystem::path& dir : s_mod_directories)
++    {
++      std::ifstream in(dir / "srnp_etiquettes" / "files" / "GTSE", std::ios::binary);
++      if (!in)
++        continue;
++      const std::vector<std::uint8_t> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++      const std::vector<std::uint8_t> d = Decompress(raw);
++      static constexpr char kMark[] = "SRNPLBL1";
++      for (std::size_t i = 0; i + 0x20 <= d.size(); i += 4)
++        if (std::memcmp(d.data() + i, kMark, 8) == 0)
++          return std::vector<std::uint8_t>(d.begin() + static_cast<std::ptrdiff_t>(i), d.end());
++    }
++    return std::vector<std::uint8_t>{};
++  }();
++  return block;
++}
++
+ GamePicture LabelsTexture()
+ {
+   return Cached("srnp_etiquettes", 0, [] {
+diff --git a/src/runtime/srnp_game_textures.hpp b/src/runtime/srnp_game_textures.hpp
+index d33b525..5ff04fd 100644
+--- a/src/runtime/srnp_game_textures.hpp
++++ b/src/runtime/srnp_game_textures.hpp
+@@ -35,6 +35,11 @@ void SetModDirectories(const std::vector<std::filesystem::path>& directories);
+ // RGB5A3 colours, then C8 texels). Not ok without the mod.
+ GamePicture LabelsTexture();
+ 
++// The labels mod's block itself ("SRNPLBL1" to the end of its GTSE, decompressed), for the runner to
++// place in the game's memory where the mod's GTSE cannot be loaded (Tournament Edition: srnp_labels.cpp).
++// Read once, on any thread; empty without the mod's folder.
++const std::vector<std::uint8_t>& LabelsBlock();
++
+ // `text` in the font of the game's results names (srnp_labels.hpp: the names' letters read from GTSE's
+ // "GoalResult_01_E", the others from Saira), white with the names' black outline, for ImGui (a tint
+ // colours the white); cached per text. Not ok without the game's GTSE.
+diff --git a/src/runtime/srnp_labels.cpp b/src/runtime/srnp_labels.cpp
+index 9f66ab3..1722731 100644
+--- a/src/runtime/srnp_labels.cpp
++++ b/src/runtime/srnp_labels.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #include "srnp_labels.hpp"
+ #include "srnp_game.hpp"
++#include "srnp_game_textures.hpp"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -121,6 +122,87 @@ constexpr std::array<std::uint32_t, 72> kRoutineCode = {
+ // outline like the labels. Its entry and the UV table live after the routine, in the same padding.
+ constexpr std::uint32_t kTagEntry = 0x80004F00;
+ constexpr std::uint32_t kTagTable = 0x80004F40;  // 8 x 0x18: u0 v0 u1 v1 (floats), width, height (u16)
++
++// Tournament Edition (2026-11-26): the same drawing code (the labels' words identical, the calls to the
++// same functions moved: srnp_game.hpp), the same HUD atlas; no GTSE of ours (the mod's block is put in the
++// game's memory by the runner: OurTexels).
++// TE's first code section has no zero padding: the routine and the tags' entry and table go in free low
++// memory (0x80002600-0x80002840, after the phase 2 caves of seats 5-7; our other caves there run fine in
++// both games). The results' tags are left out there (TE's names texture has another palette).
++bool OnTE()
++{
++  return CurrentGame() == Game::TE;
++}
++std::uint32_t AtlasInGtse()
++{
++  return kAtlasInGtse;
++}
++std::uint32_t GtseSize()
++{
++  return kGtseSize;
++}
++// Tournament Edition: where the runner puts the mod's block (OurTexels).
++constexpr std::uint32_t kTeBlock = 0x805E8000;
++std::uint32_t RoutineAt()
++{
++  return OnTE() ? 0x80002600u : kRoutine;
++}
++std::uint32_t TagEntryAt()
++{
++  return OnTE() ? 0x80002740u : kTagEntry;
++}
++std::uint32_t TagTableAt()
++{
++  return OnTE() ? 0x80002780u : kTagTable;
++}
++std::uint32_t Bl(std::uint32_t from, std::uint32_t to)
++{
++  return 0x48000001u | ((to - from) & 0x03FFFFFCu);
++}
++// The routine for the game that runs, at RoutineAt(): its calls to the game's functions (the quad, the
++// texture's loader and binder) at their places, the current texture read through r13 at its place, the
++// tags' entry and table at theirs. 0 in the first word if a place is missing.
++const std::vector<std::uint32_t>& RoutineCode()
++{
++  static std::vector<std::uint32_t> code;
++  static Game made_for = Game::Other;
++  if (made_for == CurrentGame() && !code.empty())
++    return code;
++  made_for = CurrentGame();
++  code.assign(kRoutineCode.begin(), kRoutineCode.end());
++  const std::uint32_t at = RoutineAt();
++  // r13 (the small data's base): Sonic Riders US 0x802238C0, TE 0x8042DA60 (__init_registers).
++  const std::uint32_t r13 = OnTE() ? 0x8042DA60u : 0x802238C0u;
++  for (std::size_t i = 0; i < code.size(); ++i)
++  {
++    const std::uint32_t w = kRoutineCode[i];
++    const std::uint32_t us_here = kRoutine + 4u * static_cast<std::uint32_t>(i);
++    const std::uint32_t here = at + 4u * static_cast<std::uint32_t>(i);
++    if ((w >> 26) == 18u && (w & 1u))  // bl a function of the game's
++    {
++      std::uint32_t d = w & 0x03FFFFFCu;
++      if (d & 0x02000000u)
++        d |= 0xFC000000u;
++      const std::uint32_t target = At(us_here + d);
++      code[i] = target ? Bl(here, target) : 0;
++      if (!target)
++        code[0] = 0;
++    }
++    else if ((w >> 16) == 0x808Du)  // lwz r4, d(r13): the current texture
++    {
++      const std::uint32_t us_var = 0x802238C0u + static_cast<std::uint32_t>(static_cast<std::int16_t>(w & 0xFFFFu));
++      const std::uint32_t var = At(us_var);
++      code[i] = (w & 0xFFFF0000u) | ((var - r13) & 0xFFFFu);
++      if (!var)
++        code[0] = 0;
++    }
++    else if (w == 0x616B4F40u)  // ori r11, r11, kTagTable
++      code[i] = 0x616B0000u | (TagTableAt() & 0xFFFFu);
++    else if (w == 0x60634F00u)  // ori r3, r3, kTagEntry
++      code[i] = 0x60630000u | (TagEntryAt() & 0xFFFFu);
++  }
++  return code;
++}
+ constexpr std::uint32_t kTagSize = 128;
+ constexpr std::uint32_t kTagHeight = 9;  // 7 + the outline
+ struct Glyph
+@@ -206,7 +288,7 @@ bool InMem1(std::uint32_t address, std::uint32_t size)
+ // The address of our texels, or 0: the loaded GTSE must carry our block.
+ std::uint32_t OurTexels(std::uint32_t* atlas_entry)
+ {
+-  const std::uint32_t list = Read32(kHudTextures);
++  const std::uint32_t list = Read32(At(kHudTextures));
+   if (!InMem1(list, 8))
+     return 0;
+   const std::uint32_t entries = Read32(list + 4);
+@@ -216,7 +298,22 @@ std::uint32_t OurTexels(std::uint32_t* atlas_entry)
+   if (Read32(atlas + 0x18) != kAtlasImage0)
+     return 0;
+   const std::uint32_t texels = 0x80000000u | (Read32(atlas + 0x1C) << 5);
+-  const std::uint32_t block = texels - kAtlasInGtse + kGtseSize;
++  std::uint32_t block = texels - AtlasInGtse() + GtseSize();
++  if (OnTE())
++  {
++    // Tournament Edition: a GTSE of ours does not load there (TE's decompressor refuses our compressor's
++    // stream, and with the game's own encoder the block makes it 2.3 KB longer than the disc's, more than
++    // the game reads from a save state; measured on 2026-11-26). The runner writes the mod's block itself at
++    // the bottom of the main thread's stack: 0x805E7C40 (the BSS' end) - 0x8060BC40 (ArenaLo), whose lowest
++    // 110 KB stayed at zero through every race dumped (its deepest use: 36 KB from the top).
++    block = kTeBlock;
++    const std::vector<std::uint8_t>& mod = LabelsBlock();
++    std::uint8_t* p = Guest(block, kBlockSize);
++    if (mod.size() < kBlockSize || !p)
++      return 0;
++    if (std::memcmp(p, mod.data(), 0x220 + 0x2000) != 0)  // the header, the palette, 5P-8P
++      std::memcpy(p, mod.data(), kBlockSize);
++  }
+   if (!InMem1(block, kBlockSize))
+     return 0;
+   const std::uint8_t* h = Guest(block, 0x20);
+@@ -250,7 +347,7 @@ void WriteEntry(std::uint32_t atlas, std::uint32_t texels)
+ bool WriteTable()
+ {
+   std::uint8_t* t = Guest(kTable, 16 * 16);
+-  const std::uint8_t* game = Guest(kGameLabels, 5 * 16);
++  const std::uint8_t* game = Guest(At(kGameLabels), 5 * 16);
+   if (!t || !game || Get32(game + 8) != 36)
+     return false;
+   for (std::uint32_t i = 0; i < 16; ++i)
+@@ -271,7 +368,7 @@ bool WriteTable()
+ 
+ // The tags' entry (or the results' tags', at `entry`): the atlas' entry with a 128x128 C4 texture (its
+ // 16-word RGB5A3 palette just before the texels, where the game's loader looks for it).
+-void WriteTagEntry(std::uint32_t atlas, std::uint32_t texels, std::uint32_t entry = kTagEntry)
++void WriteTagEntry(std::uint32_t atlas, std::uint32_t texels, std::uint32_t entry = TagEntryAt())
+ {
+   std::uint8_t* out = Guest(entry, kEntrySize);
+   const std::uint8_t* in = Guest(atlas, kEntrySize);
+@@ -388,7 +485,7 @@ void RenderTags(std::array<std::uint8_t, kTagSize * kTagSize / 2>* texels, std::
+ // texels (u16), the size of the quad on screen; width 0: no tag.
+ void WriteTagTable(const std::array<int, 8>& widths)
+ {
+-  std::uint8_t* t = Guest(kTagTable, 8 * 0x18);
++  std::uint8_t* t = Guest(TagTableAt(), 8 * 0x18);
+   if (!t)
+     return;
+   auto put_float = [](std::uint8_t* p, float f) {
+@@ -812,23 +909,41 @@ unsigned Mask()
+     const char* v = std::getenv("SRNP_ETIQUETTES_MASQUE");
+     return v && *v ? static_cast<unsigned>(std::strtoul(v, nullptr, 16)) : 0x1Fu;
+   }();
+-  return mask;
++  return OnTE() ? mask & 0x0Fu : mask;  // (TE: the results' tags left out)
+ }
+-const std::array<std::uint32_t, 6>& Words(std::size_t i, bool ours)
++// A patch's words in the game that runs: the rectangles' words are the same in TE; a call goes to its
++// function's place there (the game's), or to the routine's (ours).
++std::array<std::uint32_t, 6> Words(std::size_t i, bool ours)
+ {
+-  return ours && ((Mask() >> i) & 1u) ? kPatches[i].ours : kPatches[i].game;
++  const Patch& p = kPatches[i];
++  const bool mine = ours && ((Mask() >> i) & 1u);
++  std::array<std::uint32_t, 6> w = mine ? p.ours : p.game;
++  if (CurrentGame() == Game::Riders || p.n != 1)
++    return w;
++  const std::uint32_t at = At(p.address);
++  if (mine)
++    w[0] = i == 4 ? 0 : Bl(at, RoutineAt());
++  else
++    w[0] = InGame(p.address, p.game[0], p.game[0], p.game[0]);
++  return w;
+ }
+ bool AllHold(bool ours)
+ {
+   for (std::size_t i = 0; i < kPatches.size(); ++i)
+-    if (!Holds(kPatches[i].address, Words(i, ours).data(), kPatches[i].n))
++  {
++    if (OnTE() && i == 4)  // the results' (left out on TE)
++      continue;
++    const std::uint32_t at = At(kPatches[i].address);
++    if (at == 0 || !Holds(at, Words(i, ours).data(), kPatches[i].n))
+       return false;
++  }
+   return true;
+ }
+ void WriteAll(bool ours)
+ {
+   for (std::size_t i = 0; i < kPatches.size(); ++i)
+-    WriteWords(kPatches[i].address, Words(i, ours).data(), kPatches[i].n);
++    if (const std::uint32_t at = OnTE() && i == 4 ? 0 : At(kPatches[i].address))
++      WriteWords(at, Words(i, ours).data(), kPatches[i].n);
+ }
+ }  // namespace
+ 
+@@ -893,10 +1008,46 @@ void SetSeatTag(int seat, const std::string& text)
+   std::fprintf(stderr, "[srnp labels] seat %d's tag: %s (from the relay)\n", seat, tag.c_str());
+ }
+ 
++// Tournament Edition: the labels' colour, by the racer's character (+0xBA), comes from the US game's table
++// of 17 (0x805BE500, TE 0x8035D7D4), so TE's new characters (17-22) read what follows it: black labels
++// (2026-11-26). TE's own table of 23, the one its HUD reads, is at 0x80372D48 (Silver EBEBEB, Metal Sonic
++// 1239B8, Emerl BD9322, Blaze AC7FF5, Chaos 5ECFFF, Tikal FF8138). The 1P labels' lookup goes there:
++// addi r3, r22, 0 -> lis r3, 0x8037; extsb r0, r0 -> slwi r0, r0, 2 (a character is under 128);
++// slwi r0, r0, 2 -> addic r0, r0, 0x2D48 (addi would read r0 as 0; the carry is not read after); then
++// lwzx r0, r3, r0 reads 0x80372D48 + 4 x character.
++void TeLabelColours()
++{
++  struct Word
++  {
++    std::uint32_t us, original, ours;
++  };
++  static constexpr Word kWords[] = {
++      {0x8042F708, 0x38760000, 0x3C608037}, {0x8042F728, 0x7C000774, 0x5400103A}, {0x8042F734, 0x5400103A, 0x30002D48}};
++  static bool told = false;
++  bool ours = true, game = true;
++  for (const Word& w : kWords)
++  {
++    const std::uint32_t now = Read32(At(w.us));
++    ours = ours && now == w.ours;
++    game = game && now == w.original;
++  }
++  if (ours)
++    return;
++  if (!game)
++  {
++    if (!told)
++      std::fprintf(stderr, "[srnp labels] labels' colours: not TE's code here, left alone\n");
++    told = true;
++    return;
++  }
++  for (const Word& w : kWords)
++    WriteWords(At(w.us), &w.ours, 1);
++  std::fprintf(stderr, "[srnp labels] labels' colours from TE's table of 23 characters\n");
++}
++
+ void LabelsOnFrame()
+ {
+-  // The labels' code and caves are Sonic Riders US's (Tournament Edition: not carried over yet).
+-  if (CurrentGame() != Game::Riders)
++  if (CurrentGame() == Game::Other)
+     return;
+   static const bool off = [] {
+     const char* v = std::getenv("SRNP_ETIQUETTES");
+@@ -904,6 +1055,8 @@ void LabelsOnFrame()
+   }();
+   if (off)
+     return;
++  if (CurrentGame() == Game::TE)
++    TeLabelColours();
+   std::uint32_t atlas = 0;
+   const std::uint32_t texels = OurTexels(&atlas);
+   const bool ours = AllHold(true);
+@@ -918,9 +1071,12 @@ void LabelsOnFrame()
+     return;
+   }
+   // The low memory (a save state brings back its own) and the entry (the file moves with each load).
+-  if (!Holds(kRoutine, kRoutineCode.data(), kRoutineCode.size()))
+-    WriteWords(kRoutine, kRoutineCode.data(), kRoutineCode.size());
+-  if (!Holds(kResults, kResultsCode.data(), kResultsCode.size()))
++  const std::vector<std::uint32_t>& routine = RoutineCode();
++  if (routine.empty() || routine[0] == 0)
++    return;  // a place missing in this game
++  if (!Holds(RoutineAt(), routine.data(), routine.size()))
++    WriteWords(RoutineAt(), routine.data(), routine.size());
++  if (!OnTE() && !Holds(kResults, kResultsCode.data(), kResultsCode.size()))
+     WriteWords(kResults, kResultsCode.data(), kResultsCode.size());
+   if (Read32(kTable + 0x40 + 12) != 30 * 8 && !WriteTable())
+     return;
+@@ -952,7 +1108,7 @@ void LabelsOnFrame()
+       WriteTagTable(tag_widths);
+       std::fprintf(stderr, "[srnp labels] players' tags written at 0x%08X\n", tags);
+     }
+-    else if (Read32(kTagEntry + 0x1C) != ((tags & 0x01FFFFFFu) >> 5))
++    else if (Read32(TagEntryAt() + 0x1C) != ((tags & 0x01FFFFFFu) >> 5))
+     {
+       WriteTagEntry(atlas, tags);
+       WriteTagTable(tag_widths);
+@@ -963,8 +1119,8 @@ void LabelsOnFrame()
+   static std::array<std::uint8_t, kTagSize * kTagSize / 2> res_texels{};
+   static std::array<std::uint16_t, 16> res_palette{};
+   static std::array<int, 8> res_flags{};
+-  const std::uint32_t gtse = texels - 0x220 - kGtseSize;
+-  if (!res_built)
++  const std::uint32_t gtse = texels - 0x220 - GtseSize();
++  if (!res_built && !OnTE())
+   {
+     res_built = BuildResults(gtse, &res_texels, &res_palette, &res_flags);
+     if (res_built)
+-- 
+2.34.1.windows.1
+
