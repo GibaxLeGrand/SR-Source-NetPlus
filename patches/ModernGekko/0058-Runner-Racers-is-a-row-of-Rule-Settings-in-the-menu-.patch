@@ -1,0 +1,353 @@
+From 6f67cd505e704d5df637cb1b4c94e298510320a3 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:00:36 +0100
+Subject: [PATCH] Runner: "Racers" is a row of Rule Settings, in the menu's own
+ pictures
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gibax (2026-11-26): "bouger le bouton default à côté de CONTINUE, pour
+déplacer les options et pouvoir scroll dessus comme les autres"; "prendre
+le même font que les options du menu et pareil pour le nombre"; "aligne
+verticalement le choix du racers avec les autres options en colonne";
+"enlève L et R vu que c'est une option gauche droite".
+
+Rule Settings (the task 0x805A6660; its input 0x805A68C4) moves its cursor
+over its entries (+31 of its data: six rows, Default, CONTINUE), changes a
+row with left/right under entries - 2, writes the rows at CONTINUE (entries
+- 1) and resets them at Default (entries - 2); the highlights follow the
+same counts (0x805A74DC, 0x805A759C). While the Free Race menu (kind 0)
+shows:
+- nine entries: "Racers" at 6, Default 7, CONTINUE 8; four words keep the
+  game's rows at six (0x805A699C, 0x805A6A00: left/right; 0x805A6A78:
+  CONTINUE's loop; 0x805A6C30: Default's loop), put back when it closes;
+- the runner changes the racers with left/right on entry 6 (D-pad or
+  stick), Default sets them back to 8;
+- Default's 2D object (the pool at [0x80682EF8], 192-byte objects, the
+  element's function at +48, a 3x4 matrix at its head) moves by x -130,
+  y +29: beside CONTINUE;
+- the row is drawn with TSGME's pictures: the plate (texture 29), the word
+  put together from the rules' words (texture 28: R, e, r of "Retire", a, s
+  of "Laps", c of "Announce"), the digits in the values' column, the arrows
+  (texture 30); selected or not as the game's rows (colours sampled).
+
+Measured alone: the row reached with the cursor, 8 down to 5, CONTINUE
+keeps the game's rules (laps, Announce, Level, Item, Air pit, Air Lost) and
+the 5, a race of 5 racers; Default back to 8.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_relay.cpp          | 130 +++++++++++++++++++++++++---
+ src/runtime/srnp_relay.hpp          |   1 +
+ src/runtime/srnp_waiting_screen.cpp |  94 +++++++++++++-------
+ 3 files changed, 183 insertions(+), 42 deletions(-)
+
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index bdf9efc..f19cbc5 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -47,6 +47,7 @@
+ #include "Core/HW/DSP.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/State.h"
++#include "Core/PowerPC/JitInterface.h"
+ #include "Core/System.h"
+ #include "Core/HW/GCPad.h"
+ #include "InputCommon/ControllerInterface/ControllerInterface.h"
+@@ -1246,36 +1247,124 @@ std::uint32_t FindMenuTask()
+ 
+ // The racers on Rule Settings (Gibax, 2026-11-26: "on est capable de choisir le nombre de racers par
+ // course, faudrait ajouter cette option au jeu normal (même endroit qu'on ajuste les laps) in game, pour
+-// du offline aussi"). The menus' task 0x8050EDB8 (its data at [task + 16]) is in its state 22 on Track
+-// Select and Rule Settings; its data's +156 is 2 on Rule Settings (4 on Track Select), +158 the cursor
+-// (RAM dumps of 2026-11-26). There a row "Racers" is drawn under Air Lost (DrawRulesRow); L and R, which
+-// that menu leaves alone (measured), change it, 1 to 8 (8: the game's). The host's choice goes to the
+-// relay with the course and laps (SendRules); alone, OfflineRacersFrame writes it into the race.
++// du offline aussi"; then: Default beside CONTINUE, the row reached with the cursor like the others, in
++// the menu's own font, its value in their column). Rule Settings is the task 0x805A6660 (made by Track
++// Select, 0x80534AC4): its data ([task + 16]) has the rows' masks in the rules word (+0, six words), the
++// menu's kind (+29: 0 for Free Race), the cursor (+30), the entries (+31: eight, the six rows, Default,
++// CONTINUE), the values (+32), maxima (+38), minima (+44); its input (0x805A68C4) moves the cursor over
++// the entries, changes a row's value with left/right when the cursor is under entries - 2, writes the
++// rows into the rules word on A at CONTINUE (entries - 1) and resets them on A at Default (entries - 2).
++// The elements' highlights follow entries - 1 and - 2 too (0x805A74DC, 0x805A759C). Here, while the Free
++// Race menu shows: nine entries (the row "Racers" at 6, Default 7, CONTINUE 8); the game's rows stay
++// six (four words: left, right, CONTINUE's and Default's loops count entries - 3); the runner changes
++// the racers with left/right on entry 6; Default's element (its 2D object, 0x805A759C: a 3x4 matrix at
++// its head, x at +12, y at +28) moves beside CONTINUE; the row is drawn with the menu's own pictures
++// (DrawRulesRow). The host's choice goes to the relay with the course and laps (SendRules); alone,
++// OfflineRacersFrame writes it into the race.
+ std::atomic<int> s_rules_row{-1};  // the count shown on Rule Settings (-1: not there)
++std::atomic<bool> s_rules_selected{false};
++struct RulesWord
++{
++  std::uint32_t address, original, patched;
++};
++constexpr RulesWord kRulesWords[] = {
++    {0x805A699C, 0x3803FFFE, 0x3803FFFD},  // addi r0, r3, -2 (left: a row) -> -3
++    {0x805A6A00, 0x3803FFFE, 0x3803FFFD},  // addi r0, r3, -2 (right: a row) -> -3
++    {0x805A6A78, 0x3804FFFE, 0x3804FFFD},  // addi r0, r4, -2 (CONTINUE: the rows written) -> -3
++    {0x805A6C30, 0x5405063E, 0x30A0FFFF},  // rlwinm r5, r0, 0, 24, 31 (Default: the rows reset) -> addic r5, r0, -1
++};
++bool s_rules_patched = false;
++
++void PatchRulesMenu(bool on)
++{
++  if (on == s_rules_patched)
++    return;
++  for (const RulesWord& w : kRulesWords)
++    if (GuestWord(w.address) != (on ? w.original : w.patched))
++    {
++      static bool told = false;
++      if (!told)
++        std::fprintf(stderr, "[srnp relay] Rule Settings: 0x%08X holds %08X: left alone\n", w.address,
++                     GuestWord(w.address));
++      told = true;
++      return;
++    }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  for (const RulesWord& w : kRulesWords)
++  {
++    if (std::uint8_t* p = GuestByte(w.address))
++    {
++      const std::uint32_t v = on ? w.patched : w.original;
++      p[0] = static_cast<std::uint8_t>(v >> 24);
++      p[1] = static_cast<std::uint8_t>(v >> 16);
++      p[2] = static_cast<std::uint8_t>(v >> 8);
++      p[3] = static_cast<std::uint8_t>(v);
++    }
++    jit.InvalidateICache(w.address, 4, true);
++  }
++  s_rules_patched = on;
++  std::fprintf(stderr, "[srnp relay] Rule Settings: %s\n", on ? "the racers' row (nine entries)" : "the game's");
++}
++
++// Default beside CONTINUE: its 2D object (the pool at [0x80682EF8], 128 objects of 192 bytes, the
++// element's function at +48) moved by its matrix (measured: x -130, y +29 puts it left of CONTINUE).
++void MoveDefault()
++{
++  const std::uint32_t pool = GuestWord(0x80682EF8u);
++  if (pool < 0x80000000u)
++    return;
++  for (std::uint32_t k = 0; k < 128; ++k)
++  {
++    const std::uint32_t object = pool + 192 * k;
++    if (GuestWord(object + 48) != 0x805A759Cu)
++      continue;
++    if (std::uint8_t* m = GuestByte(object))
++    {
++      constexpr std::uint32_t kX = 0xC3020000u, kY = 0x41E80000u;  // -130.0f, 29.0f
++      for (const auto& [offset, value] : {std::pair{12u, kX}, std::pair{28u, kY}})
++      {
++        m[offset] = static_cast<std::uint8_t>(value >> 24);
++        m[offset + 1] = static_cast<std::uint8_t>(value >> 16);
++        m[offset + 2] = static_cast<std::uint8_t>(value >> 8);
++        m[offset + 3] = static_cast<std::uint8_t>(value);
++      }
++    }
++    return;
++  }
++}
+ 
+ void RulesMenuOnFrame()
+ {
+   static std::uint32_t task = 0;
+-  if (task == 0 || GuestWord(task) != 0x8050EDB8u)
+-    task = FindTask(0x8050EDB8u);
++  if (task == 0 || GuestWord(task) != 0x805A6660u)
++    task = FindTask(0x805A6660u);
+   const std::uint8_t* t = task ? GuestByte(task) : nullptr;
+   const std::uint32_t data = task ? GuestWord(task + 16) : 0;
+-  const std::uint8_t* d = data >= 0x80000000u ? GuestByte(data) : nullptr;
+-  if (!t || t[20] != 22 || !d || d[156] != 2)
++  std::uint8_t* d = data >= 0x80000000u ? GuestByte(data) : nullptr;
++  const bool shown = t && t[20] == 3 && d && d[29] == 0 && (d[31] == 8 || d[31] == 9);
++  if (!shown)
+   {
++    PatchRulesMenu(false);
+     s_rules_row = -1;
+     return;
+   }
++  PatchRulesMenu(true);
++  if (!s_rules_patched)
++    return;
++  if (d[31] == 8)
++    d[31] = 9;
++  MoveDefault();
++  const int cursor = static_cast<std::int8_t>(d[30]);
+   static int held = 0;
+   const GCPadStatus s = ::Pad::GetStatus(0);
+-  const bool l = (s.button & 0x0040) != 0 || s.triggerLeft > 170;
+-  const bool r = (s.button & 0x0020) != 0 || s.triggerRight > 170;
+-  if (l != r)
++  const bool left = cursor == 6 && ((s.button & 0x0001) != 0 || s.stickX < 128 - 60);
++  const bool right = cursor == 6 && ((s.button & 0x0002) != 0 || s.stickX > 128 + 60);
++  if (left != right)
+   {
+     // A press, then again every 6 frames once held for 20.
+     if (held == 0 || (held > 20 && held % 6 == 0))
+     {
+-      const int v = std::clamp(MenuRacers() + (r ? 1 : -1), 1, 8);
++      const int v = std::clamp(MenuRacers() + (right ? 1 : -1), 1, 8);
+       if (v != MenuRacers())
+       {
+         SetNbRacers(v);
+@@ -1286,6 +1375,16 @@ void RulesMenuOnFrame()
+   }
+   else
+     held = 0;
++  // A on Default (entry 7) resets the game's rows: the racers too (8, the game's).
++  static bool a_before = false;
++  const bool a = (s.button & 0x0100) != 0;
++  if (a && !a_before && cursor == 7 && MenuRacers() != 8)
++  {
++    SetNbRacers(8);
++    std::fprintf(stderr, "[srnp relay] Rule Settings: Default, 8 racers\n");
++  }
++  a_before = a;
++  s_rules_selected = cursor == 6;
+   s_rules_row = MenuRacers();
+ }
+ 
+@@ -1691,4 +1790,9 @@ int RulesRowRacers()
+ {
+   return s_rules_row.load();
+ }
++
++bool RulesRowSelected()
++{
++  return s_rules_selected.load();
++}
+ }  // namespace srnp
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index b82eb72..15481df 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -68,6 +68,7 @@ void WaitingVeilOnPresent();
+ // The racers chosen on the game's Rule Settings while it shows (-1 otherwise): the row drawn under Air
+ // Lost, changed with L and R (online and alone).
+ int RulesRowRacers();
++bool RulesRowSelected();  // the cursor is on that row
+ 
+ // Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
+ // Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index c931028..44958cf 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -432,38 +432,74 @@ void Draw(const WaitView& view)
+ }
+ }  // namespace
+ 
+-// The "Racers" row of Rule Settings (srnp_relay.cpp, RulesMenuOnFrame): under Air Lost, as the game's
+-// rows (measured on its screen, 2026-11-26: labels from 22.7 % to 41.8 % of the width, rows every 6.66 %
+-// of the height from 25.4 %; Default and CONTINUE at the right from 65.6 %): the label's plate, the
+-// count between two arrows (left of Default), and L and R beside the arrows.
+-void DrawRulesRow(int racers)
++// The "Racers" row of Rule Settings (srnp_relay.cpp, RulesMenuOnFrame), drawn as the game draws its rows,
++// with the menu's own pictures (TSGME's textures 28: the rules' words and digits, white with a black
++// outline; 29: the row's plate; 30: the arrow), one row under Air Lost, its value in the values' column.
++// Measured on the game's screen (640 x 480 units, 2026-11-26): the plates from x 143 to 266, one row every
++// 32.2 from Total Laps at y 122.7 (Air Lost 283.7: this row 315.9), the words from x 147.7, the laps'
++// digits centred at x 412.2 and 440.4, the arrows from 360.9 to 376.6 and 493.8 to 509.6; the pictures
++// near their size. Selected (the cursor on the row): the plate bright, the letters white, the arrows
++// white; else the plate dim, the letters dark grey (their outline black), the arrows grey (the colours sampled from the game's).
++// "Racers" is put together from the words' letters: R, e and r of "Retire", a and s of "Laps", c of
++// "Announce" (each letter's white core and 2 texels of outline).
++void DrawRulesRow(int racers, bool selected)
+ {
+   ImDrawList* list = ImGui::GetForegroundDrawList();
+-  ImFont* font = ImGui::GetFont();
+   const ImVec2 display = ImGui::GetIO().DisplaySize;
+-  if (!list || !font || display.x <= 0.0f || display.y <= 0.0f)
++  const GamePicture words = GameTexture(kMenus, 28), plate = GameTexture(kMenus, 29), arrow = GameTexture(kMenus, 30);
++  if (!list || display.x <= 0.0f || display.y <= 0.0f || !words.ok || !plate.ok || !arrow.ok)
+     return;
+-  const float y = display.y * 0.653f, h = display.y * 0.052f;
+-  const ImVec2 a(display.x * 0.2266f, y - h * 0.5f), b(display.x * 0.4178f, y + h * 0.5f);
+-  list->AddRectFilled(ImVec2(a.x + 3, a.y + 3), ImVec2(b.x + 3, b.y + 3), Rgba(10, 12, 40, 0.6f), h * 0.12f);
+-  list->AddRectFilled(a, b, Rgba(122, 128, 196), h * 0.12f);
+-  list->AddRectFilled(a, ImVec2(b.x, a.y + h * 0.35f), Rgba(160, 166, 222), h * 0.12f);
+-  list->AddRect(a, b, Rgba(28, 30, 70), h * 0.12f, 0, std::max(2.0f, h * 0.05f));
+-  const ImVec2 label(a.x + (b.x - a.x) * 0.5f, y);
+-  if (!NameTextCentred(list, "Racers", label, h * 0.78f, Rgba(40, 42, 76), (b.x - a.x) * 0.9f))
+-    TextCentred(list, font, h * 0.7f, label, Rgba(40, 42, 76), "Racers");
+-  char count[8];
+-  std::snprintf(count, sizeof(count), "%02d", racers);
+-  const ImVec2 value(display.x * 0.530f, y);
+-  if (!NameTextCentred(list, count, value, h * 0.9f, IM_COL32_WHITE))
+-    TextCentred(list, font, h * 0.8f, value, IM_COL32_WHITE, count);
+-  const float s = h * 0.36f;
+-  const ImU32 arrow = Rgba(176, 182, 212);
+-  const float lx = display.x * 0.466f, rx = display.x * 0.594f;
+-  list->AddTriangleFilled(ImVec2(lx - s, y), ImVec2(lx + s * 0.8f, y - s), ImVec2(lx + s * 0.8f, y + s), arrow);
+-  list->AddTriangleFilled(ImVec2(rx + s, y), ImVec2(rx - s * 0.8f, y - s), ImVec2(rx - s * 0.8f, y + s), arrow);
+-  TextCentred(list, font, h * 0.42f, ImVec2(lx - s * 2.4f, y), Rgba(255, 214, 64), "L");
+-  TextCentred(list, font, h * 0.42f, ImVec2(rx + s * 2.4f, y), Rgba(255, 214, 64), "R");
++  const float sx = display.x / 640.0f, sy = display.y / 480.0f;
++  const auto at = [&](float x, float y) { return ImVec2(x * sx, y * sy); };
++  // A picture's texels (x0, y0)-(x1, y1) drawn over the game's units (gx, gy) at scale k.
++  const auto part = [&](const GamePicture& p, float x0, float y0, float x1, float y1, float gx, float gy, float w,
++                        float h, ImU32 tint, bool mirror = false) {
++    ImVec2 uv0(x0 / p.width, y0 / p.height), uv1(x1 / p.width, y1 / p.height);
++    if (mirror)
++      std::swap(uv0.x, uv1.x);
++    list->AddImage(p.texture, at(gx, gy), at(gx + w, gy + h), uv0, uv1, tint);
++  };
++  constexpr float kRowY = 315.9f;
++  // The plate.
++  part(plate, 2, 34, 162, 63, 143.2f, kRowY - 12.6f, 125.8f, 25.2f,
++       selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(120, 124, 150, 255));
++  // "Racers": the letters' texels in texture 28 (core +- 2), laid out as the game's words are (2 texels
++  // between cores).
++  struct Letter
++  {
++    float x0, x1, y0, y1;
++  };
++  static constexpr Letter kLetters[] = {
++      {366, 385, 78, 99},  // R (Retire)
++      {358, 372, 4, 24},   // a (Laps)
++      {204, 219, 54, 74},  // c (Announce)
++      {383, 399, 78, 99},  // e (Retire)
++      {414, 427, 78, 99},  // r (Retire)
++      {383, 397, 4, 24},   // s (Laps)
++  };
++  const ImU32 ink = selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(44, 44, 54, 255);
++  float x = 147.7f;
++  for (const Letter& l : kLetters)
++  {
++    const float w = l.x1 - l.x0, h = l.y1 - l.y0;
++    part(words, l.x0, l.y0, l.x1, l.y1, x, kRowY - h * 0.5f, w, h, ink);
++    x += w - 4.0f + 2.0f;  // the next core 2 texels after this one's
++  }
++  // The value: two digits of texture 28 (0-9 side by side, x 2..200, y 78..99), in the laps' places.
++  static constexpr float kDigits[10][2] = {{2, 20},    {24, 35},   {42, 60},   {62, 80},   {81, 100},
++                                           {102, 120}, {122, 140}, {143, 160}, {162, 180}, {183, 200}};
++  const int digits[2] = {std::clamp(racers, 0, 99) / 10, std::clamp(racers, 0, 99) % 10};
++  for (int k = 0; k < 2; ++k)
++  {
++    const float* d = kDigits[digits[k]];
++    const float w = d[1] - d[0] + 2.0f, h = 21.0f;
++    const float centre = k == 0 ? 412.2f : 440.4f;
++    part(words, d[0] - 1.0f, 78, d[1] + 1.0f, 99, centre - w * 0.5f, kRowY - h * 0.5f, w, h, IM_COL32_WHITE);
++  }
++  // The arrows (texture 30: the triangle at (4, 69)-(20, 86), pointing right).
++  const ImU32 tip = selected ? IM_COL32(253, 253, 253, 255) : IM_COL32(99, 99, 99, 255);
++  part(arrow, 4, 69, 20, 86, 360.9f, kRowY - 8.5f, 15.7f, 17.0f, tip, true);
++  part(arrow, 4, 69, 20, 86, 493.8f, kRowY - 8.5f, 15.8f, 17.0f, tip);
+ }
+ 
+ void WaitingVeilOnPresent()
+@@ -473,7 +509,7 @@ void WaitingVeilOnPresent()
+   if (view.veil && !view.waiting)
+     Draw(view);
+   else if (const int racers = RulesRowRacers(); racers > 0)
+-    DrawRulesRow(racers);
++    DrawRulesRow(racers, RulesRowSelected());
+ }
+ 
+ void RedrawWhileWaiting()
+-- 
+2.34.1.windows.1
+
