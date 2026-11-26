@@ -20,7 +20,7 @@ prepare() {  # prepare <pc> <tag>
   local U="$RUN/$1/sr-source"
   mkdir -p "$U/Logs" "$U/Mods"
   cp -a "$W/userdir_modele/Config" "$U/Config"
-  sed -e 's/^music_volume=.*/music_volume=0/' -e 's/^check_for_updates=.*/check_for_updates=false/' \
+  sed -e 's/^music_volume=.*/music_volume=0/' -e 's/^game_volume=.*/game_volume=0/' -e 's/^check_for_updates=.*/check_for_updates=false/' \
       "$W/userdir_modele/config.ini" > "$U/config.ini"
   w "$W/games/GXEE8P" > "$U/default-game.txt"
   printf 'tag=%s\naddress=127.0.0.1:%s\nport=%s\nstart_state=%s\n' "$2" "$PORT" "$PORT" "$(w "$STATE")" > "$U/online.ini"
