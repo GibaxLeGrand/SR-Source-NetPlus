@@ -1,0 +1,155 @@
+From 4c77aa11cae500c6204b5b4ddd15e7c45834e7aa Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:15:46 +0100
+Subject: [PATCH] Runner: the Racers row lined up with the game's rows; the
+ waiting card is the whole banner
+
+The Racers row of Rule Settings, measured against Air pit and Air Lost: the value and arrows centred
+32.1 under Air Lost's, the plate as the game's plates one row apart (302.8 to 327.2 on a capture, the
+game's 302.9 to 327.1), the letters all from words of the rows' size (R of Retire brought to 13 texels,
+e of Level, r of Air), drawn 0.97 x 0.88 a texel as the game's words, the digits as the laps' digits.
+
+The waiting screen's card: texture 116 is the left half of a wide banner; stretched whole it showed a
+cut edge (Gibax: "le background bizarre ... y'a pas mieux ?"). It is now the half and its mirror,
+turned upright: rounded at the top and the bottom.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_waiting_screen.cpp | 84 +++++++++++++++++++----------
+ 1 file changed, 57 insertions(+), 27 deletions(-)
+
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 44958cf..c78b738 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -278,9 +278,21 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+     const float x = column * static_cast<float>(k + 1);
+     const float top = display.y * 0.30f;
+     const ImVec2 a(x - card_w * 0.5f, top), b(x + card_w * 0.5f, top + card_h);
+-    // The card: the menus' panel, tinted as the game tints it (lighter for this machine's seat).
++    // The card: the menus' panel, tinted as the game tints it (lighter for this machine's seat). Texture
++    // 116 is the left half of a wide banner (its rounded end, then up to the middle; the game draws the
++    // other half mirrored): stretched whole into a card it showed a cut edge (Gibax, 2026-11-26: "le
++    // background bizarre ... y'a pas mieux ?"). Here the whole banner, the half then its mirror, turned
++    // upright: rounded at the top and at the bottom, the same on both sides.
+     if (panel.ok)
+-      Picture(list, panel, a, b, ImVec2(0, 0), ImVec2(1, 1), mine ? Rgba(190, 225, 255, 0.95f) : Rgba(150, 190, 245, 0.75f));
++    {
++      const ImU32 tint = mine ? Rgba(190, 225, 255, 0.95f) : Rgba(150, 190, 245, 0.75f);
++      constexpr float v0 = 4.0f / 256.0f, v1 = 186.0f / 256.0f;  // the banner's rows in the texture
++      const float mid = (a.y + b.y) * 0.5f;
++      list->AddImageQuad(panel.texture, ImVec2(a.x, a.y), ImVec2(b.x, a.y), ImVec2(b.x, mid), ImVec2(a.x, mid),
++                         ImVec2(0, v0), ImVec2(0, v1), ImVec2(1, v1), ImVec2(1, v0), tint);
++      list->AddImageQuad(panel.texture, ImVec2(a.x, mid), ImVec2(b.x, mid), ImVec2(b.x, b.y), ImVec2(a.x, b.y),
++                         ImVec2(1, v0), ImVec2(1, v1), ImVec2(0, v1), ImVec2(0, v0), tint);
++    }
+     else
+       list->AddRectFilled(a, b, Rgba(60, 120, 210, 0.8f), unit * 0.3f);
+     GameLabel(list, font, ImVec2(x, top + card_h * 0.14f), unit, k, s == 'X');
+@@ -436,12 +448,11 @@ void Draw(const WaitView& view)
+ // with the menu's own pictures (TSGME's textures 28: the rules' words and digits, white with a black
+ // outline; 29: the row's plate; 30: the arrow), one row under Air Lost, its value in the values' column.
+ // Measured on the game's screen (640 x 480 units, 2026-11-26): the plates from x 143 to 266, one row every
+-// 32.2 from Total Laps at y 122.7 (Air Lost 283.7: this row 315.9), the words from x 147.7, the laps'
+-// digits centred at x 412.2 and 440.4, the arrows from 360.9 to 376.6 and 493.8 to 509.6; the pictures
+-// near their size. Selected (the cursor on the row): the plate bright, the letters white, the arrows
++// 32.1 (the numbers below), the words from x 147.7, the laps' digits centred at x 412.2 and 440.4, the
++// arrows as Air pit's. Checked on a capture: this plate 302.8 to 327.2 (the game's next row: 302.9 to
++// 327.1). Selected (the cursor on the row): the plate bright, the letters white, the arrows
+ // white; else the plate dim, the letters dark grey (their outline black), the arrows grey (the colours sampled from the game's).
+-// "Racers" is put together from the words' letters: R, e and r of "Retire", a and s of "Laps", c of
+-// "Announce" (each letter's white core and 2 texels of outline).
++// "Racers" is put together from the rows' letters (below).
+ void DrawRulesRow(int racers, bool selected)
+ {
+   ImDrawList* list = ImGui::GetForegroundDrawList();
+@@ -459,47 +470,66 @@ void DrawRulesRow(int racers, bool selected)
+       std::swap(uv0.x, uv1.x);
+     list->AddImage(p.texture, at(gx, gy), at(gx + w, gy + h), uv0, uv1, tint);
+   };
+-  constexpr float kRowY = 315.9f;
++  // Measured against Air pit and Air Lost (2026-11-26, the game's units): the values and arrows centred
++  // 32.1 apart (Air Lost's at 280.0: this row's 312.1), the plates 2.9 lower (24.2 tall, x 142.9 to
++  // 265.7), the words' band starting 6.5 above the plate's centre.
++  constexpr float kValueY = 312.1f, kPlateY = 315.0f, kTextTop = kPlateY - 6.5f;
+   // The plate.
+-  part(plate, 2, 34, 162, 63, 143.2f, kRowY - 12.6f, 125.8f, 25.2f,
++  // (its texels' visible part is 82 % of their height, from 8 %: drawn 29.7 tall from 300.5, it covers
++  // 302.9 to 327.1 as the game's plates one row apart; x as Air pit's, 142.9 to 265.7)
++  part(plate, 2, 34, 162, 63, 143.0f, kPlateY - 14.5f, 126.4f, 29.7f,
+        selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(120, 124, 150, 255));
+-  // "Racers": the letters' texels in texture 28 (core +- 2), laid out as the game's words are (2 texels
+-  // between cores).
++  // "Racers" from the rows' own size of letters (capitals 13 texels, small letters 10: Air Lost, Level,
++  // Announce, Laps), each letter's white core and 2 texels of outline, its word's band (20 texels from the
++  // outline's top); the cores 2 texels apart as in the game's words. No word of that size has an R: the R
++  // of "Retire" (14 texels) is brought to 13, on the same base line.
+   struct Letter
+   {
+-    float x0, x1, y0, y1;
++    float core0, core1, band, scale;
+   };
+   static constexpr Letter kLetters[] = {
+-      {366, 385, 78, 99},  // R (Retire)
+-      {358, 372, 4, 24},   // a (Laps)
+-      {204, 219, 54, 74},  // c (Announce)
+-      {383, 399, 78, 99},  // e (Retire)
+-      {414, 427, 78, 99},  // r (Retire)
+-      {383, 397, 4, 24},   // s (Laps)
++      {368, 383, 80, 13.0f / 14.0f},  // R (Retire: core rows 82-95)
++      {360, 370, 4, 1.0f},            // a (Laps)
++      {206, 217, 54, 1.0f},           // c (Announce)
++      {19, 30, 29, 1.0f},             // e (Level)
++      {191, 198, 4, 1.0f},            // r (Air)
++      {385, 395, 4, 1.0f},            // s (Laps)
+   };
+   const ImU32 ink = selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(44, 44, 54, 255);
++  // The game draws the rows' words 0.97 wide and 0.88 tall a texel (Air Lost: 96 texels over 93.1, its
++  // 17 texels of height over 15).
++  constexpr float kWordX = 0.97f, kWordY = 0.88f;
+   float x = 147.7f;
+   for (const Letter& l : kLetters)
+   {
+-    const float w = l.x1 - l.x0, h = l.y1 - l.y0;
+-    part(words, l.x0, l.y0, l.x1, l.y1, x, kRowY - h * 0.5f, w, h, ink);
+-    x += w - 4.0f + 2.0f;  // the next core 2 texels after this one's
++    const float k = l.scale, w = l.core1 - l.core0 + 4.0f, h = l.scale == 1.0f ? 20.0f : 18.0f;
++    // A small letter's band starts at the outline's top; the R's crop at its core's top - 2, which goes
++    // to the capitals' top (the band's + 2).
++    const float top = l.scale == 1.0f ? kTextTop : kTextTop + (2.0f - 2.0f * k) * kWordY;
++    part(words, l.core0 - 2.0f, l.band, l.core1 + 2.0f, l.band + h, x, top, w * k * kWordX, h * k * kWordY, ink);
++    x += ((l.core1 - l.core0) * k + 2.0f) * kWordX;
+   }
+-  // The value: two digits of texture 28 (0-9 side by side, x 2..200, y 78..99), in the laps' places.
++  // The value: two digits of texture 28 (0-9 side by side, x 2..200, y 78..99) as the laps' are drawn
++  // (their "0": 11.0 x 12.2, 0.92 x 0.97 a texel, its white centred at x 412.2, 2.0 under the arrows'
++  // centre; its white 3.3 texels under the crop's top, 2.4 right of its left).
+   static constexpr float kDigits[10][2] = {{2, 20},    {24, 35},   {42, 60},   {62, 80},   {81, 100},
+                                            {102, 120}, {122, 140}, {143, 160}, {162, 180}, {183, 200}};
+   const int digits[2] = {std::clamp(racers, 0, 99) / 10, std::clamp(racers, 0, 99) % 10};
+   for (int k = 0; k < 2; ++k)
+   {
++    constexpr float kDigitX = 0.92f, kDigitY = 0.97f;
+     const float* d = kDigits[digits[k]];
+-    const float w = d[1] - d[0] + 2.0f, h = 21.0f;
++    const float w = (d[1] - d[0] + 2.0f) * kDigitX, h = 21.0f * kDigitY;
+     const float centre = k == 0 ? 412.2f : 440.4f;
+-    part(words, d[0] - 1.0f, 78, d[1] + 1.0f, 99, centre - w * 0.5f, kRowY - h * 0.5f, w, h, IM_COL32_WHITE);
++    const float white_top = kValueY + 2.0f - 12.2f * 0.5f;
++    part(words, d[0] - 1.0f, 78, d[1] + 1.0f, 99, centre - w * 0.5f + 1.5f, white_top - 3.3f * kDigitY, w, h,
++         IM_COL32_WHITE);
+   }
+-  // The arrows (texture 30: the triangle at (4, 69)-(20, 86), pointing right).
++  // The arrows (texture 30: the triangle at (4, 69)-(20, 86), pointing right), as Air pit's: 13.9 wide,
++  // 14.6 tall, from x 361.9 and 494.4.
+   const ImU32 tip = selected ? IM_COL32(253, 253, 253, 255) : IM_COL32(99, 99, 99, 255);
+-  part(arrow, 4, 69, 20, 86, 360.9f, kRowY - 8.5f, 15.7f, 17.0f, tip, true);
+-  part(arrow, 4, 69, 20, 86, 493.8f, kRowY - 8.5f, 15.8f, 17.0f, tip);
++  part(arrow, 4, 69, 20, 86, 362.2f, kValueY - 7.6f, 15.3f, 16.1f, tip, true);
++  part(arrow, 4, 69, 20, 86, 496.2f, kValueY - 7.6f, 15.3f, 16.1f, tip);
+ }
+ 
+ void WaitingVeilOnPresent()
+-- 
+2.34.1.windows.1
+
