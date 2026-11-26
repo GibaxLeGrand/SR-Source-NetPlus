@@ -25,6 +25,9 @@ if [[ "$JEU" == GXSRTE ]]; then
   STATE="${ETAT:-$W/states/gxsrte_pret1p_metal_1tour_jit.sav}"
   # Sur TE, le Start n'est pris que ~90 frames après le A de la planche (« . » : 30 frames d'attente).
   TOUCHES_A_DEFAUT="RAA...S"; TOUCHES_B="RRAA...S"
+  # SRNP_INPUT=ia ne conduit que les racers CPU au montage ; le racer 0 (l'humain du menu) resterait au neutre
+  # sur la ligne : SRNP_TOUS_CPU=1, les 8 en CPU au montage (session phase 2, 26/11). TOUS_CPU= : non.
+  TOUS_CPU="${TOUS_CPU-1}"
   export STATICRECOMP_MODULE="$(cygpath -w "${MODULE_TE:-$W/te/module/gGXSRTE_recomp_te.dll}")"
 else
   RUNNER="$W/chassis_p2/moderngekko-run.exe"
@@ -114,11 +117,11 @@ lance() {  # lance <pc> <auto> <touches> [variables...]
      SRNP_LOBBY_KEYS="$keys" SRNP_CKDUMP="$ck" "$@" "$EXE" --x11 "$pc-$(basename "$RUN")" > "$RUN/$pc/launcher.out" 2>&1) &
   echo "$(date +%T) launcher $pc lancé ($auto)"
 }
-lance pcA host "${TOUCHES_A-$TOUCHES_A_DEFAUT}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}" SRNP_RELAY_PING="${PING:-}" SRNP_FIN_CHOIX="${FIN_A:-}"
+lance pcA host "${TOUCHES_A-$TOUCHES_A_DEFAUT}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}" SRNP_RELAY_PING="${PING:-}" SRNP_FIN_CHOIX="${FIN_A:-}" ${TOUS_CPU:+SRNP_TOUS_CPU=$TOUS_CPU}
 sleep 7
 LA=$(pid_de SR-Source.exe "pcA-$(basename "$RUN")")
 photo "$LA" "$RUN/1_hote_seul.png"
-lance pcB connect "$TOUCHES_B" SRNP_ONLINE_READY=1 SRNP_ONLINE_BACKGROUND="${FOND_B:-}" SRNP_INPUT="${INPUT_B:-ia}" SRNP_FIN_CHOIX="${FIN_B:-}"
+lance pcB connect "$TOUCHES_B" SRNP_ONLINE_READY=1 SRNP_ONLINE_BACKGROUND="${FOND_B:-}" SRNP_INPUT="${INPUT_B:-ia}" SRNP_FIN_CHOIX="${FIN_B:-}" ${TOUS_CPU:+SRNP_TOUS_CPU=$TOUS_CPU}
 sleep 4
 LB=$(pid_de SR-Source.exe "pcB-$(basename "$RUN")")
 photo "$LA" "$RUN/2_lobby_hote.png"
