@@ -1,0 +1,55 @@
+From 368e913fb501f4da72d6d136742855149b7c5635 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:52:59 +0100
+Subject: [PATCH] Runner: Tournament Edition's new characters' heads on the
+ waiting screen (GTSE's texture 7)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_waiting_screen.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 58f6dc0..c83d311 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -119,6 +119,14 @@ constexpr const char* kHud = "GTSE";
+ constexpr ImVec2 kHeads[17] = {{0, 120},   {38, 120},  {76, 120}, {114, 120}, {0, 150},   {38, 150},
+                                {76, 150},  {114, 150}, {152, 120}, {152, 150}, {190, 120}, {0, 120},
+                                {190, 150}, {0, 180},   {0, 210},  {38, 180},  {38, 210}};
++// Tournament Edition's own characters (17-22: Silver, Metal Sonic, Emerl, Blaze, Chaos, Tikal): their heads
++// are in GTSE's texture 7, square (32x32, Tikal's 28x28), as TE's table at 0x803737B0 has them (pairs
++// head/silhouette, the heads first: its split screen, its results and the 1P HUD, srnp_labels.cpp TeHeads).
++struct SquareHead
++{
++  float x, y, side;
++};
++constexpr SquareHead kTeHeads[6] = {{38, 135, 32}, {37, 101, 32}, {36, 1, 32}, {38, 68, 32}, {36, 34, 32}, {38, 168, 28}};
+ 
+ void Picture(ImDrawList* list, const GamePicture& p, ImVec2 a, ImVec2 b, ImVec2 uv0 = ImVec2(0, 0),
+              ImVec2 uv1 = ImVec2(1, 1), ImU32 tint = IM_COL32_WHITE)
+@@ -329,12 +337,21 @@ void DrawWithGamePictures(const WaitView& view, ImDrawList* list, ImFont* font,
+     const GamePicture atlas = GameTexture(kHud, 5);
+     const float side_w = card_w * 0.86f, side_h = side_w * 30.0f / 38.0f;
+     const ImVec2 i0(x - side_w * 0.5f, top + card_h * 0.30f), i1(x + side_w * 0.5f, top + card_h * 0.30f + side_h);
++    const GamePicture te_heads = CurrentGame() == Game::TE ? GameTexture(kHud, 7) : GamePicture{};
+     if (s != 'X' && character >= 0 && character <= 16 && atlas.ok)
+     {
+       const ImVec2 head = kHeads[character];
+       Picture(list, atlas, i0, i1, ImVec2(head.x / atlas.width, head.y / atlas.height),
+               ImVec2((head.x + 38.0f) / atlas.width, (head.y + 30.0f) / atlas.height), tint);
+     }
++    else if (s != 'X' && character >= 17 && character <= 22 && te_heads.ok)
++    {
++      // (square: as high as the others, centred)
++      const SquareHead& head = kTeHeads[character - 17];
++      Picture(list, te_heads, ImVec2(x - side_h * 0.5f, i0.y), ImVec2(x + side_h * 0.5f, i0.y + side_h),
++              ImVec2(head.x / te_heads.width, head.y / te_heads.height),
++              ImVec2((head.x + head.side) / te_heads.width, (head.y + head.side) / te_heads.height), tint);
++    }
+     else
+     {
+       const GamePicture unknown = GameTexture(kMenus, Menu(110));
+-- 
+2.34.1.windows.1
+
