@@ -1,0 +1,208 @@
+From 8c4b6671009aa3eaa8d63f7a9749da173388517e Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:39:49 +0100
+Subject: [PATCH] Runner: the results once every player has finished, each
+ machine its own GOAL
+
+Gibax: "faudrait faire comme en multi local, et attendre que TOUT LE MONDE
+finisse avant de mettre le classement et tout le tralala".
+
+The 1P HUD task (0x8041DD78) followed racer 0: when Sonic crossed the line,
+every machine showed his GOAL, rank and times, and its controller (0x80529B54)
+made the results about 7 s later, whoever was still racing. Now:
+- the HUD shows this machine's seat (0x8041DDD0), its loop over the racers
+  still starting at racer 0 (0x8041EA58 through a cave): GOAL, the rank and
+  the lap/total times come when the seat crosses the line;
+- the controller makes the results only once our flag (0x80002BF0) is up,
+  waiting in its state 0 until then (0x8052AB18, 0x8052AB20); the runner raises
+  it 480 frames after every seat's racer has crossed the line (+0xBA8 &
+  0x80000, the race logic's), so at the same frame on every machine;
+- four HUD tasks that ended at the first human's finish ([0x806129B5]) ask
+  the seat's racer instead (the rings box stays for the others).
+
+Measured, 2-player race (both AI): Sonic sees GOAL/1st/55"36 at his finish,
+Knuckles GOAL/7th/59"25 at his; the results come at the same moment on both
+screens, about 8 s after Knuckles; 96 identical checksums, 0 divergences.
+Not yet: the time, rank and speed still fade on a racing player's screen when
+another human finishes (not from [0x806129B5] alone: resetting it does not
+bring them back).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 139 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index be36892..decb361 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -967,6 +967,142 @@ void PatchIntro(int seat, int seats)
+     std::fprintf(stderr, "[srnp racers] intro: the game's\n");
+ }
+ 
++// The race's end (2026-11-26; Gibax: "faudrait faire comme en multi local, et attendre que TOUT LE
++// MONDE finisse avant de mettre le classement et tout le tralala"). The 1P HUD task (0x8041DD78) shows
++// racer 0 (0x8041DDD0) and, once it crosses the line (+0xBA8 & 0x80000, set by the race logic), starts
++// the "GOAL" task (0x8052CE74: GOAL, the rank, the lap and total times), which 90 frames later starts
++// a controller (0x80529B54) that checks once (its state 0, 0x8052AB18) whether its player is the
++// last-placed human, makes the results (0x80524EE4) if so, and ends either way. With several humans
++// on one machine that waits for the last of them; with one machine each, only the last player's
++// machine would make the results. Here the HUD shows this machine's seat (GOAL, rank and times when
++// the seat crosses the line; its loop over the racers still starts at racer 0, 0x8041EA58), and the
++// controller makes the results only once our flag is up, waiting in its state 0 until then: the flag
++// rises kFinishDelay frames after every seat's racer has crossed the line, from the racers' own state,
++// so at the same frame on every machine. Measured on 2026-11-26 (1P): the results came 433 frames
++// after racer 0 crossed. And [0x806129B5] rises when the first human crosses the line: three HUD
++// tasks (0x8051B600, 0x8051C470, 0x8051D204, 0x805A8760: rings, time, speed...) end once its getter (0x8051C3C0)
++// says so, so the other players' HUD went as soon as one finished (measured on 2026-11-26: Knuckles's
++// screen lost it at Sonic's finish); those three ask this machine's seat's racer instead (+0xBA8 &
++// 0x80000). The race manager (0x804337A8) still reads the byte. SRNP_FIGURES=0 keeps the game's.
++constexpr std::uint32_t kFinishFlag = 0x80002BF0;  // ours, free low memory: 1 once the results may come
++constexpr std::uint32_t kFinishCaveCheck = 0x80002B80, kFinishCaveLoop = 0x80002BA0,
++                        kFinishCaveSeat = 0x80002BC0;
++constexpr std::uint64_t kFinishDelay = 480;  // frames after the last seat's racer crossed the line
++constexpr CodeWord kFinishWords[] = {
++    {0x8041DDD0, 0x38849440},  // addi r4, r4, -0x6BC0 (the HUD's player: racer 0) -> the seat's
++    {0x8041EA58, 0x3AA00000},  // li r21, 0 (the loop over the racers) -> bl: r21 = 0, r23 = racer 0
++    {0x8052AB18, 0x881F0010},  // lbz r0, 16(r31) (the controller's player) -> bl: r7 once the flag is up
++    {0x8052AB20, 0x408200AC},  // bne 0x8052ABCC (next state, then the end) -> bne 0x8052ABF0 (wait)
++    {0x8051B680, 0x48000D41},  // bl 0x8051C3C0 (a player has crossed the line) -> bl: has the seat's racer
++    {0x8051C4D4, 0x4BFFFEED},  // bl 0x8051C3C0, the same
++    {0x8051D258, 0x4BFFF169},  // bl 0x8051C3C0, the same
++    {0x805A8808, 0x4BF73BB9},  // bl 0x8051C3C0, the same (task 0x805A8760)
++};
++bool s_finish_patched = false;
++int s_finish_seats = 0;
++std::uint64_t s_all_crossed = 0;  // frames since every seat's racer crossed the line (0: not yet)
++
++void PatchFinish(int seat, int seats)
++{
++  static const bool off = [] {
++    const char* v = std::getenv("SRNP_FIGURES");
++    return v && *v == '0';
++  }();
++  const bool on = !off && seat >= 0 && seat < 8 && seats >= 1 && seats <= 8;
++  if (std::uint8_t* flag = Guest(kFinishFlag, 1))
++    *flag = 0;
++  s_all_crossed = 0;
++  s_finish_seats = on ? seats : 0;
++  if (on == s_finish_patched)
++    return;
++  const auto bl = [](std::uint32_t from, std::uint32_t to) {
++    return 0x48000001u | ((to - from) & 0x03FFFFFCu);
++  };
++  // r0 = r7 + (flag ? 0 : 1): equal to r7, the player the game would make the results for, once up.
++  const std::uint32_t check[] = {0x3D808000u, 0x880C0000u | (kFinishFlag & 0xFFFFu), 0x68000001u,
++                                 0x7C003A14u, 0x4E800020u};  // lis r12; lbz r0; xori r0, 1; add r0, r7; blr
++  const std::uint32_t loop[] = {0x3AA00000u, 0x3EE08061u, 0x3AF79440u,
++                                0x4E800020u};  // li r21, 0; r23 = racer 0 (0x80609440); blr
++  // r3 = (the seat's racer +0xBA8 >> 19) & 1: has it crossed the line.
++  const std::uint32_t seat_crossed[] = {
++      0x3C608061u, 0x38630000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(std::max(seat, 0))) & 0xFFFFu),
++      0x80630BA8u, 0x54636FFEu, 0x4E800020u};  // lis; addi; lwz r3, 0xBA8(r3); rlwinm r3, r3, 13, 31, 31; blr
++  const std::uint32_t patched[] = {
++      0x38840000u | ((0x9440u + 0x1080u * static_cast<std::uint32_t>(std::max(seat, 0))) & 0xFFFFu),
++      bl(kFinishWords[1].address, kFinishCaveLoop), bl(kFinishWords[2].address, kFinishCaveCheck),
++      0x408200D0u, bl(kFinishWords[4].address, kFinishCaveSeat), bl(kFinishWords[5].address, kFinishCaveSeat),
++      bl(kFinishWords[6].address, kFinishCaveSeat), bl(kFinishWords[7].address, kFinishCaveSeat)};
++  static_assert(std::size(patched) == std::size(kFinishWords));
++  if (on)
++  {
++    for (const CodeWord& w : kFinishWords)
++      if (Read32(w.address) != w.original)
++      {
++        std::fprintf(stderr, "[srnp racers] finish: 0x%08X holds %08X, not %08X: left alone\n", w.address,
++                     Read32(w.address), w.original);
++        return;
++      }
++    const auto ours = [&](std::uint32_t a) -> std::uint32_t {
++      if (a >= kFinishCaveCheck && a < kFinishCaveCheck + 4 * std::size(check))
++        return check[(a - kFinishCaveCheck) / 4];
++      if (a >= kFinishCaveLoop && a < kFinishCaveLoop + 4 * std::size(loop))
++        return loop[(a - kFinishCaveLoop) / 4];
++      return 0;
++    };
++    // The seat's cave changes with the seat: any of its words may be there from an earlier race.
++    for (std::uint32_t a = kFinishCaveCheck; a < kFinishCaveSeat; a += 4)
++      if (Read32(a) != 0 && Read32(a) != ours(a))
++      {
++        std::fprintf(stderr, "[srnp racers] finish: 0x%08X is not free (%08X): left alone\n", a, Read32(a));
++        return;
++      }
++  }
++  auto& jit = Core::System::GetInstance().GetJitInterface();
++  if (on)
++  {
++    for (std::size_t i = 0; i < std::size(check); ++i)
++      if (std::uint8_t* p = Guest(kFinishCaveCheck + 4 * static_cast<std::uint32_t>(i), 4))
++        Put32(p, check[i]);
++    for (std::size_t i = 0; i < std::size(loop); ++i)
++      if (std::uint8_t* p = Guest(kFinishCaveLoop + 4 * static_cast<std::uint32_t>(i), 4))
++        Put32(p, loop[i]);
++    for (std::size_t i = 0; i < std::size(seat_crossed); ++i)
++      if (std::uint8_t* p = Guest(kFinishCaveSeat + 4 * static_cast<std::uint32_t>(i), 4))
++        Put32(p, seat_crossed[i]);
++    jit.InvalidateICache(kFinishCaveCheck, kFinishCaveSeat + 4 * std::size(seat_crossed) - kFinishCaveCheck, true);
++  }
++  for (std::size_t i = 0; i < std::size(kFinishWords); ++i)
++  {
++    if (std::uint8_t* p = Guest(kFinishWords[i].address, 4))
++      Put32(p, on ? patched[i] : kFinishWords[i].original);
++    jit.InvalidateICache(kFinishWords[i].address, 4, true);
++  }
++  s_finish_patched = on;
++  if (on)
++    std::fprintf(stderr, "[srnp racers] finish: the HUD on racer %d, the results %llu frames after the %d seats\n",
++                 seat, static_cast<unsigned long long>(kFinishDelay), seats);
++  else
++    std::fprintf(stderr, "[srnp racers] finish: the game's\n");
++}
++
++// Each race frame: the flag, from the racers' state (the same on every machine).
++void UpdateFinishFlag(const std::uint8_t* racers)
++{
++  if (!s_finish_patched)
++    return;
++  bool all = s_finish_seats > 0;
++  for (int k = 0; k < s_finish_seats; ++k)
++    all = all && (Get32(racers + static_cast<std::size_t>(k) * kRacerSize + 0xBA8) & 0x80000u) != 0;
++  const std::uint64_t before = s_all_crossed;
++  s_all_crossed = all ? s_all_crossed + 1 : 0;
++  if (std::uint8_t* flag = Guest(kFinishFlag, 1))
++    *flag = s_all_crossed > kFinishDelay ? 1 : 0;
++  if (before == 0 && s_all_crossed == 1)
++    std::fprintf(stderr, "[srnp racers] finish: every seat has crossed the line\n");
++  if (s_all_crossed == kFinishDelay + 1)
++    std::fprintf(stderr, "[srnp racers] finish: the results may come\n");
++}
++
+ // SRNP_PATCH=<address>=<word>,... (hexadecimal): code words written for the race, for experiments
+ // (finding which HUD task shows what); the game's words come back at the end of the race.
+ std::vector<std::pair<std::uint32_t, std::uint32_t>> s_test_patch_saved;
+@@ -1084,6 +1220,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchZones(true);
+     PatchSeatDisplays(camera_seat);
+     PatchIntro(camera_seat, static_cast<int>(std::min<std::size_t>(pads.size(), count)));
++    PatchFinish(camera_seat, static_cast<int>(std::min<std::size_t>(pads.size(), count)));
+     PatchCameras(racers, camera_seat, camera_seat2);
+     PatchTest(true);
+     // SRNP_BD5=<address>,... (test, hexadecimal): those reads of the CPUs' flag (lbz rD, 0xBD(rA))
+@@ -1162,6 +1299,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     PatchZones(false);
+     PatchSeatDisplays(-1);
+     PatchIntro(-1, 0);
++    PatchFinish(-1, 0);
+     PatchCameras(racers, -1, -1);
+     PatchTest(false);
+     std::fprintf(stderr, "[srnp racers] race over (0x%X, loading %u, scene %u): racers back to the game\n",
+@@ -1223,6 +1361,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     seat.written = 0;
+   }
+   WriteCameraSlots(racers);  // the camera of each racer's events (PatchCameras)
++  UpdateFinishFlag(racers);  // the results once every seat has finished (PatchFinish)
+   if (camera_seat >= 0 && camera_seat < 8)
+     if (std::uint8_t* camera = Guest(kCameraRacer, 1))
+       *camera = static_cast<std::uint8_t>(camera_seat);
+-- 
+2.34.1.windows.1
+
