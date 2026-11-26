@@ -1,0 +1,227 @@
+From 1452af5b70ec04f35c4703522cee1712726903ad Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:17:49 +0100
+Subject: [PATCH] Launcher: a simulated ping in the room's relay, for tests
+ (SRNP_RELAY_PING)
+
+SRNP_RELAY_PING=<ms>[~<jitter ms>] for every game, or <seat>=<ms>[~<jitter>],... per seat: the relay
+holds a game's lines half the ping each way, in order (TCP keeps it), so the delay based lockstep can
+be measured without a second computer. The room's launchers are not held.
+
+Measured on 2026-11-26 (two launchers on one computer, Metal City with 8 racers, the friend's seat
+pinged): 0 ms 59.9 frames/s; 60 ms with 2 frames of delay 44.8; 120 ms 28.3 (its inputs replaced:
+the relay waits 100 ms for a late seat); 200 ms 28.4; 120 ms with 8 frames 59.9 but 5417 of the
+friend's inputs replaced. 0 divergences in every run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/launcher_online.cpp | 133 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 131 insertions(+), 2 deletions(-)
+
+diff --git a/tools/launcher_online.cpp b/tools/launcher_online.cpp
+index 56d0da3..c34bbcd 100644
+--- a/tools/launcher_online.cpp
++++ b/tools/launcher_online.cpp
+@@ -33,6 +33,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <deque>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
+@@ -423,6 +424,13 @@ struct Relay::Impl
+     Kind kind = Kind::Unknown;
+     bool closed = false;
+     std::vector<int> seats;  // a runner's seats (one, or two on one machine)
++    // Tests (SRNP_RELAY_PING): a game's lines held this long each way, in order.
++    double one_way = 0.0;
++    double jitter = 0.0;
++    double last_out = 0.0;
++    double last_in = 0.0;
++    std::deque<std::pair<double, std::string>> later_out;
++    std::deque<std::pair<double, std::string>> later_in;
+   };
+   struct RoomMember
+   {
+@@ -447,6 +455,65 @@ struct Relay::Impl
+   std::thread thread;
+   std::mt19937 random{std::random_device{}()};
+ 
++  // Tests: SRNP_RELAY_PING=<ms>[~<jitter ms>] for every game, or <seat>=<ms>[~<jitter>],... per
++  // seat: a network's ping between the relay and a game, half each way (the room's launchers are
++  // not held). Measures the delay based lockstep without a second computer.
++  struct Ping
++  {
++    double ms = 0.0;
++    double jitter = 0.0;
++  };
++  std::optional<Ping> ping_all;
++  std::map<int, Ping> ping_by_seat;
++
++  void ReadPing()
++  {
++    const char* text = std::getenv("SRNP_RELAY_PING");
++    if (!text || !*text)
++      return;
++    std::stringstream entries(text);
++    std::string entry;
++    while (std::getline(entries, entry, ','))
++    {
++      Ping ping;
++      int seat = -1;
++      const std::size_t equals = entry.find('=');
++      if (equals != std::string::npos)
++      {
++        seat = std::atoi(entry.substr(0, equals).c_str());
++        entry = entry.substr(equals + 1);
++      }
++      const std::size_t tilde = entry.find('~');
++      ping.ms = std::atof(entry.substr(0, tilde).c_str());
++      if (tilde != std::string::npos)
++        ping.jitter = std::atof(entry.substr(tilde + 1).c_str());
++      if (seat >= 0)
++        ping_by_seat[seat] = ping;
++      else
++        ping_all = ping;
++    }
++    std::string said;
++    if (ping_all)
++      said += " every game " + std::to_string(static_cast<int>(ping_all->ms)) + " ms (+/-" +
++              std::to_string(static_cast<int>(ping_all->jitter)) + ")";
++    for (const auto& [seat, ping] : ping_by_seat)
++      said += " seat " + std::to_string(seat) + " " + std::to_string(static_cast<int>(ping.ms)) +
++              " ms (+/-" + std::to_string(static_cast<int>(ping.jitter)) + ")";
++    Log("test: simulated ping:" + said);
++  }
++
++  // When a line held for `one_way` (+/- jitter) goes, never before the one held before it (TCP keeps
++  // the order).
++  double Release(double one_way, double jitter, double& last)
++  {
++    double when = Now() + one_way;
++    if (jitter > 0.0)
++      when += std::uniform_real_distribution<double>(-jitter, jitter)(random);
++    when = std::max(when, last + 1e-6);
++    last = when;
++    return when;
++  }
++
+   // The room.
+   std::vector<RoomMember> members;
+   Rules rules;
+@@ -514,6 +581,12 @@ struct Relay::Impl
+     const auto found = connections.find(id);
+     if (found == connections.end() || found->second.closed)
+       return;
++    if (found->second.one_way > 0.0)
++    {
++      Connection& c = found->second;
++      c.later_out.emplace_back(Release(c.one_way, c.jitter, c.last_out), line);
++      return;
++    }
+     found->second.out += line;
+     found->second.out += '\n';
+     if (!Flush(found->second.socket, found->second.out))
+@@ -925,6 +998,16 @@ struct Relay::Impl
+             " seats, the match has " + std::to_string(match.seats));
+       const int s = static_cast<int>(seat);
+       connection.seats.push_back(s);
++      if (connection.seats.size() == 1)
++      {
++        const auto own = ping_by_seat.find(s);
++        const std::optional<Ping> ping = own != ping_by_seat.end() ? std::optional<Ping>(own->second) : ping_all;
++        if (ping && ping->ms > 0.0)
++        {
++          connection.one_way = ping->ms / 2000.0;
++          connection.jitter = ping->jitter / 2000.0;
++        }
++      }
+       if (words.size() > 3)
+         match.input_delay = std::max(match.input_delay, static_cast<int>(Number(words, 3, 0)));
+       match.runners[s] = id;
+@@ -1059,11 +1142,55 @@ struct Relay::Impl
+       }
+     }
+     if (connection.kind == Connection::Kind::Runner)
+-      OnRunnerLine(id, words);
++    {
++      if (connection.one_way > 0.0 && words[0] != "HELLO")
++        connection.later_in.emplace_back(Release(connection.one_way, connection.jitter, connection.last_in),
++                                         line);
++      else
++        OnRunnerLine(id, words);
++    }
+     else
+       OnLauncherLine(id, words);
+   }
+ 
++  // The held lines whose time has come (SRNP_RELAY_PING).
++  void ReleaseHeld()
++  {
++    const double now = Now();
++    std::vector<int> ids;
++    for (const auto& [id, connection] : connections)
++      ids.push_back(id);
++    for (const int id : ids)
++    {
++      auto found = connections.find(id);
++      if (found == connections.end())
++        continue;
++      Connection& c = found->second;
++      bool sent = false;
++      while (!c.later_out.empty() && c.later_out.front().first <= now)
++      {
++        c.out += c.later_out.front().second;
++        c.out += '\n';
++        c.later_out.pop_front();
++        sent = true;
++      }
++      if (sent && !c.closed && !Flush(c.socket, c.out))
++        c.closed = true;
++      while (!c.closed)
++      {
++        found = connections.find(id);
++        if (found == connections.end() || found->second.later_in.empty() ||
++            found->second.later_in.front().first > now)
++          break;
++        const std::string line = found->second.later_in.front().second;
++        found->second.later_in.pop_front();
++        const std::vector<std::string> words = Words(line);
++        if (!words.empty())
++          OnRunnerLine(id, words);
++      }
++    }
++  }
++
+   void Close(int id)
+   {
+     Connection& connection = connections[id];
+@@ -1091,7 +1218,7 @@ struct Relay::Impl
+           FD_SET(connection.socket, &writable);
+         highest = std::max(highest, connection.socket);
+       }
+-      timeval wait{0, 5000};
++      timeval wait{0, ping_all || !ping_by_seat.empty() ? 1000 : 5000};
+       const int ready = select(static_cast<int>(highest + 1), &readable, &writable, nullptr, &wait);
+       if (ready > 0 && FD_ISSET(listener, &readable))
+       {
+@@ -1144,6 +1271,7 @@ struct Relay::Impl
+           Close(id);
+         }
+       }
++      ReleaseHeld();
+       // relais.py's minuteur: WAIT every 2 s while a seat is expected, and the frames whose wait is over.
+       if (in_match)
+       {
+@@ -1201,6 +1329,7 @@ bool Relay::Start(std::uint16_t port, const fs::path& journal, std::string* erro
+   m.journal = std::fopen(journal.c_str(), "a");
+ #endif
+   m.Log("relay: TCP port " + std::to_string(port) + ", up to " + std::to_string(MAX_PLAYERS) + " players");
++  m.ReadPing();
+   m.thread = std::thread([&m] { m.Loop(); });
+   return true;
+ }
+-- 
+2.34.1.windows.1
+

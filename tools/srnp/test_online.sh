@@ -7,6 +7,8 @@
 #     (SRNP_INPUT=ia) ; photos des launchers (lobby) et des jeux ;
 #   - fin : runners arrêtés après DUREE s de course, puis les launchers ; bilan du relais (relay.log).
 #   test_online.sh   (RULES=<course>/<laps>/<racers>/<delay>, défaut 1/1/8/2 ; DUREE=90 ; DEPART=6)
+#   PING=<ms>[~<gigue>] ou <siège>=<ms>[~<gigue>],... : ping simulé par le relais (SRNP_RELAY_PING) ;
+#   INPUT_B=course : entrées de test variées pour l'ami (au lieu de l'IA).
 set -uo pipefail
 W=/d/_SonicRidersSource/work
 L=$W/launcher_online
@@ -86,11 +88,11 @@ lance() {  # lance <pc> <auto> <touches> [variables...]
      SRNP_LOBBY_KEYS="$keys" SRNP_CKDUMP="$ck" "$@" "$EXE" --x11 "$pc-$(basename "$RUN")" > "$RUN/$pc/launcher.out" 2>&1) &
   echo "$(date +%T) launcher $pc lancé ($auto)"
 }
-lance pcA host "${TOUCHES_A-RAAS}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}"
+lance pcA host "${TOUCHES_A-RAAS}" SRNP_ONLINE_RULES="${RULES:-1/1/8/2}" SRNP_ONLINE_START="2:${DEPART:-6}" SRNP_ONLINE_BACKGROUND="${FOND_A:-}" SRNP_INPUT="${INPUT_A:-ia}" SRNP_RELAY_PING="${PING:-}"
 sleep 7
 LA=$(pid_de SR-Source.exe "pcA-$(basename "$RUN")")
 photo "$LA" "$RUN/1_hote_seul.png"
-lance pcB connect RRAAS SRNP_ONLINE_READY=1 SRNP_ONLINE_BACKGROUND="${FOND_B:-}" SRNP_INPUT=ia
+lance pcB connect RRAAS SRNP_ONLINE_READY=1 SRNP_ONLINE_BACKGROUND="${FOND_B:-}" SRNP_INPUT="${INPUT_B:-ia}"
 sleep 4
 LB=$(pid_de SR-Source.exe "pcB-$(basename "$RUN")")
 photo "$LA" "$RUN/2_lobby_hote.png"
