@@ -37,6 +37,9 @@ checksums start again from nothing, and the seats are expected again (O). AGAIN 
 runner is back on its waiting screen) makes it V, BYE <seat> or its leaving makes it X (the AI takes its
 racer, with its own character); then WAIT and GO as at the start, the frames counting from 1 again.
 A seat that has not chosen --attente-manche seconds (60) after the round's end counts as gone.
+--carte-hasard: each new round's course is drawn at random (another than the last), sent as RULES with
+the host's laps and racers (1 lap without them) before GO: the runners write it when the start state is
+back (Gibax, 2026-11-26: "un mode random map qui à chaque restart rechoisit une map au pif").
 """
 import argparse
 import asyncio
@@ -51,7 +54,7 @@ PERSOS = [c for c in range(17) if c != 11]
 
 
 class Relais:
-    def __init__(self, sieges, delai, journal, cadence=0.0, attente_manche=60.0):
+    def __init__(self, sieges, delai, journal, cadence=0.0, attente_manche=60.0, carte_hasard=False):
         self.sieges = sieges
         self.delai = delai
         self.cadence = cadence        # frames par seconde de l'horloge du relais (0 : pas d'horloge)
@@ -85,6 +88,7 @@ class Relais:
         self.decision = {}            # siège -> "V" (AGAIN) ou "X" (BYE) dit avant la fin de la manche
         self.manche = 1
         self.attente_manche = attente_manche  # secondes pour choisir dans le menu des résultats
+        self.carte_hasard = carte_hasard      # une course au hasard à chaque nouvelle manche
         self.t_manche = None                  # fin de la manche précédente (entre deux manches)
         self.debut = time.monotonic()
 
@@ -222,6 +226,13 @@ class Relais:
                 self.etat[s] = self.decision.get(s, "O")
         self.decision = {}
         self.t_manche = time.monotonic()
+        if self.carte_hasard:
+            avant = self.regles[0] if self.regles else None
+            course = random.choice([c for c in range(1, 17) if c != avant])
+            tours = self.regles[1] if self.regles else 1
+            self.regles = (course, tours) + tuple(self.regles[2:] if self.regles else ())
+            self.log(f"carte au hasard : course {course}, {tours} tour(s)")
+            await self.diffuser("RULES " + " ".join(map(str, self.regles)))
         self.log(f"manche {self.manche} : chacun choisit dans son menu des résultats ({''.join(self.etat)})")
         await self.annoncer()
 
@@ -357,11 +368,13 @@ async def principal():
     p.add_argument("--journal")
     p.add_argument("--attente-manche", type=float, default=60.0,
                    help="secondes pour choisir dans le menu des résultats avant d'être compté comme parti")
+    p.add_argument("--carte-hasard", action="store_true",
+                   help="une course tirée au hasard à chaque nouvelle manche (Restart)")
     p.add_argument("--cadence", type=float, default=0.0,
                    help="frames par seconde : une frame est fermée au plus tard à son échéance (0 : sans horloge)")
     a = p.parse_args()
     journal = open(a.journal, "a", encoding="utf-8") if a.journal else None
-    relais = Relais(a.sieges, a.delai_ms / 1000.0, journal, a.cadence, a.attente_manche)
+    relais = Relais(a.sieges, a.delai_ms / 1000.0, journal, a.cadence, a.attente_manche, a.carte_hasard)
     serveur = await asyncio.start_server(relais.client, a.hote, a.port)
     relais.log(f"relais : {a.sieges} sièges, {a.hote}:{a.port}, délai {a.delai_ms} ms, cadence {a.cadence}")
     asyncio.get_running_loop().create_task(relais.minuteur())

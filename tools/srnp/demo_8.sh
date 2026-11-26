@@ -37,7 +37,7 @@ if [[ "${ATTENDRE:-1}" != 0 ]]; then
   done
 fi
 sleep 2
-"$PY" -I "$RELAIS" --sieges $N --port 7845 --journal "$(w "$RUN/relais.log")" > "$RUN/relais.out" 2>&1 &
+"$PY" -I "$RELAIS" --sieges $N --port 7845 ${RELAIS_OPTS:-} --journal "$(w "$RUN/relais.log")" > "$RUN/relais.out" 2>&1 &
 sleep 1
 # TAGS_RELAIS="T0,T1,..." : chaque runner n'a que son tag (SRNP_TAG) ; ceux des autres viennent du relais.
 tag_de() { [[ -n "${TAGS_RELAIS:-}" ]] && echo "$TAGS_RELAIS" | cut -d, -f$(($1 + 1)) || true; }

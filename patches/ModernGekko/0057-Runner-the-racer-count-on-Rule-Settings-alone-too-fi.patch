@@ -1,0 +1,299 @@
+From bbdc134006eb2222e525df1f70adbde4ea647191 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:44:39 +0100
+Subject: [PATCH] Runner: the racer count on Rule Settings, alone too (first
+ version, L/R)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gibax (2026-11-26): "on est capable de choisir le nombre de racers/riders par
+course. Faudrait ajouter cette option au jeu normal (même endroit qu'on ajuste
+les laps etc) in game, pour du offline aussi".
+
+- Rule Settings is the task 0x805A6660 (from Track Select 0x80534AC4, from
+  the menus' 0x8050EDB8 in its state 22); its data's cursor at +30, count at
+  +31 (8: six rows, Default, CONTINUE), values +32, maxima +38, minima +44,
+  the rows' masks in the rules word at +0 (RAM dumps and its code,
+  0x805A68C4). Seen from the menus' task: state 22, data +156 = 2.
+- A "Racers" row is drawn under Air Lost (the waiting screen's overlay, now
+  on every present, online or not), changed with L and R, which that menu
+  leaves alone (measured), 1 to 8 (8: the game's). The host's count goes to
+  the relay with the course and laps, as before.
+- Alone, the count is written into the race the game sets up: the racer
+  count stays 8 through the menus (measured: it never goes back to 1), the
+  player count is set after Player Entry, loading screens follow until the
+  race (scene 4); during those, the count (at least the players) and a CPU
+  character for racers the menu left empty (4 made with 3 players or more).
+  Measured: Rule Settings 5, a race of 5 (Sonic 5th).
+
+Gibax wants it as a real row of the menu (the cursor on it, Default moved
+beside CONTINUE, the menu's own font): next.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/dolphin_runtime.cpp     |  6 +--
+ src/runtime/srnp_racers.cpp         | 59 +++++++++++++++++++++++++++++
+ src/runtime/srnp_racers.hpp         |  5 +++
+ src/runtime/srnp_relay.cpp          | 53 ++++++++++++++++++++++++++
+ src/runtime/srnp_relay.hpp          |  4 ++
+ src/runtime/srnp_waiting_screen.cpp | 36 ++++++++++++++++++
+ 6 files changed, 160 insertions(+), 3 deletions(-)
+
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index 7a89c40..8dfefe3 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -1540,9 +1540,9 @@ RuntimeRunResult Runtime::Run() {
+           [menu = m_impl->menu.get()](const PresentInfo &) { menu->AddToFrame(); });
+     }
+   }
+-  if (srnp::RelayConfigured())
+-    m_impl->srnp_veil_hook = GetVideoEvents().before_present_event.Register(
+-        [](const PresentInfo &) { srnp::WaitingVeilOnPresent(); });
++  // Online and alone: the waiting screen's veil, and the racers' row on Rule Settings.
++  m_impl->srnp_veil_hook = GetVideoEvents().before_present_event.Register(
++      [](const PresentInfo &) { srnp::WaitingVeilOnPresent(); });
+   m_impl->present_hook =
+       GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
+         m_impl->automation_state.frame_count.store(info.frame_count,
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index dcfaf01..758520c 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -488,6 +488,65 @@ int RacersWanted()
+   return NbRacers();
+ }
+ 
++int MenuRacers()
++{
++  const int n = NbRacers();
++  return n >= 1 ? n : 8;
++}
++
++// Without the relay (the game played alone, Gibax 2026-11-26: "pour du offline aussi"): the racer count
++// chosen on Rule Settings (SetNbRacers), written once the menu has set the race up (the racer count
++// leaves 1 after Player Entry's Start) and until the race runs, at least the players; racers the menu
++// left empty (it makes 4 with 3 players or more) get a character the CPU can drive.
++void OfflineRacersFrame()
++{
++  static std::uint32_t last_count = 0;
++  static bool setting = false;
++  const int wanted = NbRacers();
++  const std::uint32_t count = Read32(kRacerCount);
++  // Alone the racer count stays 8 through the menus (measured on 2026-11-26: it never goes back to 1 as
++  // from the online start state); the player count is set once Player Entry is done, and loading
++  // screens follow until the race (scene 4). The count is written during those loadings.
++  last_count = count;
++  const std::uint32_t player_count = Read32(kPlayerCount);
++  if (wanted < 1 || player_count < 1 || player_count > 4 || Read32(kRaceScene) == 4 ||
++      Read32(kRaceLoading) == 0)
++  {
++    setting = false;
++    return;
++  }
++  if (!setting)
++    std::fprintf(stderr, "[srnp racers] race being set up (alone): %d racers\n", wanted);
++  setting = true;
++  std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
++  std::uint8_t* p = Guest(kRacerCount, 4);
++  if (!racers || !p)
++    return;
++  const std::uint32_t players = player_count;
++  const std::uint32_t n = std::max<std::uint32_t>(players, static_cast<std::uint32_t>(wanted));
++  if (count != n)
++    Put32(p, n);
++  for (std::uint32_t k = players; k < n; ++k)
++  {
++    std::uint8_t* racer = racers + k * kRacerSize;
++    if (racer[0xBA] > 16)
++    {
++      static constexpr std::uint8_t kSpare[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14};
++      racer[0xBA] = racer[0xBF] = kSpare[k % std::size(kSpare)];
++      racer[0xBB] = 0;
++    }
++    const int character = racer[0xBA], gear = racer[0xBB];
++    if (character < 32 && !GearAllows(gear, character))
++      for (int g = 0; g < kGears; ++g)
++        if (GearAllows(g, character))
++        {
++          racer[0xBB] = static_cast<std::uint8_t>(g);
++          break;
++        }
++    racer[kControl] = racer[kCpuFlag] = 1;
++  }
++}
++
+ int GearCount()
+ {
+   return kGears;
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 9249a47..7f800c0 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -60,6 +60,11 @@ int SeatGear(int seat);
+ void SetNbRacers(int racers);
+ int RacersWanted();
+ 
++// The count Rule Settings shows (8: the game's), and, without the relay, the racer count written into
++// the race the game sets up (each frame; a CPU character for racers the menu left empty).
++int MenuRacers();
++void OfflineRacersFrame();
++
+ // The game's gears (41) and whether a character may ride one (the gear table, in the game's memory
+ // once its REL is loaded: false for every gear before).
+ int GearCount();
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index b6c624a..bdf9efc 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -958,6 +958,7 @@ namespace
+ {
+ std::atomic<std::uint64_t> s_game_frames{0};
+ void RelayStep(std::uint64_t frame);
++void RulesMenuOnFrame();
+ }  // namespace
+ 
+ void SetStartState(const std::string& path)
+@@ -1055,6 +1056,9 @@ bool PauseAtGameFrame()
+ 
+ void RelayOnFrame(std::uint64_t frame)
+ {
++  RulesMenuOnFrame();
++  if (!RelayConfigured())
++    OfflineRacersFrame();
+   PadCheckOnFrame(frame);
+   if (GameFrameHookAddress() != 0)
+     return;  // the relay steps in the game's main loop
+@@ -1240,6 +1244,51 @@ std::uint32_t FindMenuTask()
+   return FindTask(kMenuTaskFunction);
+ }
+ 
++// The racers on Rule Settings (Gibax, 2026-11-26: "on est capable de choisir le nombre de racers par
++// course, faudrait ajouter cette option au jeu normal (même endroit qu'on ajuste les laps) in game, pour
++// du offline aussi"). The menus' task 0x8050EDB8 (its data at [task + 16]) is in its state 22 on Track
++// Select and Rule Settings; its data's +156 is 2 on Rule Settings (4 on Track Select), +158 the cursor
++// (RAM dumps of 2026-11-26). There a row "Racers" is drawn under Air Lost (DrawRulesRow); L and R, which
++// that menu leaves alone (measured), change it, 1 to 8 (8: the game's). The host's choice goes to the
++// relay with the course and laps (SendRules); alone, OfflineRacersFrame writes it into the race.
++std::atomic<int> s_rules_row{-1};  // the count shown on Rule Settings (-1: not there)
++
++void RulesMenuOnFrame()
++{
++  static std::uint32_t task = 0;
++  if (task == 0 || GuestWord(task) != 0x8050EDB8u)
++    task = FindTask(0x8050EDB8u);
++  const std::uint8_t* t = task ? GuestByte(task) : nullptr;
++  const std::uint32_t data = task ? GuestWord(task + 16) : 0;
++  const std::uint8_t* d = data >= 0x80000000u ? GuestByte(data) : nullptr;
++  if (!t || t[20] != 22 || !d || d[156] != 2)
++  {
++    s_rules_row = -1;
++    return;
++  }
++  static int held = 0;
++  const GCPadStatus s = ::Pad::GetStatus(0);
++  const bool l = (s.button & 0x0040) != 0 || s.triggerLeft > 170;
++  const bool r = (s.button & 0x0020) != 0 || s.triggerRight > 170;
++  if (l != r)
++  {
++    // A press, then again every 6 frames once held for 20.
++    if (held == 0 || (held > 20 && held % 6 == 0))
++    {
++      const int v = std::clamp(MenuRacers() + (r ? 1 : -1), 1, 8);
++      if (v != MenuRacers())
++      {
++        SetNbRacers(v);
++        std::fprintf(stderr, "[srnp relay] Rule Settings: %d racers\n", v);
++      }
++    }
++    ++held;
++  }
++  else
++    held = 0;
++  s_rules_row = MenuRacers();
++}
++
+ // Back to Menu: the race manager (the task 0x804337A8) acts on the menu's choice in its state 9
+ // (0x80433AB0: once 0x806129CE says decided, 0x80436D04); it gets there from the race (7) through 8
+ // when a player of the game ([0x806129B5]) has finished, which never happens when the game's racers
+@@ -1638,4 +1687,8 @@ void RelayStep(std::uint64_t frame)
+   }
+ }
+ }  // namespace
++int RulesRowRacers()
++{
++  return s_rules_row.load();
++}
+ }  // namespace srnp
+diff --git a/src/runtime/srnp_relay.hpp b/src/runtime/srnp_relay.hpp
+index 200d269..b82eb72 100644
+--- a/src/runtime/srnp_relay.hpp
++++ b/src/runtime/srnp_relay.hpp
+@@ -65,6 +65,10 @@ void RedrawWhileWaiting();
+ // present).
+ void WaitingVeilOnPresent();
+ 
++// The racers chosen on the game's Rule Settings while it shows (-1 otherwise): the row drawn under Air
++// Lost, changed with L and R (online and alone).
++int RulesRowRacers();
++
+ // Phase 2 (SRNP_RACERS=1, native core): the relay steps once per frame of the game, at the head of
+ // Sonic Riders' main loop (0x805B8290: the pads are read, then the game's tasks run, then the frame is
+ // drawn), through a StaticRecomp host hook. Inputs are then applied, and checksums taken, at the same
+diff --git a/src/runtime/srnp_waiting_screen.cpp b/src/runtime/srnp_waiting_screen.cpp
+index 7764ed4..c931028 100644
+--- a/src/runtime/srnp_waiting_screen.cpp
++++ b/src/runtime/srnp_waiting_screen.cpp
+@@ -432,12 +432,48 @@ void Draw(const WaitView& view)
+ }
+ }  // namespace
+ 
++// The "Racers" row of Rule Settings (srnp_relay.cpp, RulesMenuOnFrame): under Air Lost, as the game's
++// rows (measured on its screen, 2026-11-26: labels from 22.7 % to 41.8 % of the width, rows every 6.66 %
++// of the height from 25.4 %; Default and CONTINUE at the right from 65.6 %): the label's plate, the
++// count between two arrows (left of Default), and L and R beside the arrows.
++void DrawRulesRow(int racers)
++{
++  ImDrawList* list = ImGui::GetForegroundDrawList();
++  ImFont* font = ImGui::GetFont();
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  if (!list || !font || display.x <= 0.0f || display.y <= 0.0f)
++    return;
++  const float y = display.y * 0.653f, h = display.y * 0.052f;
++  const ImVec2 a(display.x * 0.2266f, y - h * 0.5f), b(display.x * 0.4178f, y + h * 0.5f);
++  list->AddRectFilled(ImVec2(a.x + 3, a.y + 3), ImVec2(b.x + 3, b.y + 3), Rgba(10, 12, 40, 0.6f), h * 0.12f);
++  list->AddRectFilled(a, b, Rgba(122, 128, 196), h * 0.12f);
++  list->AddRectFilled(a, ImVec2(b.x, a.y + h * 0.35f), Rgba(160, 166, 222), h * 0.12f);
++  list->AddRect(a, b, Rgba(28, 30, 70), h * 0.12f, 0, std::max(2.0f, h * 0.05f));
++  const ImVec2 label(a.x + (b.x - a.x) * 0.5f, y);
++  if (!NameTextCentred(list, "Racers", label, h * 0.78f, Rgba(40, 42, 76), (b.x - a.x) * 0.9f))
++    TextCentred(list, font, h * 0.7f, label, Rgba(40, 42, 76), "Racers");
++  char count[8];
++  std::snprintf(count, sizeof(count), "%02d", racers);
++  const ImVec2 value(display.x * 0.530f, y);
++  if (!NameTextCentred(list, count, value, h * 0.9f, IM_COL32_WHITE))
++    TextCentred(list, font, h * 0.8f, value, IM_COL32_WHITE, count);
++  const float s = h * 0.36f;
++  const ImU32 arrow = Rgba(176, 182, 212);
++  const float lx = display.x * 0.466f, rx = display.x * 0.594f;
++  list->AddTriangleFilled(ImVec2(lx - s, y), ImVec2(lx + s * 0.8f, y - s), ImVec2(lx + s * 0.8f, y + s), arrow);
++  list->AddTriangleFilled(ImVec2(rx + s, y), ImVec2(rx - s * 0.8f, y - s), ImVec2(rx - s * 0.8f, y + s), arrow);
++  TextCentred(list, font, h * 0.42f, ImVec2(lx - s * 2.4f, y), Rgba(255, 214, 64), "L");
++  TextCentred(list, font, h * 0.42f, ImVec2(rx + s * 2.4f, y), Rgba(255, 214, 64), "R");
++}
++
+ void WaitingVeilOnPresent()
+ {
+   // While the game runs under the veil (not while it waits: RedrawWhileWaiting draws then).
+   const WaitView view = RelayWaitView();
+   if (view.veil && !view.waiting)
+     Draw(view);
++  else if (const int racers = RulesRowRacers(); racers > 0)
++    DrawRulesRow(racers);
+ }
+ 
+ void RedrawWhileWaiting()
+-- 
+2.34.1.windows.1
+
