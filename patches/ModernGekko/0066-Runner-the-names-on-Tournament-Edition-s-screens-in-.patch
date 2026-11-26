@@ -1,0 +1,54 @@
+From 87de8438532468f1971d593edb5fd753d44ab01e Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:00:25 +0100
+Subject: [PATCH] Runner: the names on Tournament Edition's screens in SR's
+ font (the US game's GTSE)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_game_textures.cpp | 21 +++++++++++++++------
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/src/runtime/srnp_game_textures.cpp b/src/runtime/srnp_game_textures.cpp
+index fc243e6..488430e 100644
+--- a/src/runtime/srnp_game_textures.cpp
++++ b/src/runtime/srnp_game_textures.cpp
+@@ -247,11 +247,20 @@ Decoded DecodeC8(const std::vector<std::uint8_t>& d, std::size_t palette, std::s
+ bool NamesTexture(std::vector<std::uint8_t>* indices, std::vector<std::uint32_t>* colours)
+ {
+   // Tournament Edition's names (its 14th texture) are laid out alike but their palette is another: the
+-  // letters picked by their colours came out wrong (2026-11-26). The screens write with their own font there
+-  // until that is done.
++  // letters picked by their colours came out wrong (2026-11-26). Gibax wants SR's font there too: TE takes
++  // the US game's GTSE, next to its own (the launcher keeps every game in <user>\games\<ID>, and a TE player
++  // has the US disc, which TE's patcher starts from), or SRNP_JEU_US=<the US game's root> (tests); without it,
++  // the screens write with their own font.
++  std::filesystem::path gtse_path = s_root / "files" / "GTSE";
+   if (CurrentGame() == Game::TE)
+-    return false;
+-  const std::vector<std::uint8_t>& d = File(s_root / "files" / "GTSE");
++  {
++    const char* us = std::getenv("SRNP_JEU_US");
++    gtse_path = (us && *us ? std::filesystem::path(us) : s_root.parent_path() / "GXEE8P") / "files" / "GTSE";
++    std::error_code ec;
++    if (!std::filesystem::exists(gtse_path, ec))
++      return false;
++  }
++  const std::vector<std::uint8_t>& d = File(gtse_path);
+   std::size_t at = 0;
+   int k = -1;
+   for (;;)
+@@ -265,8 +274,8 @@ bool NamesTexture(std::vector<std::uint8_t>* indices, std::vector<std::uint32_t>
+       }
+     if (found == std::string::npos)
+       return false;
+-    // (Tournament Edition: the same names, laid out alike, are its 14th texture; 2026-11-26.)
+-    if (++k == (CurrentGame() == Game::TE ? 13 : 6))
++    // (the 7th: GoalResult_01_E; on TE too, from the US game's file)
++    if (++k == 6)
+     {
+       at = found;
+       break;
+-- 
+2.34.1.windows.1
+
