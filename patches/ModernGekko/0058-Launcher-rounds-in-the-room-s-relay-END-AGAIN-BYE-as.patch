@@ -1,0 +1,221 @@
+From 6b59bdbce04dfcddfaf93eb370367f551bc4fd79 Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:33:58 +0100
+Subject: [PATCH] Launcher: rounds in the room's relay (END, AGAIN, BYE), as
+ relais.py
+
+Ported from tools/srnp/relais.py (runner patch 0056): after the race each game's results' menu is its
+own. END <seat> takes the seat out of the lockstep (its inputs are no longer waited for nor counted
+late); once every seat still there has, the round is over: frames, inputs and checksums start from
+nothing and the seats are expected again (a decision said before, AGAIN -> V, BYE -> X; a seat gone
+-> X), then WAIT and GO; at GO a gone seat is the AI's with its own pick (the draw is the first
+round's only). A game that leaves during a round counts as BYE; between rounds a seat that has not
+chosen in 60 s counts as gone.
+
+Measured on 2026-11-26 (two launchers, Metal City with 8 racers): both Restart: two races, 207
+identical checksums, 0 divergences; Restart and Back to Menu: round 2 with the friend's Knuckles to
+the AI, 205 identical, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/launcher_online.cpp | 125 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 119 insertions(+), 6 deletions(-)
+
+diff --git a/tools/launcher_online.cpp b/tools/launcher_online.cpp
+index c34bbcd..bf05120 100644
+--- a/tools/launcher_online.cpp
++++ b/tools/launcher_online.cpp
+@@ -547,6 +547,14 @@ struct Relay::Impl
+     std::vector<std::string> tags;
+     std::vector<std::string> picks;
+     bool rules_ignored_said = false;
++    // Rounds (relais.py's, 2026-11-26): END <seat> takes a seat out of the lockstep (its results' menu
++    // is open, the same frame everywhere); once every seat still there has, the round is over and the
++    // seats are expected again: AGAIN (Restart) makes one V, BYE (Back to Menu) or its leaving X.
++    std::set<int> finished;
++    std::map<int, char> decision;  // seat -> 'V' or 'X', said before the round was over everywhere
++    int round = 1;
++    std::optional<double> round_ended;  // between two rounds: when the last one ended
++    double round_wait = 60.0;           // seconds to choose in the results' menu (relais.py --attente-manche)
+   };
+   Match match;
+ 
+@@ -867,17 +875,29 @@ struct Relay::Impl
+       match.go = true;
+       std::string go = "GO";
+       std::string replaced;
++      std::string to_ai;
+       for (int s = 0; s < match.seats; ++s)
+       {
+-        if (match.states[static_cast<std::size_t>(s)] == 'X')
++        if (match.states[static_cast<std::size_t>(s)] != 'X')
++          continue;
++        to_ai += " " + std::to_string(s);
++        // Its own character when it had one; in a later round without a known choice (no lobby),
++        // nothing: the racer keeps its own; else one drawn at random (the first round only).
++        std::string pick = match.picks[static_cast<std::size_t>(s)];
++        if (pick.empty() && match.round == 1)
+         {
+           const int character =
+               RANDOM_CHARACTERS[std::uniform_int_distribution<std::size_t>(0, RANDOM_CHARACTERS.size() - 1)(random)];
+-          go += " " + std::to_string(s) + ":" + std::to_string(character) + "/0";
+-          replaced += " " + std::to_string(s) + ":" + std::to_string(character) + "/0";
++          pick = std::to_string(character) + "/0";
++        }
++        if (!pick.empty())
++        {
++          go += " " + std::to_string(s) + ":" + pick;
++          replaced += " " + std::to_string(s) + ":" + pick;
+         }
+       }
+-      Log("nobody is expected any more: GO" + (replaced.empty() ? std::string() : "; to the AI:" + replaced));
++      Log("nobody is expected any more: GO" +
++          (to_ai.empty() ? std::string() : "; to the AI:" + (replaced.empty() ? to_ai : replaced)));
+       SendRunners(go);
+       CloseFrames();
+     }
+@@ -915,7 +935,7 @@ struct Relay::Impl
+       {
+         complete = true;
+         for (int s = 0; s < match.seats; ++s)
+-          complete = complete && received.contains(s);
++          complete = complete && (received.contains(s) || match.finished.contains(s));
+       }
+       // At the start, no waiting while a seat has sent nothing yet: it has just loaded.
+       if (!complete && (match.seen.size() < Active() || Now() - match.first[f] < match.delay))
+@@ -927,7 +947,7 @@ struct Relay::Impl
+         {
+           match.last[static_cast<std::size_t>(s)] = found->second;
+         }
+-        else if (f >= match.first_input_frame)
++        else if (f >= match.first_input_frame && !match.finished.contains(s))
+         {
+           ++match.late_total;
+           if (++match.late[static_cast<std::size_t>(s)] <= 3)
+@@ -1076,6 +1096,33 @@ struct Relay::Impl
+         Announce();
+       }
+     }
++    else if (verb == "END")
++    {
++      const long long s = Number(words, 1);
++      if (seat_ok(s) && match.go && !match.finished.contains(static_cast<int>(s)))
++      {
++        match.finished.insert(static_cast<int>(s));
++        Log("seat " + std::to_string(s) + ": results' menu, out of the lockstep");
++        if (RoundOver())
++          NewRound();
++      }
++    }
++    else if (verb == "AGAIN" || verb == "BYE")
++    {
++      const long long s = Number(words, 1);
++      const char state = verb == "AGAIN" ? 'V' : 'X';
++      if (seat_ok(s))
++      {
++        Log("seat " + std::to_string(s) + (state == 'V' ? ": Restart" : ": Back to Menu"));
++        if (match.go)
++          match.decision[static_cast<int>(s)] = state;  // the round is not over everywhere yet
++        else if (match.states[static_cast<std::size_t>(s)] != 'X')
++        {
++          match.states[static_cast<std::size_t>(s)] = state;
++          Announce();
++        }
++      }
++    }
+     else if (verb == "TAG")
+     {
+       const long long s = Number(words, 1);
+@@ -1097,6 +1144,53 @@ struct Relay::Impl
+     }
+   }
+ 
++  // Every seat still there and not gone (X) has left the lockstep.
++  bool RoundOver() const
++  {
++    if (match.finished.empty())
++      return false;
++    for (int s = 0; s < match.seats; ++s)
++    {
++      if (match.states[static_cast<std::size_t>(s)] != 'X' && match.runners.contains(s) &&
++          !match.finished.contains(s))
++        return false;
++    }
++    return true;
++  }
++
++  // relais.py's nouvelle_manche: every seat still there has left the lockstep (its results' menu): the
++  // next round starts from nothing (frames, inputs, checksums), the seats expected again.
++  void NewRound()
++  {
++    ++match.round;
++    match.go = false;
++    match.begun = false;
++    match.inputs.clear();
++    match.first.clear();
++    match.checks.clear();
++    match.received.clear();
++    match.last.assign(static_cast<std::size_t>(match.seats), NEUTRAL);
++    match.last_received.assign(static_cast<std::size_t>(match.seats), std::nullopt);
++    match.next.reset();
++    match.first_input_frame = 0;
++    match.seen.clear();
++    match.finished.clear();
++    for (int s = 0; s < match.seats; ++s)
++    {
++      char& state = match.states[static_cast<std::size_t>(s)];
++      if (state == 'X' || !match.runners.contains(s))
++        state = 'X';
++      else if (const auto said = match.decision.find(s); said != match.decision.end())
++        state = said->second;
++      else
++        state = 'O';
++    }
++    match.decision.clear();
++    match.round_ended = Now();
++    Log("round " + std::to_string(match.round) + ": each seat chooses in its results' menu (" + match.states + ")");
++    Announce();
++  }
++
+   void OnRunnerClosed(int id)
+   {
+     Connection& connection = connections[id];
+@@ -1106,9 +1200,13 @@ struct Relay::Impl
+         match.runners.erase(found);
+       if (in_match && !match.go && s < match.seats)
+         match.states[static_cast<std::size_t>(s)] = 'X';  // left before the start: the AI's
++      else if (in_match && match.go)
++        match.decision[s] = 'X';  // left during the round: gone for the next one
+     }
+     if (in_match && !match.go && !connection.seats.empty())
+       Announce();
++    else if (in_match && match.go && RoundOver())
++      NewRound();
+     std::string late;
+     for (std::size_t i = 0; i < match.late.size(); ++i)
+       late += (i ? "," : "") + std::to_string(match.late[i]);
+@@ -1275,6 +1373,21 @@ struct Relay::Impl
+       // relais.py's minuteur: WAIT every 2 s while a seat is expected, and the frames whose wait is over.
+       if (in_match)
+       {
++        // Between two rounds, a seat that has not chosen in round_wait seconds counts as gone.
++        if (!match.go && match.round_ended && match.states.find('O') != std::string::npos &&
++            Now() - *match.round_ended > match.round_wait)
++        {
++          for (int s = 0; s < match.seats; ++s)
++          {
++            if (match.states[static_cast<std::size_t>(s)] == 'O')
++            {
++              match.states[static_cast<std::size_t>(s)] = 'X';
++              Log("seat " + std::to_string(s) + ": no choice in " +
++                  std::to_string(static_cast<int>(match.round_wait)) + " s, counted as gone");
++            }
++          }
++          Announce();
++        }
+         if (!match.go && !match.runners.empty() && Now() - match.last_wait > 2.0)
+           Announce();
+         CloseFrames();
+-- 
+2.34.1.windows.1
+
