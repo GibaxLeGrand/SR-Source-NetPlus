@@ -30,6 +30,13 @@ sends PICKS <c0>/<g0>,<c1>/<g1>,... ("-": none yet) to everyone; the runners set
 The host (seat 0) sends RULES 0 <course> <laps> [<racers>] (course 1-16, laps 1-9, racers from the seats
 to 8: the AI drives the others); the relay sends RULES <course> <laps> [<racers>] to everyone (and to
 each new connection); the runners write them into the game at GO.
+
+After the race (2026-11-26): END <seat> says the seat left the lockstep (its results' menu is open, the
+same frame everywhere); once every seat still there has, the round is over: frames, inputs and
+checksums start again from nothing, and the seats are expected again (O). AGAIN <seat> (Restart: the
+runner is back on its waiting screen) makes it V, BYE <seat> or its leaving makes it X (the AI takes its
+racer, with its own character); then WAIT and GO as at the start, the frames counting from 1 again.
+A seat that has not chosen --attente-manche seconds (60) after the round's end counts as gone.
 """
 import argparse
 import asyncio
@@ -44,7 +51,7 @@ PERSOS = [c for c in range(17) if c != 11]
 
 
 class Relais:
-    def __init__(self, sieges, delai, journal, cadence=0.0):
+    def __init__(self, sieges, delai, journal, cadence=0.0, attente_manche=60.0):
         self.sieges = sieges
         self.delai = delai
         self.cadence = cadence        # frames par seconde de l'horloge du relais (0 : pas d'horloge)
@@ -74,6 +81,11 @@ class Relais:
         self.tags = [""] * sieges     # le tag de chaque siège (TAG), seulement affiché
         self.choix = [""] * sieges    # lobby : « perso/planche » de chaque siège (PICK)
         self.regles = None            # lobby : (course, tours) de l'hôte (RULES)
+        self.fini = set()             # sièges sortis du lockstep de la manche (END : menu des résultats)
+        self.decision = {}            # siège -> "V" (AGAIN) ou "X" (BYE) dit avant la fin de la manche
+        self.manche = 1
+        self.attente_manche = attente_manche  # secondes pour choisir dans le menu des résultats
+        self.t_manche = None                  # fin de la manche précédente (entre deux manches)
         self.debut = time.monotonic()
 
     def log(self, texte):
@@ -112,7 +124,7 @@ class Relais:
             for s in range(self.sieges):
                 if self.etat[s] == "X":
                     recues[s] = IA
-            complete = f < self.f_saisie or all(s in recues for s in range(self.sieges))
+            complete = f < self.f_saisie or all(s in recues or s in self.fini for s in range(self.sieges))
             if self.cadence > 0:
                 # Horloge du relais : la frame f est due à départ + (f - première) / cadence ; elle est
                 # fermée dès qu'elle est complète, sinon à son échéance plus le délai.
@@ -128,7 +140,7 @@ class Relais:
             for s in range(self.sieges):
                 if s in recues:
                     self.dernier[s] = recues[s]
-                elif f >= self.f_saisie:
+                elif f >= self.f_saisie and s not in self.fini:
                     self.en_retard += 1
                     self.retard_siege[s] += 1
                     if self.retard_siege[s] <= 3:
@@ -163,8 +175,14 @@ class Relais:
             remplaces = []
             for s in range(self.sieges):
                 if self.etat[s] == "X":
-                    remplaces.append(f"{s}:{random.choice(PERSOS)}/0")
-            self.log("plus personne n'est attendu : GO" + (" ; à l'IA : " + " ".join(remplaces) if remplaces else ""))
+                    # Son propre perso s'il en avait un ; dans une manche suivante sans choix connu (pas de
+                    # lobby), rien : le racer garde le sien ; sinon au hasard.
+                    if self.choix[s]:
+                        remplaces.append(f"{s}:{self.choix[s]}")
+                    elif self.manche == 1:
+                        remplaces.append(f"{s}:{random.choice(PERSOS)}/0")
+            ia = [str(s) for s in range(self.sieges) if self.etat[s] == "X"]
+            self.log("plus personne n'est attendu : GO" + (" ; à l'IA : " + " ".join(remplaces or ia) if ia else ""))
             await self.diffuser(" ".join(["GO"] + remplaces))
             await self.fermer_pretes()
         else:
@@ -174,9 +192,38 @@ class Relais:
     async def minuteur(self):
         while True:
             await asyncio.sleep(0.005)
+            if (not self.go and self.t_manche is not None and "O" in self.etat
+                    and time.monotonic() - self.t_manche > self.attente_manche):
+                for s in range(self.sieges):
+                    if self.etat[s] == "O":
+                        self.etat[s] = "X"
+                        self.log(f"siège {s} : pas de choix en {self.attente_manche:.0f} s, compté comme parti")
+                await self.annoncer()
             if not self.go and self.clients and time.monotonic() - self.dernier_wait > 2.0:
                 await self.annoncer()
             await self.fermer_pretes()
+
+    async def nouvelle_manche(self):
+        """Tous les sièges encore là ont quitté le lockstep (menu des résultats) : la manche suivante
+        repart de rien (frames, entrées, sommes), les sièges sont de nouveau attendus."""
+        self.manche += 1
+        self.go = False
+        self.demarre = False
+        self.entrees, self.premiere, self.ck, self.nb_recues = {}, {}, {}, {}
+        self.dernier = [NEUTRE] * self.sieges
+        self.derniere_recue = [None] * self.sieges
+        self.prochaine, self.f_saisie, self.t0, self.f0 = None, 0, None, None
+        self.vus = set()
+        self.fini = set()
+        for s in range(self.sieges):
+            if self.etat[s] == "X" or s not in self.clients:
+                self.etat[s] = "X"
+            else:
+                self.etat[s] = self.decision.get(s, "O")
+        self.decision = {}
+        self.t_manche = time.monotonic()
+        self.log(f"manche {self.manche} : chacun choisit dans son menu des résultats ({''.join(self.etat)})")
+        await self.annoncer()
 
     def controle(self, frame, siege, valeur):
         recues = self.ck.setdefault(frame, {})
@@ -238,6 +285,23 @@ class Relais:
                         self.log(f"siège {s_} : {'prêt' if mots[0] == 'READY' else 'choisit encore'} "
                                  f"({self.choix[s_] or 'sans choix'})")
                         await self.annoncer()
+                elif mots[0] == "END":
+                    s_ = int(mots[1])
+                    if 0 <= s_ < self.sieges and self.go and s_ not in self.fini:
+                        self.fini.add(s_)
+                        self.log(f"siège {s_} : menu des résultats, hors du lockstep")
+                        if all(s in self.fini for s in self.actifs() if s in self.clients):
+                            await self.nouvelle_manche()
+                elif mots[0] in ("AGAIN", "BYE"):
+                    s_ = int(mots[1])
+                    etat = "V" if mots[0] == "AGAIN" else "X"
+                    if 0 <= s_ < self.sieges:
+                        self.log(f"siège {s_} : {'Restart' if etat == 'V' else 'Back to Menu'}")
+                        if self.go:
+                            self.decision[s_] = etat   # la manche n'est pas encore finie partout
+                        elif self.etat[s_] != "X":
+                            self.etat[s_] = etat
+                            await self.annoncer()
                 elif mots[0] == "TAG":
                     s = int(mots[1])
                     tag = "".join(c for c in (mots[2] if len(mots) > 2 else "") if c != ",")[:8].upper()
@@ -273,8 +337,12 @@ class Relais:
                 self.clients.pop(s, None)
                 if not self.go:
                     self.etat[s] = "X"   # parti avant le départ : l'IA le remplacera
+                else:
+                    self.decision[s] = "X"
             if not self.go and sieges:
                 await self.annoncer()
+            elif self.go and self.fini and all(s in self.fini for s in self.actifs() if s in self.clients):
+                await self.nouvelle_manche()
             self.log(f"siège(s) {sieges} parti(s) ; {self.fermees} frames fermées, {self.en_retard} entrées en retard "
                      f"(par siège : {self.retard_siege}), "
                      f"sommes de contrôle : {self.ck_ok} identiques, {self.ck_ko} divergences")
@@ -287,11 +355,13 @@ async def principal():
     p.add_argument("--hote", default="127.0.0.1")
     p.add_argument("--delai-ms", type=float, default=100.0)
     p.add_argument("--journal")
+    p.add_argument("--attente-manche", type=float, default=60.0,
+                   help="secondes pour choisir dans le menu des résultats avant d'être compté comme parti")
     p.add_argument("--cadence", type=float, default=0.0,
                    help="frames par seconde : une frame est fermée au plus tard à son échéance (0 : sans horloge)")
     a = p.parse_args()
     journal = open(a.journal, "a", encoding="utf-8") if a.journal else None
-    relais = Relais(a.sieges, a.delai_ms / 1000.0, journal, a.cadence)
+    relais = Relais(a.sieges, a.delai_ms / 1000.0, journal, a.cadence, a.attente_manche)
     serveur = await asyncio.start_server(relais.client, a.hote, a.port)
     relais.log(f"relais : {a.sieges} sièges, {a.hote}:{a.port}, délai {a.delai_ms} ms, cadence {a.cadence}")
     asyncio.get_running_loop().create_task(relais.minuteur())

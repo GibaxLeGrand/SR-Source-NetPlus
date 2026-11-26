@@ -1,0 +1,492 @@
+From 9b7baf3089624d85466497e97373bcde5d79f4be Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:06:14 +0100
+Subject: [PATCH] Runner: the results' menu is each player's own (Restart, Back
+ to Menu)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gibax (2026-11-26): "le menu qui suit, on empêche de sélectionner replay
+(atm), mais restart te renvoie dans l'écran d'attente du runner (pour
+relancer la course, en attendant que tout le monde revienne ou non) ;
+sélectionner return to menu te renvoie au menu, et te déconnecte du reste";
+"c'est à chaque runner de choisir son option".
+
+The results' menu is the task 0x80528C9C (found in RAM dumps): state +20
+(4: open), cursor +22 (Restart, Replay, Back to Menu), kind +28 (0); it
+opens at the same frame on every machine. There each runner leaves the
+lockstep (END to the relay) and its own player drives its menu:
+- the menus read the players' controller structures (0x8040BC60, from racer
+  0, a player's only); racer 0 points to port 0's, as in a 1P game;
+- A on Replay is dropped;
+- A on Restart is kept from the game: AGAIN to the relay, the race ended by
+  the runner (EndRace: its code words back before a state is loaded over
+  them), the waiting screen until GO, the start state loaded again, the
+  lockstep from frame 1; the waiting screen stays until the race loads;
+- A on Back to Menu goes to the game; the race's manager (0x80434414) only
+  acts on the choice in its state 9 (0x80435D44), which it reaches when a
+  player of the game has finished ([0x806129B5]), never with the seats'
+  racers as CPUs: this machine's manager goes to 9; then the race ends,
+  BYE, the runner leaves the relay, and the game is in its own menus.
+SRNP_FIN_CHOIX=restart|menu|replay: the choice for tests.
+
+Measured, 3 runners (Tails, Jet, Wave, all AI): Tails Restart, Jet Back to
+Menu (the game's Normal Race menu, alone), Wave Replay (dropped) then
+Restart; the second race with Tails and Wave, Jet's racer to the AI;
+128 identical checksums over both races, 0 divergences.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp |  54 +++++--
+ src/runtime/srnp_racers.hpp |   7 +
+ src/runtime/srnp_relay.cpp  | 315 +++++++++++++++++++++++++++++++++++-
+ 3 files changed, 361 insertions(+), 15 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index 237310d..dcfaf01 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -1490,6 +1490,45 @@ void WatchWords()
+   }
+ }
+ 
++// Race over: the AI finishes for the seats still driven (the game's CPUs only: the AI of a racer that
++// was human at the start reads data the game did not make, 2026-11-25), and the code words come back.
++static void RaceOver(std::uint8_t* racers)
++{
++  for (std::size_t k = 0; k < 8; ++k)
++    if (!s_seats[k].released && s_seats[k].written == 0 && s_seats[k].cpu_at_start)
++      racers[k * kRacerSize + kControl] = racers[k * kRacerSize + kCpuFlag] = 1;
++  s_race = false;
++  PatchHud(0);
++  PatchAnimation(false);
++  PatchZones(false);
++  PatchSeatDisplays(-1);
++  PatchIntro(-1, 0);
++  PatchFinish(-1, 0);
++  PatchCameras(racers, -1, -1);
++  PatchTest(false);
++}
++
++void MenusOnPort0()
++{
++  // The menus after the race read the players' controller structures (0x8040BC60: from racer 0, as
++  // many racers as players, a player's only, +0xBD == 0, OR-ed into 0x80612B30); out of the lockstep,
++  // racer 0 points to port 0's structure as in a 1P game, the pad this machine's player drives.
++  std::uint8_t* racer = Guest(kRacers, kRacerSize);
++  if (!racer)
++    return;
++  Put32(racer, kGamePads);
++  racer[kCpuFlag] = 0;
++}
++
++void EndRace()
++{
++  std::uint8_t* racers = Guest(kRacers, 8 * kRacerSize);
++  if (!s_race || !racers)
++    return;
++  RaceOver(racers);
++  std::fprintf(stderr, "[srnp racers] race ended by the runner (a state is loaded over it): racers back to the game\n");
++}
++
+ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2)
+ {
+   if (++s_frames % 1200 == 0)
+@@ -1592,20 +1631,7 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+     return false;
+   if (!racing)
+   {
+-    // Race over: the AI finishes for the seats still driven (the game's CPUs only: the AI of a
+-    // racer that was human at the start reads data the game did not make, 2026-11-25).
+-    for (std::size_t k = 0; k < 8; ++k)
+-      if (!s_seats[k].released && s_seats[k].written == 0 && s_seats[k].cpu_at_start)
+-        racers[k * kRacerSize + kControl] = racers[k * kRacerSize + kCpuFlag] = 1;
+-    s_race = false;
+-    PatchHud(0);
+-    PatchAnimation(false);
+-    PatchZones(false);
+-    PatchSeatDisplays(-1);
+-    PatchIntro(-1, 0);
+-    PatchFinish(-1, 0);
+-    PatchCameras(racers, -1, -1);
+-    PatchTest(false);
++    RaceOver(racers);
+     std::fprintf(stderr, "[srnp racers] race over (0x%X, loading %u, scene %u): racers back to the game\n",
+                  phase, Read32(kRaceLoading), Read32(kRaceScene));
+     return false;
+diff --git a/src/runtime/srnp_racers.hpp b/src/runtime/srnp_racers.hpp
+index 5058d67..9249a47 100644
+--- a/src/runtime/srnp_racers.hpp
++++ b/src/runtime/srnp_racers.hpp
+@@ -41,6 +41,13 @@ bool DriveRacers(const std::vector<Pad>& pads, int camera_seat, int camera_seat2
+ // Frames since the runner took the race (the first frame it drove the racers), or -1.
+ long long RaceFrame();
+ 
++// Ends the race the runner drives as when the game leaves it (its code words come back), before a
++// state is loaded over it (the results menu's Restart): the next race is taken and patched afresh.
++void EndRace();
++
++// Out of the lockstep, in the results' menu: the game's menus read port 0 (this machine's player).
++void MenusOnPort0();
++
+ // A seat's character and gear for the race to be set up (as SRNP_PERSOS gives them; the relay's
+ // choice for a seat the AI takes over), and the character and gear known for a seat (-1: the game's
+ // choice).
+diff --git a/src/runtime/srnp_relay.cpp b/src/runtime/srnp_relay.cpp
+index b22af46..b6c624a 100644
+--- a/src/runtime/srnp_relay.cpp
++++ b/src/runtime/srnp_relay.cpp
+@@ -107,6 +107,7 @@ enum class Vanilla
+   Synced,
+ };
+ std::atomic<Vanilla> s_vanilla{Vanilla::Free};
++std::uint64_t s_loading_at = 0;  // synced: the frame seat 0's Start set the race up (the veil's end)
+ // Through the game's menus, the seats whose choice the relay has given (PICKS, GO): the others'
+ // character is not known yet (SRNP_PERSOS is only a default), so the waiting screen shows the menus'
+ // "?" for them (Gibax, 2026-11-26: "en 2P c'est tjr Shadow en bleuâtre").
+@@ -1174,7 +1175,7 @@ bool VanillaStep(std::uint64_t* frame)
+     // The veil comes off 15 frames after seat 0's Start has set the race up (the racer count leaves 1,
+     // at the end of the menu's fade): the screen is black by then (Gibax: "juste avant que le
+     // chargement commence").
+-    static std::uint64_t loading_at = 0;
++    std::uint64_t& loading_at = s_loading_at;
+     if (s_veil && loading_at == 0 && GuestWord(kRacerCount) != 1)
+       loading_at = *frame;
+     if (s_veil && loading_at != 0 && *frame >= loading_at + 15)
+@@ -1190,6 +1191,302 @@ bool VanillaStep(std::uint64_t* frame)
+   }
+ }
+ 
++// After the race (Gibax, 2026-11-26: "le menu qui suit, on empêche de sélectionner replay (atm), mais
++// restart te renvoie dans l'écran d'attente du runner (pour relancer la course, en attendant que tout
++// le monde revienne ou non) ; sélectionner return to menu te renvoie au menu, et te déconnecte du
++// reste"). The results' menu is the task 0x80528C9C (made by the results task 0x80524EE4; found in RAM
++// dumps on 2026-11-26): the task's pointer is the word of its function in the task pool, its state at
++// +20 (4: open to the pad), its cursor at +22 (Restart 0, Replay 1, Back to Menu 2), its kind at +28
++// (0: those three); A writes the choice at 0x806129CC. It opens at the same frame on every machine (the
++// race is the same). There each runner leaves the lockstep (END) and its player's pad drives its own
++// menu: A on Replay is dropped; A on Restart is kept from the game: the runner tells the relay
++// (AGAIN), ends the race (its code words back), shows the waiting screen until GO, then loads the start
++// state again and the frames count from 1, as from the boot; A on Back to Menu goes to the game (its
++// own menus): the runner ends the race, tells the relay (BYE) and leaves it.
++// SRNP_FIN_CHOIX=restart|menu|replay (tests): that choice a second after the menu opens (replay: A on
++// Replay, dropped, then Restart).
++enum class After
++{
++  None,       // the race (or the menus before it), in the lockstep
++  Menu,       // the results' menu, this player's own
++  Leaving,    // Back to Menu: A goes to the game for a few frames, then the runner leaves the relay
++  Reloading,  // Restart, after GO: the start state is being loaded again
++};
++After s_after = After::None;
++std::uint32_t s_menu_task = 0;
++std::uint64_t s_menu_frames = 0;  // frames since the menu opened (or since Back to Menu)
++bool s_raced = false;             // a race was taken since the start state
++constexpr std::uint32_t kMenuTaskFunction = 0x80528C9C;
++constexpr std::uint32_t kRacerCountWord = 0x8021B8C0u;
++
++// A task of the game by its function: the task's pointer (the word of its function in the pool).
++std::uint32_t FindTask(std::uint32_t function)
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  constexpr std::uint32_t kPool = 0x803D0000u, kSize = 0x20000u;
++  const std::uint8_t* pool = memory.GetPointerForRange(kPool, kSize);
++  if (!pool)
++    return 0;
++  const std::uint8_t f[4] = {static_cast<std::uint8_t>(function >> 24), static_cast<std::uint8_t>(function >> 16),
++                             static_cast<std::uint8_t>(function >> 8), static_cast<std::uint8_t>(function)};
++  for (std::uint32_t o = 0; o + 32 <= kSize; o += 4)
++    if (pool[o] == f[0] && pool[o + 1] == f[1] && pool[o + 2] == f[2] && pool[o + 3] == f[3])
++      return kPool + o;
++  return 0;
++}
++
++std::uint32_t FindMenuTask()
++{
++  return FindTask(kMenuTaskFunction);
++}
++
++// Back to Menu: the race manager (the task 0x804337A8) acts on the menu's choice in its state 9
++// (0x80433AB0: once 0x806129CE says decided, 0x80436D04); it gets there from the race (7) through 8
++// when a player of the game ([0x806129B5]) has finished, which never happens when the game's racers
++// are all CPUs (the seats drive them): this machine's manager goes to 9 (out of the lockstep).
++void LogTasks(std::uint32_t function)
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  constexpr std::uint32_t kPool = 0x803D0000u, kSize = 0x20000u;
++  const std::uint8_t* pool = memory.GetPointerForRange(kPool, kSize);
++  if (!pool)
++    return;
++  for (std::uint32_t o = 0; o + 32 <= kSize; o += 4)
++    if (((static_cast<std::uint32_t>(pool[o]) << 24) | (pool[o + 1] << 16) | (pool[o + 2] << 8) | pool[o + 3]) ==
++        function)
++      std::fprintf(stderr, "[srnp relay]   task %08X at %08X: +16 %02X%02X%02X%02X +20 %d +22 %d +25 %d +28 %d\n",
++                   function, kPool + o, pool[o + 16], pool[o + 17], pool[o + 18], pool[o + 19], pool[o + 20],
++                   pool[o + 22], pool[o + 25], pool[o + 28]);
++}
++
++void RaceManagerToChoice()
++{
++  // The race's manager: 0x80434414 in the races played online (its states in the table 0x805D51F8:
++  // 7 the race, 8 after a player's finish, 9 the menu's choice at 0x80435D44), 0x804337A8 in another
++  // mode (its 9 at 0x80433AB0).
++  std::uint32_t manager = FindTask(0x80434414u);
++  if (!manager)
++    manager = FindTask(0x804337A8u);
++  std::uint8_t* m = manager ? GuestByte(manager) : nullptr;
++  if (!m)
++  {
++    std::fprintf(stderr, "[srnp relay] no race manager found: the choice is left to the game\n");
++    return;
++  }
++  std::fprintf(stderr, "[srnp relay] the race manager at %08X: state %d\n", manager, m[20]);
++  if (m[20] == 7 || m[20] == 8)
++  {
++    std::fprintf(stderr, "[srnp relay] the race manager (state %d) to its choice state (9)\n", m[20]);
++    m[20] = 9;
++  }
++}
++
++void ClearPad(int port)
++{
++  using ciface::Touch::ClearControlState;
++  using ciface::Touch::ControlID;
++  static constexpr ControlID kControls[] = {
++      ControlID::GCPAD_A_BUTTON,    ControlID::GCPAD_B_BUTTON,     ControlID::GCPAD_X_BUTTON,
++      ControlID::GCPAD_Y_BUTTON,    ControlID::GCPAD_Z_BUTTON,     ControlID::GCPAD_START_BUTTON,
++      ControlID::GCPAD_DPAD_UP,     ControlID::GCPAD_DPAD_DOWN,    ControlID::GCPAD_DPAD_LEFT,
++      ControlID::GCPAD_DPAD_RIGHT,  ControlID::GCPAD_L_DIGITAL,    ControlID::GCPAD_R_DIGITAL,
++      ControlID::GCPAD_MAIN_STICK_X, ControlID::GCPAD_MAIN_STICK_Y, ControlID::GCPAD_C_STICK_X,
++      ControlID::GCPAD_C_STICK_Y,   ControlID::GCPAD_L_ANALOG,     ControlID::GCPAD_R_ANALOG};
++  for (const ControlID control : kControls)
++    ClearControlState(port, control);
++}
++
++// The player's pad in the results' menu: the real one, or SRNP_FIN_CHOIX for tests.
++Pad MenuPad(std::uint64_t t)
++{
++  static const std::string choice = [] {
++    const char* v = std::getenv("SRNP_FIN_CHOIX");
++    return std::string(v ? v : "");
++  }();
++  Pad pad{};
++  const auto press = [&](std::uint64_t at, unsigned bits) {
++    if (t >= at && t < at + 6)
++    {
++      pad[0] = static_cast<std::uint8_t>(bits >> 8);
++      pad[1] = static_cast<std::uint8_t>(bits);
++    }
++  };
++  constexpr unsigned kA = 0x1, kUp = 0x40, kDown = 0x80;
++  if (choice == "restart")
++    press(60, kA);
++  else if (choice == "menu")
++  {
++    press(40, kDown);
++    press(70, kDown);
++    press(100, kA);
++  }
++  else if (choice == "replay")
++  {
++    press(40, kDown);
++    press(70, kA);   // dropped
++    press(100, kUp);
++    press(130, kA);  // Restart
++  }
++  else if (s_relay.input_mode == "manette")
++    return RealPad();
++  return pad;
++}
++
++// Each frame from the menu's opening; false: no lockstep this frame.
++bool AfterRaceStep(std::uint64_t* frame)
++{
++  switch (s_after)
++  {
++  case After::Menu:
++  {
++    ++s_menu_frames;
++    const std::uint8_t* task = GuestByte(s_menu_task);
++    if (!task || GuestWord(s_menu_task) != kMenuTaskFunction)
++    {
++      ApplyPad(0, Pad{});
++      return false;
++    }
++    const int cursor = task[22];
++    static int cursor_before = -1;
++    if (cursor != cursor_before)
++      std::fprintf(stderr, "[srnp relay] results' menu: cursor %d (frame %llu of the menu)\n", cursor,
++                   static_cast<unsigned long long>(s_menu_frames));
++    cursor_before = cursor;
++    MenusOnPort0();
++    Pad pad = MenuPad(s_menu_frames);
++    const bool a = (pad[1] & 0x1) != 0;
++    static bool a_before = false;
++    const bool a_pressed = a && !a_before;
++    a_before = a;
++    if (a && cursor == 1)
++    {
++      pad[1] = static_cast<std::uint8_t>(pad[1] & ~0x1);  // Replay: not now
++      if (a_pressed)
++        std::fprintf(stderr, "[srnp relay] results' menu: Replay is not available online\n");
++    }
++    else if (a_pressed && cursor == 0)
++    {
++      ApplyPad(0, Pad{});
++      std::fprintf(stderr, "[srnp relay] results' menu: Restart: back to the waiting screen\n");
++      for (const int seat : s_relay.local)
++        SendLine("AGAIN " + std::to_string(seat));
++      EndRace();
++      s_veil = true;
++      WaitForGo();
++      if (!s_relay.on)
++        return false;
++      s_after = After::Reloading;
++      std::thread([] {
++        State::LoadAs(Core::System::GetInstance(), s_start_state);
++        std::fprintf(stderr, "[srnp relay] start state asked again: %s\n", s_start_state.c_str());
++      }).detach();
++      return false;
++    }
++    else if (a_pressed && cursor == 2)
++    {
++      std::fprintf(stderr, "[srnp relay] results' menu: Back to Menu: this machine leaves the others\n");
++      s_after = After::Leaving;
++      s_menu_frames = 0;
++    }
++    ApplyPad(0, pad);
++    return false;
++  }
++  case After::Leaving:
++  {
++    // A held a few frames for the game, then the runner lets go of everything.
++    Pad a{};
++    a[1] = 0x1;
++    MenusOnPort0();
++    {
++      const std::uint8_t* choice = GuestByte(0x806129CCu);
++      const std::uint8_t* task = GuestByte(s_menu_task);
++      if (s_menu_frames % 10 == 0)
++        std::fprintf(stderr, "[srnp relay] Back to Menu, frame %llu: the game's choice %d (decided %d), menu state %d "
++                     "closing %d cursor %d, phase %u\n", static_cast<unsigned long long>(s_menu_frames),
++                     choice ? choice[0] : -1, choice ? choice[2] : -1, task ? task[20] : -1,
++                     task ? task[25] : -1, task ? task[22] : -1, GuestWord(0x806129A0u));
++    }
++    // A until the game has taken the choice (0x806129CE), at most 30 frames; then 10 frames for it.
++    static std::uint64_t decided_at = 0;
++    const std::uint8_t* decided = GuestByte(0x806129CEu);
++    ++s_menu_frames;
++    if (decided && decided[0] != 0 && decided_at == 0)
++    {
++      decided_at = s_menu_frames;
++      RaceManagerToChoice();
++    }
++    if (decided_at == 0 && s_menu_frames <= 30)
++      ApplyPad(0, a);
++    else if (decided_at != 0 && s_menu_frames < decided_at + 60)
++      ApplyPad(0, Pad{});
++    else
++    {
++      decided_at = 0;
++      ApplyPad(0, Pad{});
++      EndRace();
++      for (const int seat : s_relay.local)
++        SendLine("BYE " + std::to_string(seat));
++      Off("Back to Menu: this machine plays alone now");
++      ClearPad(0);
++      s_after = After::None;
++    }
++    return false;
++  }
++  case After::Reloading:
++  {
++    ApplyPad(0, Pad{});
++    if (GuestWord(kRacerCountWord) != 1)
++      return false;  // still the race: the start state is not back yet
++    s_game_frames.store(1);
++    *frame = 1;
++    s_relay.official.clear();
++    ApplyRules();
++    // The waiting screen stays until the race loads (VeilUntilRace), as through the game's menus.
++    s_loading_at = 0;
++    if (LobbyVanilla())
++      s_vanilla = Vanilla::Synced;
++    s_after = After::None;
++    s_raced = false;
++    std::fprintf(stderr, "[srnp relay] start state back: the lockstep starts again\n");
++    return true;
++  }
++  default:
++    return true;
++  }
++}
++
++// In the lockstep, after a race: whether the results' menu has opened (then END, and the menu is
++// this player's).
++void WatchForMenu()
++{
++  if (!s_relay.racers || s_after != After::None)
++    return;
++  if (RaceFrame() >= 0)
++    s_raced = true;
++  if (!s_raced)
++    return;
++  const std::uint32_t task = FindMenuTask();
++  const std::uint8_t* t = task ? GuestByte(task) : nullptr;
++  if (!t || t[20] != 4)
++    return;
++  if (t[28] != 0)
++  {
++    static bool told = false;
++    if (!told)
++      std::fprintf(stderr, "[srnp relay] a results' menu of kind %d: left to the lockstep\n", t[28]);
++    told = true;
++    return;
++  }
++  s_menu_task = task;
++  s_menu_frames = 0;
++  s_after = After::Menu;
++  for (const int seat : s_relay.local)
++    SendLine("END " + std::to_string(seat));
++  LogTasks(kMenuTaskFunction);
++  std::fprintf(stderr, "[srnp relay] results' menu open (task 0x%08X): out of the lockstep, this player's own\n",
++               task);
++}
++
+ void RelayStep(std::uint64_t frame)
+ {
+   if (!s_relay.tried)
+@@ -1219,6 +1516,8 @@ void RelayStep(std::uint64_t frame)
+   }
+   if (!s_relay.on)
+     return;
++  if (s_after != After::None && !AfterRaceStep(&frame))
++    return;
+   if (LobbyVanilla() && !VanillaStep(&frame))
+     return;
+ 
+@@ -1314,6 +1613,20 @@ void RelayStep(std::uint64_t frame)
+     for (std::size_t port = 0; port < pads.size() && port < 4; ++port)
+       ApplyPad(static_cast<int>(port), pads[port]);
+   s_relay.official.erase(s_relay.official.begin(), s_relay.official.upper_bound(next));
++  WatchForMenu();
++  // After a Restart without the game's menus (SRNP_LOBBY=0), the waiting screen stays over the start
++  // state's menus until the race loads: 15 frames after seat 0's Start has set it up, as VanillaStep.
++  if (s_veil && !LobbyVanilla())
++  {
++    if (s_loading_at == 0 && GuestWord(kRacerCountWord) != 1)
++      s_loading_at = frame;
++    if (s_loading_at != 0 && frame >= s_loading_at + 15)
++    {
++      s_veil = false;
++      std::fprintf(stderr, "[srnp relay] waiting screen off: the race loads (frame %llu)\n",
++                   static_cast<unsigned long long>(frame));
++    }
++  }
+ 
+   if (++s_relay.frames % 600 == 0)
+   {
+-- 
+2.34.1.windows.1
+

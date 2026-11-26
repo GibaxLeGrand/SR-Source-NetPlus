@@ -135,3 +135,7 @@ Phase 2 prototype (8 seats drive Sonic Riders' 8 racers; runner with `SRNP_RACER
   alone or in a loop over the views: the list behind the runner's `kObjectZoneSites` (2026-11-26).
 
 Comments and output are in French.
+
+After the race (2026-11-26): `relais.py` takes END/AGAIN/BYE between races (rounds; `--attente-manche`),
+`demo_8.sh` FIN_CHOIX="restart;menu;replay" (each runner's choice in the results' menu) and MANCHE2="<s> ..."
+(photos after the second GO).

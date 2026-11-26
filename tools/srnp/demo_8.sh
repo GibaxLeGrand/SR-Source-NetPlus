@@ -51,6 +51,9 @@ auto_de() { [[ -n "${LOBBY_AUTO:-}" ]] && echo "$LOBBY_AUTO" | cut -d';' -f$(($1
 # TOUS_CPU=0.
 entree_de() { local e=""; [[ -n "${ENTREES:-}" ]] && e=$(echo "$ENTREES" | cut -d";" -f$(($1 + 1))); echo "${e:-ia}"; }
 touches_de() { [[ -n "${LOBBY_KEYS:-}" ]] && echo "$LOBBY_KEYS" | cut -d';' -f$(($1 + 1)) || true; }
+# FIN_CHOIX="restart;menu;replay;..." : le choix de chaque runner dans le menu des résultats (SRNP_FIN_CHOIX ;
+# replay : A sur Replay, refusé, puis Restart).
+choix_de() { [[ -n "${FIN_CHOIX:-}" ]] && echo "$FIN_CHOIX" | cut -d';' -f$(($1 + 1)) || true; }
 lance() {  # lance <siège>
   local r=$1 D="$RUN/runner$1"
   mkdir -p "$D/auto/commands" "$D/ck"
@@ -65,7 +68,7 @@ lance() {  # lance <siège>
   fi
   local SON=--mute; [[ -n "${SON_RUNNER:-}" && "$r" == "$SON_RUNNER" ]] && SON=   # muet par défaut (Gibax dort, 26/11)
   (cd "$CHASSIS" && SRNP_RELAY=127.0.0.1:7845 SRNP_SEAT=$r SRNP_SEATS=$N SRNP_RACERS=1 SRNP_TOUS_CPU="${TOUS_CPU:-1}" \
-     SRNP_PERSOS="$PERSOS" SRNP_INPUT="$(entree_de "$r")" SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_TAG="$(tag_de "$r")" SRNP_LOBBY="${LOBBY:-0}" SRNP_LOBBY_AUTO="$(auto_de "$r")" SRNP_LOBBY_KEYS="$(touches_de "$r")" SRNP_CKDUMP="$(w "$D/ck")" \
+     SRNP_PERSOS="$PERSOS" SRNP_INPUT="$(entree_de "$r")" SRNP_CHECK=60 SRNP_PAUSE_JEU=1 SRNP_TAG="$(tag_de "$r")" SRNP_LOBBY="${LOBBY:-0}" SRNP_LOBBY_AUTO="$(auto_de "$r")" SRNP_LOBBY_KEYS="$(touches_de "$r")" SRNP_FIN_CHOIX="$(choix_de "$r")" SRNP_CKDUMP="$(w "$D/ck")" \
      MODERNGEKKO_STATICRECOMP=1 ./moderngekko-run.exe --game "$(w "$W/games/GXEE8P")" --user-dir "$(w "$D/userdir")" \
      --automation-dir "$(w "$D/auto")" $SON --load-state "$(w "$STATE")" \
      --module "$(w "$CHASSIS/gGXEE8P_recomp.dll")" > "$D/runner.log" 2>&1) &
@@ -172,6 +175,22 @@ for c in "${CAPTS[@]}"; do
     echo "$(date +%T) rafale : $(ls "$RUN/rafale" | wc -l) captures"
   fi
 done
+# MANCHE2="<s> ..." : après le menu des résultats (FIN_CHOIX), photos de toutes les fenêtres à la fin de la
+# manche 1 (les menus), puis à ces secondes après le deuxième GO du relais (Restart), sans pause (les
+# frames repartent de 1).
+if [[ -n "${MANCHE2:-}" ]]; then
+  for i in $(seq 1 900); do grep -q "manche 2" "$RUN/relais.log" 2>/dev/null && break; sleep 0.5; done
+  echo "$(date +%T) manche 2 : les menus des résultats"
+  for k in $(seq 0 $((N - 1))); do fenetre $k "menu_0s"; done
+  sleep 2; for k in $(seq 0 $((N - 1))); do fenetre $k "menu_2s"; done
+  for i in $(seq 1 900); do (( $(grep -c ": GO" "$RUN/relais.log") >= 2 )) && break; sleep 0.5; done
+  t0=$(date +%s); echo "$(date +%T) GO de la manche 2"
+  for s in $MANCHE2; do
+    while (( $(date +%s) - t0 < s )); do sleep 0.5; done
+    for k in $(seq 0 $((N - 1))); do fenetre $k "manche2_${s}s"; done
+    echo "$(date +%T) photos de la manche 2 à ${s} s"
+  done
+fi
 sleep 3
 for r in $(seq 0 $((N - 1))); do printf 'command=stop\n' > "$RUN/runner$r/auto/commands/z.txt"; done
 sleep 12
