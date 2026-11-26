@@ -1,0 +1,130 @@
+From aee21a445b7f78dc127affcd5606a171a773660a Mon Sep 17 00:00:00 2001
+From: GibaxLeGrand <48137851+GibaxLeGrand@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:47:56 +0100
+Subject: [PATCH] Runner: on Tournament Edition the racers' camera slot is
+ +0x106F (TE's +0x106C is a flag of its tricks); SRNP_TRACE on TE,
+ SRNP_TRACE_RACER
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/srnp_racers.cpp | 56 +++++++++++++++++++++++++++++++------
+ 1 file changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/src/runtime/srnp_racers.cpp b/src/runtime/srnp_racers.cpp
+index f1fc08b..63a7dc4 100644
+--- a/src/runtime/srnp_racers.cpp
++++ b/src/runtime/srnp_racers.cpp
+@@ -829,7 +829,16 @@ void PatchZones(bool on)
+ // seat (camera 1 for its second seat) and the seat's own for the racer that had camera 0. Every racer
+ // keeps a camera of its own; only which one is shown differs between machines. The read at 0x80574608
+ // (kIndexReads) already sends the seat's racer to camera 0. SRNP_CAMERAS=0 keeps the game's.
+-constexpr std::uint32_t kCameraSlot = 0x106C;
++// Tournament Edition uses +0x106C: a trick from some ramps sets it (0x80107FFC), it is cleared out of the
++// trick state 0x13 (0x80291074), and the landing gives more air when it is set (0x80122E68). Our camera
++// numbers there gave the CPUs' tricks more air on the machines of seats 1-7 (measured on 2026-11-26: Silver's
++// air 0x1E1 against 0x17A at frame 4503, 3 divergences after the race; 0 with SRNP_CAMERAS=0). On TE the
++// slot is +0x106F: no load or store of SR or TE reaches it (0x1000-0x107F: 0x1045-0x1047, 0x1069, 0x106F,
++// 0x1070-0x1071, 0x1075-0x1077, 0x107A-0x107B), zero in every racer of 174 dumps of TE's races.
++std::uint32_t CameraSlot()
++{
++  return CurrentGame() == Game::TE ? 0x106Fu : 0x106Cu;
++}
+ constexpr std::uint32_t kCameraIndexReads[] = {
+     0x803FEE8C, 0x80401438, 0x8040E1C0, 0x8040E1EC, 0x8045204C, 0x8045265C, 0x80452828,
+     0x80452E40, 0x804533C8, 0x804533D8, 0x8045343C, 0x80453484, 0x80454A60, 0x80455A3C,
+@@ -896,7 +905,7 @@ std::array<std::uint8_t, 8> CameraOf(int seat, int seat2)
+ void WriteCameraSlots(std::uint8_t* racers)
+ {
+   for (std::size_t k = 0; k < 8; ++k)
+-    racers[k * kRacerSize + kCameraSlot] = s_cameras_patched ? s_camera_of[k] : 0;
++    racers[k * kRacerSize + CameraSlot()] = s_cameras_patched ? s_camera_of[k] : 0;
+ }
+ 
+ // seat < 0: the game's reads back.
+@@ -912,7 +921,7 @@ void PatchCameras(std::uint8_t* racers, int seat, int seat2)
+   const bool on = !off && seat >= 0 && of != CameraOf(0, 0);  // seat 0 alone: the game's own reads
+   if (on == s_cameras_patched)
+     return;
+-  const std::uint32_t from = on ? 0x1029u : kCameraSlot, to = on ? kCameraSlot : 0x1029u;
++  const std::uint32_t from = on ? 0x1029u : CameraSlot(), to = on ? CameraSlot() : 0x1029u;
+   for (const std::uint32_t address : kCameraIndexReads)
+   {
+     const std::uint32_t word = Read32(address);
+@@ -2015,8 +2024,7 @@ std::uint64_t RacersHash()
+       // Amy, 2026-11-25: 0x803DFD08 against 0x803DFC48, one 0xC0 slot apart; the race the same); and
+       // +0x894, the same for the display task 0x804A4F2C started for this machine's seat alone.
+       {0x894, 0x89C},
+-      // The camera of the racer's events, this machine's (PatchCameras).
+-      {0x106C, 0x106D},
++      // (The camera of the racer's events, this machine's: CameraSlot, left out below.)
+       // Sound handles (0x80412xxx: given by 0x8008D78C, played by 0x8008BBCC, tested by 0x8008BC9C,
+       // stopped by 0x8008BDB4, nothing else reads them): +0xF44/+0xF48 a human's, +0xF50 + 4 x view a
+       // CPU's engine for each view. Their values depend on the order the sounds were started in, which
+@@ -2032,12 +2040,15 @@ std::uint64_t RacersHash()
+   // drawing (0x8040B438, 0x8040AA78) tests it (2026-11-25). {byte, bits left out}.
+   static constexpr std::pair<std::uint32_t, std::uint8_t> kCameraBits[] = {{0xBAD, 0x01},
+                                                                            {0xBB9, 0x01}};
++  // The camera of the racer's events, this machine's (PatchCameras): +0x106C in SR, +0x106F in TE (whose
++  // +0x106C is a flag of its tricks, counted).
++  const std::uint32_t camera_slot = CameraSlot();
+   std::uint64_t hash = 0xCBF29CE484222325ull;
+   for (std::uint32_t k = 0; k < 8; ++k)
+   {
+     for (std::uint32_t i = 0; i < kRacerSize; ++i)
+     {
+-      bool skip = false;
++      bool skip = i == camera_slot;
+       for (const auto& [a, b] : kCameraFields)
+         skip = skip || (i >= a && i < b);
+       std::uint8_t byte = racers[k * kRacerSize + i];
+@@ -2090,16 +2101,45 @@ std::vector<std::uint32_t> TraceAddresses()
+ 
+ void TraceHook(CPUState* state)
+ {
++  // (the racers where the game that runs has them: Tournament Edition's are elsewhere)
++  static const std::uint32_t racers = At(kRacers);
+   int racer = -1;
+   for (int r = 31; r >= 14 && racer < 0; --r)
+   {
+     const std::uint32_t v = state->gpr[r];
+-    if (v >= kRacers && v < kRacers + 8 * kRacerSize && (v - kRacers) % kRacerSize == 0)
+-      racer = static_cast<int>((v - kRacers) / kRacerSize);
++    if (v >= racers && v < racers + 8 * kRacerSize && (v - racers) % kRacerSize == 0)
++      racer = static_cast<int>((v - racers) / kRacerSize);
+   }
+   if (s_trace[{state->pc, racer}]++ == 0)
+     std::fprintf(stderr, "[srnp trace] 0x%08X racer %d first at race frame %llu\n", state->pc, racer,
+                  static_cast<unsigned long long>(s_frames));
++  // SRNP_TRACE_RACER=<racer>:<from>-<to> (tests): every traced store (stw/sth/stb, d(rA)) done for that
++  // racer between those race frames, with the word it changes before and the value stored.
++  static const std::array<long long, 3> only = [] {
++    std::array<long long, 3> o{-2, 0, 0};
++    if (const char* v = std::getenv("SRNP_TRACE_RACER"); v && *v)
++    {
++      long long k = -2, from = 0, to = 0;
++      if (std::sscanf(v, "%lld:%lld-%lld", &k, &from, &to) == 3)
++        o = {k, from, to};
++    }
++    return o;
++  }();
++  if (racer != only[0] || static_cast<long long>(s_frames) < only[1] || static_cast<long long>(s_frames) > only[2])
++    return;
++  const std::uint32_t w = RawWord(state->pc);  // (the game's own addresses: no translation)
++  const std::uint32_t op = w >> 26;
++  const bool store = op == 36 || op == 44 || op == 38;  // stw, sth, stb
++  if (!store && op != 32 && op != 40 && op != 34)       // lwz, lhz, lbz
++    return;
++  const std::uint32_t rs = (w >> 21) & 31u, ra = (w >> 16) & 31u;
++  const std::uint32_t ea = state->gpr[ra] + static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(w & 0xFFFFu)));
++  if (store)
++    std::fprintf(stderr, "[srnp trace] frame %llu 0x%08X racer %d [0x%08X] %08X <- %08X\n",
++                 static_cast<unsigned long long>(s_frames), state->pc, racer, ea, RawWord(ea & ~3u), state->gpr[rs]);
++  else
++    std::fprintf(stderr, "[srnp trace] frame %llu 0x%08X racer %d [0x%08X] read %08X\n",
++                 static_cast<unsigned long long>(s_frames), state->pc, racer, ea, RawWord(ea & ~3u));
+ }
+ 
+ void PadCheckOnFrame(std::uint64_t frame)
+-- 
+2.34.1.windows.1
+
